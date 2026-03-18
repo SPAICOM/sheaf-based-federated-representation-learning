@@ -11,4 +11,4 @@ format:
     uvx ruff format .
 
 # Run formatting and linting (CI-style target)
-all: format check
+clean: format check
