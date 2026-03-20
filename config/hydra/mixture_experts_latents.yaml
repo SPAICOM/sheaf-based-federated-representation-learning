@@ -1,0 +1,47 @@
+defaults:
+  - _self_
+  - dataset: semantic-cifar10
+  - model: latent_classifier
+  - orchestrator: federated
+
+seed: 42
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sheaf-repr-learning__mixture-experts-latents
+  name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 50
+  accelerator: auto
+  devices: 1
+
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: validation/total_loss_epoch
+    mode: min
+    save_top_k: 1
+    save_last: true
+
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: validation/total_loss_epoch
+    patience: 5
+    mode: min
+
+  batch_size_finder:
+    _target_: lightning.pytorch.callbacks.BatchSizeFinder
+    mode: power
+    init_val: 32
+    max_trials: 5

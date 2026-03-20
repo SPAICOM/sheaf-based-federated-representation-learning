@@ -1,0 +1,12 @@
+_target_: src.agents.LatentClassifier
+
+in_features: null
+num_classes: null
+
+hidden_dims: [256, 128]
+dropout: 0.1
+
+activation:
+  _target_: torch.nn.ReLU
+
+use_batchnorm: false

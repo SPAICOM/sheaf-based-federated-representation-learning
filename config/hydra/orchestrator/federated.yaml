@@ -1,0 +1,12 @@
+_target_: src.orchestrators.FederatedLearning
+
+# Injected at runtime
+agents: null
+
+# Graph structure (agent connectivity)
+neighbors:
+  0: [1]
+  1: [0]
+
+# Optimization
+lr: 1e-3
