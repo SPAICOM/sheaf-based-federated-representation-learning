@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import lightning as l
 import torch
 import torch.nn as nn
+from hydra.utils import instantiate
 
 
 class BaseOrchestrator(l.LightningModule, ABC):
@@ -10,7 +11,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self,
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
-        lr: float,
+        optimizer,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['agents', 'cfg'])
@@ -182,16 +183,19 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def configure_optimizers(self) -> dict[str, object]:
         """Configure the optimizer used for training.
 
-        Uses the AdamW optimizer with the learning rate defined in
+        Uses an optimizer with the learning rate defined in
         ``self.hparams.lr``.
 
         Returns:
             dict[str, object]: A dictionary containing the optimizer used by
             the training loop. The dictionary has the following key:
 
-            - "optimizer": The instantiated AdamW optimizer.
+            - "optimizer": The instantiated optimizer.
         """
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        optimizer = instantiate(
+            self.hparams.optimizer,
+            params=self.parameters(),
+        )
         return {
             'optimizer': optimizer,
         }

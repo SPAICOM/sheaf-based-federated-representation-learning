@@ -100,12 +100,15 @@ def main(cfg: DictConfig) -> None:
     # ===================================================
     neighbors = {int(k): set(v) for k, v in cfg.orchestrator.neighbors.items()}
 
+    print('hdjshdjshdjshdjhdjds')
     # Instantiate orchestrator
     orchestrator = instantiate(
         cfg.orchestrator,
         agents=agents,
         neighbors=neighbors,
+        optimizer=cfg.optimizer,
         _convert_='all',
+        _recursive_=False,
     )
 
     # -------------------------

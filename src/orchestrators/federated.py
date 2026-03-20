@@ -9,12 +9,12 @@ class FederatedLearning(BaseOrchestrator):
         self,
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
-        lr: float,
+        optimizer,
     ):
         super().__init__(
             agents=agents,
             neighbors=neighbors,
-            lr=lr,
+            optimizer=optimizer,
         )
 
         self._validate_agents_for_fedavg()
@@ -140,12 +140,14 @@ class FederatedLearning(BaseOrchestrator):
         outputs = self(batch)
 
         total_loss = 0
+        total_performance = 0
 
         # Compute the personalized loss for each agent
         for idx, agent in self.agents.items():
             y_hat, y = outputs[idx]
 
             loss = agent.compute_loss(y_hat, y)
+            performance = agent.task_performance(y_hat, y)
 
             # per-agent loss
             self.log(
@@ -155,12 +157,31 @@ class FederatedLearning(BaseOrchestrator):
                 on_epoch=True,
             )
 
-            total_loss += loss
+            # per-agent task
+            self.log(
+                f'{prefix}/task_performance_agent_{idx}',
+                performance,
+                on_step=False,
+                on_epoch=True,
+            )
 
-        # Log the total_loss
+            total_loss += loss
+            total_performance += performance
+
+        # Average task across agents
+        avg_performance = total_performance / len(self.agents)
+
+        # Log the total
         self.log(
             f'{prefix}/total_loss_epoch',
             total_loss,
+            on_step=False,
+            on_epoch=True,
+        )
+
+        self.log(
+            f'{prefix}/avg_task_performance_epoch',
+            avg_performance,
             on_step=False,
             on_epoch=True,
         )

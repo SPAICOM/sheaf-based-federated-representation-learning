@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchmetrics.classification import MulticlassAccuracy
 
 
 class LatentClassifier(nn.Module):
@@ -57,6 +58,10 @@ class LatentClassifier(nn.Module):
         layers = []
         prev_dim = in_features
 
+        self.accuracy = MulticlassAccuracy(
+            num_classes=num_classes,
+        )
+
         # Build hidden layers
         for h_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, h_dim))
@@ -80,7 +85,10 @@ class LatentClassifier(nn.Module):
 
         self.classifier = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Forward pass of the classifier.
 
@@ -144,3 +152,47 @@ class LatentClassifier(nn.Module):
             )
 
         return F.cross_entropy(y_hat, y.long())
+
+    @torch.no_grad()
+    def task_performance(
+        self,
+        y_hat: torch.Tensor,
+        y: torch.Tensor,
+    ) -> float:
+        """
+        Compute classification accuracy.
+
+        Parameters
+        ----------
+        y_hat : torch.Tensor
+            Model outputs (logits) of shape (batch_size, num_classes).
+        y : torch.Tensor
+            Ground truth labels of shape (batch_size,).
+
+        Returns
+        -------
+        float
+            Accuracy (between 0 and 1).
+
+        Raises
+        ------
+        ValueError
+            If shapes are inconsistent.
+        """
+        if y_hat.ndim != 2:
+            raise ValueError(
+                'Expected y_hat of shape (batch_size, num_classes), '
+                f'got {y_hat.shape}'
+            )
+
+        if y.ndim != 1:
+            raise ValueError(
+                f'Expected y of shape (batch_size,), got {y.shape}'
+            )
+
+        preds = torch.argmax(y_hat, dim=1)
+        return self.accuracy(preds, y)
+
+
+if __name__ == '__main__':
+    pass
