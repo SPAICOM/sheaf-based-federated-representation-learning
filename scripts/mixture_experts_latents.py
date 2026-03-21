@@ -17,9 +17,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.utils import remove_non_empty_dir
 
-# torch.serialization.safe_globals([DictConfig, OmegaConf])
-# torch.serialization.add_safe_globals([omegaconf.dictconfig.DictConfig])
-
 
 @hydra.main(
     config_path='../config/hydra/',
@@ -100,7 +97,6 @@ def main(cfg: DictConfig) -> None:
     # ===================================================
     neighbors = {int(k): set(v) for k, v in cfg.orchestrator.neighbors.items()}
 
-    print('hdjshdjshdjshdjhdjds')
     # Instantiate orchestrator
     orchestrator = instantiate(
         cfg.orchestrator,
