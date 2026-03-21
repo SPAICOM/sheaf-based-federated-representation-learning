@@ -177,6 +177,7 @@ class FederatedLearning(BaseOrchestrator):
             total_loss,
             on_step=False,
             on_epoch=True,
+            prog_bar=True,
         )
 
         self.log(
@@ -184,6 +185,7 @@ class FederatedLearning(BaseOrchestrator):
             avg_performance,
             on_step=False,
             on_epoch=True,
+            prog_bar=True,
         )
 
         return outputs, total_loss

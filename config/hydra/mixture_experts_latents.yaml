@@ -3,7 +3,7 @@ defaults:
   - dataset: semantic-cifar10
   - model: latent_classifier
   - orchestrator: federated
-  - optimizer: sgd
+  - optimizer: adam
 
 seed: 42
 

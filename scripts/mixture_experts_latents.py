@@ -10,8 +10,6 @@ import copy
 
 import hydra
 from hydra.utils import instantiate
-
-# import omegaconf
 from lightning import Trainer, seed_everything
 from omegaconf import DictConfig, OmegaConf
 
