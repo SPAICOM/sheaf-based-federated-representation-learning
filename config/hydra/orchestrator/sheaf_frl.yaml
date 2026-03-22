@@ -1,8 +1,9 @@
 _target_: src.orchestrators.sheafFRL.SheafFRL
 
 lambda_sheaf: 0.01
-anchor_strategy: "batch" # to be refined, now it uses all samples in the batch 
+anchor_strategy: "prototype"
 parseval_normalization: True
+num_anchors: 128 # ignored by proto
 
 neighbors:
   0: [1]

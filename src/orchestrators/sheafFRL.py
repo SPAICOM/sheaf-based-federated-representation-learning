@@ -12,6 +12,7 @@ class SheafFRL(BaseOrchestrator):
         lambda_sheaf: float,
         latent_dims: dict,
         anchor_strategy: str,
+        num_anchors: int,
         parseval_normalization: bool,
         **kwargs,
     ):
@@ -23,8 +24,10 @@ class SheafFRL(BaseOrchestrator):
 
         self.lambda_sheaf = lambda_sheaf
         self.anchor_strategy = anchor_strategy
+        self.num_anchors = num_anchors
         self.stiefel_matrices = nn.ParameterDict()
         self.epoch_anchors = {} 
+        self.epoch_labels = []
         self.parseval_normalization = parseval_normalization
 
         # Force latent_dims to have integer keys and values
@@ -55,13 +58,70 @@ class SheafFRL(BaseOrchestrator):
                         stiefel_matrix, requires_grad=False
                     )
 
+    def _compute_anchors(self, latents: dict[int, torch.Tensor], labels: torch.Tensor) -> dict[int, torch.Tensor]:
+        """Computes or selects the final anchor representations based on the strategy."""
+
+        tot = len(labels)
+        uniques = torch.unique(labels)
+
+        if self.anchor_strategy == "prototype":
+            A_proto = {int(idx): [] for idx in self.agents.keys()}
+            
+            for c in uniques:
+                c_mask = (labels == c)
+                for idx in self.agents.keys():
+                    idx = int(idx)
+                    mean_anchor = latents[idx][c_mask].mean(dim=0)
+                    A_proto[idx].append(mean_anchor)
+            
+            return {idx: torch.stack(protos, dim=0) for idx, protos in A_proto.items()}
+
+        elif self.anchor_strategy == "balanced":
+            k = min(self.num_anchors, tot)
+            anchors_per_class = k // len(uniques)
+
+            selected_indices = []
+            for c in uniques:
+                c_idx = torch.where(labels == c)[0]
+                perm = torch.randperm(len(c_idx), device=labels.device)
+                chosen = c_idx[perm[:anchors_per_class]]
+                selected_indices.append(chosen)
+                
+            selected_indices = torch.cat(selected_indices)
+            
+            remaining = k - len(selected_indices)
+            if remaining > 0:
+                all_idx = torch.arange(tot, device=labels.device)
+                mask = torch.ones(tot, dtype=torch.bool, device=labels.device)
+                mask[selected_indices] = False
+                avail_idx = all_idx[mask]
+                
+                extra_perm = torch.randperm(len(avail_idx), device=labels.device)
+                extra = avail_idx[extra_perm[:remaining]]
+                selected_indices = torch.cat([selected_indices, extra])
+                
+            final_perm = torch.randperm(len(selected_indices), device=labels.device)
+            anchor_indices = selected_indices[final_perm]
+            
+            return {idx: A[anchor_indices] for idx, A in latents.items()}
+
+        elif self.anchor_strategy == "random":
+            k = min(self.num_anchors, tot)
+            perm = torch.randperm(tot, device=labels.device)
+            anchor_indices = perm[:k]
+            return {idx: A[anchor_indices] for idx, A in latents.items()}
+            
+        else:
+            return latents
+
     def on_train_epoch_start(self) -> None:
-        """Initialize/Reset the anchor lists at the start of each epoch."""
+        """Initialize/Reset the anchor (and its label) lists at the start of each epoch."""
         for idx_str in self.agents.keys():
             self.epoch_anchors[int(idx_str)] = []
+        self.epoch_labels = []
     
     def parseval_normalize(self, A: torch.Tensor) -> torch.Tensor:
-        """Apply Parseval normalization to the anchors latent representation as suggested"""
+        """Apply Parseval normalization to the anchors features as local whitening """
         C = torch.matmul(A.T, A)
         eps = 1e-4
         C = C + eps * torch.eye(C.size(0), device=C.device)
@@ -85,6 +145,9 @@ class SheafFRL(BaseOrchestrator):
             idx = int(idx_str)
             if self.epoch_anchors[idx]: 
                 A_dict[idx] = torch.cat(self.epoch_anchors[idx], dim=0)
+        
+        labels = torch.cat(self.epoch_labels, dim=0)
+        A_dict = self._compute_anchors(A_dict, labels)
             
         for edge_key, V_param in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
@@ -92,7 +155,10 @@ class SheafFRL(BaseOrchestrator):
             if node_i not in A_dict or node_j not in A_dict:
                 continue
 
-            C = torch.matmul(A_dict[node_i].T, A_dict[node_j])
+            A_i_unbiased = A_dict[node_i] - A_dict[node_i].mean(dim=0, keepdim=True)
+            A_j_unbiased = A_dict[node_j] - A_dict[node_j].mean(dim=0, keepdim=True)
+
+            C = torch.matmul(A_i_unbiased.T, A_j_unbiased)
             U, S, W_T = torch.linalg.svd(C, full_matrices=False)
             V_new = torch.matmul(U, W_T) 
 
@@ -101,6 +167,8 @@ class SheafFRL(BaseOrchestrator):
 
         for idx in self.epoch_anchors.keys():
             self.epoch_anchors[idx].clear()
+
+        self.epoch_labels.clear()
 
     def _shared_eval(
         self,
@@ -136,6 +204,8 @@ class SheafFRL(BaseOrchestrator):
 
             if prefix == 'train':
                 self.epoch_anchors[idx].append(A_i_tilde.detach())
+                if idx == 0:
+                    self.epoch_labels.append(y.detach())
 
             task_loss = agent.compute_loss(y_hat, y)
             task_performance = agent.task_performance(y_hat, y)
