@@ -3,8 +3,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
+from abc import ABC, abstractmethod
 
-class LatentClassifier(nn.Module):
+class BaseAgent(nn.Module, ABC):
+    """Abstract base class for all federated learning agents."""
+    
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Starndard forward pass of the agent."""
+        pass
+
+    @abstractmethod
+    def forward_with_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass returning both logits for a classifier and the internal latent representation.
+        The child class determines which internal layer constitutes the 'latent' space.
+        """
+        pass
+
+    @abstractmethod
+    def compute_loss(self, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Compute the task-specific loss."""
+        pass
+
+    @abstractmethod
+    def task_performance(self, y_hat: torch.Tensor, y: torch.Tensor) -> float:
+        """Compute the task-specific performance metric."""
+        pass
+
+
+class LatentClassifier(BaseAgent):
     """
     A flexible multi-layer perceptron (MLP) classifier for vector inputs.
 
@@ -114,6 +142,22 @@ class LatentClassifier(nn.Module):
             )
 
         return self.classifier(x)
+
+    def forward_with_features(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+
+        if x.ndim != 2:
+            raise ValueError(
+                'Expected input of shape (batch_size, in_features),'
+                f'got {x.shape}'
+            )
+
+        features = self.classifier[:-1](x)
+        logits = self.classifier[-1](features)
+
+        return logits, features
 
     def compute_loss(
         self,
