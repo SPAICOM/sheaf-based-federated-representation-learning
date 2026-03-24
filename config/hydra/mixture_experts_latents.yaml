@@ -7,6 +7,13 @@ defaults:
 
 seed: 42
 
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.3
+  m: 3
+  neighbors: {}
+
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: sheaf-repr-learning__mixture-experts-latents

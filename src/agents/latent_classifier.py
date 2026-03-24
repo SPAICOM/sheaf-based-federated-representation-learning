@@ -1,40 +1,15 @@
+"""Latent-based classifier agent for federated learning."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
-from abc import ABC, abstractmethod
-
-class BaseAgent(nn.Module, ABC):
-    """Abstract base class for all federated learning agents."""
-    
-    @abstractmethod
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Starndard forward pass of the agent."""
-        pass
-
-    @abstractmethod
-    def forward_with_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass returning both logits for a classifier and the internal latent representation.
-        The child class determines which internal layer constitutes the 'latent' space.
-        """
-        pass
-
-    @abstractmethod
-    def compute_loss(self, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute the task-specific loss."""
-        pass
-
-    @abstractmethod
-    def task_performance(self, y_hat: torch.Tensor, y: torch.Tensor) -> float:
-        """Compute the task-specific performance metric."""
-        pass
+from .base_agent import BaseAgent
 
 
 class LatentClassifier(BaseAgent):
-    """
-    A flexible multi-layer perceptron (MLP) classifier for vector inputs.
+    """A flexible multi-layer perceptron (MLP) classifier for vector inputs.
 
     This module is designed to operate on inputs that are already flattened
     feature vectors (e.g., outputs from a pretrained model or embedding layer).
@@ -62,6 +37,8 @@ class LatentClassifier(BaseAgent):
     classifier : nn.Sequential
         The sequential stack of linear, normalization, activation,
         and dropout layers.
+    accuracy : MulticlassAccuracy
+        TorchMetrics accuracy calculator.
 
     Notes
     -----
@@ -90,7 +67,6 @@ class LatentClassifier(BaseAgent):
             num_classes=num_classes,
         )
 
-        # Build hidden layers
         for h_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, h_dim))
 
@@ -108,7 +84,6 @@ class LatentClassifier(BaseAgent):
 
             prev_dim = h_dim
 
-        # Final classification layer
         layers.append(nn.Linear(prev_dim, num_classes))
 
         self.classifier = nn.Sequential(*layers)
@@ -117,8 +92,7 @@ class LatentClassifier(BaseAgent):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass of the classifier.
+        """Forward pass of the classifier.
 
         Parameters
         ----------
@@ -147,7 +121,24 @@ class LatentClassifier(BaseAgent):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning logits and latent features.
 
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, in_features).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Tuple of (logits, features) where features are the output of the
+            last hidden layer.
+
+        Raises
+        ------
+        ValueError
+            If the input tensor is not 2-dimensional.
+        """
         if x.ndim != 2:
             raise ValueError(
                 'Expected input of shape (batch_size, in_features),'
@@ -164,8 +155,7 @@ class LatentClassifier(BaseAgent):
         y_hat: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute the loss for classification.
+        """Compute the loss for classification.
 
         Parameters
         ----------
@@ -203,8 +193,7 @@ class LatentClassifier(BaseAgent):
         y_hat: torch.Tensor,
         y: torch.Tensor,
     ) -> float:
-        """
-        Compute classification accuracy.
+        """Compute classification accuracy.
 
         Parameters
         ----------

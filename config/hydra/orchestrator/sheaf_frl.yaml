@@ -3,12 +3,10 @@ _target_: src.orchestrators.sheafFRL.SheafFRL
 lambda_sheaf: 0.01
 anchor_strategy: "prototype"
 parseval_normalization: True
-num_anchors: 128 # ignored by proto
+num_anchors: 128
 
-neighbors:
-  0: [1]
-  1: [0]
+neighbors: {}
 
 per_agent_hidden_dims:
-  0: [128, 64]        
-  1: [64, 32]        
+  0: [128, 64]
+  1: [64, 32]

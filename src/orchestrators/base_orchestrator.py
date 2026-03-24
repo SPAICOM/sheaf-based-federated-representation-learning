@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 import lightning as l
 import torch
@@ -7,6 +8,29 @@ from hydra.utils import instantiate
 
 
 class BaseOrchestrator(l.LightningModule, ABC):
+    """Abstract base orchestrator for federated learning with multiple agents.
+
+    Base class that defines the interface for orchestrating training across
+    multiple agents in a federated learning setting. Subclasses must implement
+    epoch-end aggregation logic and evaluation procedures.
+
+    Parameters
+    ----------
+    agents : dict[int, nn.Module]
+        Dictionary mapping agent indices to their model instances. Must not be
+        empty.
+    neighbors : dict[int, set[int]]
+        Dictionary mapping each agent index to the set of its neighbor indices.
+    optimizer : hydra config
+        Optimizer configuration for training.
+
+    Notes
+    -----
+    - Agents are stored in a ``ModuleDict`` so Lightning can track parameters.
+    - Subclasses must implement ``on_train_epoch_end`` for epoch-level ops.
+    - Subclasses must implement ``_shared_eval`` for evaluation logic.
+    """
+
     def __init__(
         self,
         agents: dict[int, nn.Module],
@@ -18,34 +42,35 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         assert len(agents) > 0, 'The "agents" dictionary must be not empty'
 
-        # Store agents in a ModuleDict so Lightning tracks parameters
         self.agents = nn.ModuleDict(
             {str(idx): agent for idx, agent in agents.items()}
         )
 
     @abstractmethod
     def on_train_epoch_end(self):
+        """Perform epoch-level aggregation or updates.
+
+        Called at the end of each training epoch. Subclasses should implement
+        this method to perform operations such as federated averaging,
+        parameter synchronization, or model aggregation across agents.
+        """
         pass
 
     def forward(
         self,
         batch: dict[int, list[torch.Tensor]],
     ) -> dict[str, torch.Tensor]:
-        """
-        Forward pass for multiple agents.
+        """Forward pass for multiple agents.
 
-        Args:
-            batch : dict[int, torch.Tensor]
-                Dictionary mapping agent names to their input tensors.
-                   Example:
-                   {
-                       "agent1": x1,
-                       "agent2": x2,
-                   }
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
 
-        Returns:
-            outputs : dict[str, torch.Tensor]
-                Dictionary mapping agent names to their latent representations.
+        Returns
+        -------
+        dict[str, tuple[torch.Tensor, torch.Tensor]]
+            Dictionary mapping agent indices to (prediction, label) pairs.
         """
         if isinstance(batch, tuple):
             batch = batch[0]
@@ -54,7 +79,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         for idx, agent in self.agents.items():
             key = str(idx) if str(idx) in batch else idx
-            x, y = batch[key]  # (embedding, label)
+            x, y = batch[key]
 
             y_hat = agent(x)
 
@@ -62,48 +87,56 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         return outputs
 
-    @abstractmethod
     def _shared_eval(
         self,
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
         prefix: str,
-    ):
-        """A common step performed in the test and validation step.
+    ) -> tuple[dict[str, Any], torch.Tensor]:
+        """Compute losses and metrics for validation/test steps.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
-            prefix : str
-                The step type for logging purposes.
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
+        prefix : str
+            Prefix for logging (e.g., 'train', 'validation', 'test').
 
-        Returns:
-            (outputs, total_loss) : tuple[
-                                        dict[int, torch.Tensor],
-                                        torch.Tensor,
-                                    ]
-                The tuple with the output of the network and the epoch loss.
+        Returns
+        -------
+        tuple[dict, torch.Tensor]
+            Tuple of (outputs, total_loss) where outputs maps agent indices to
+            (prediction, label) pairs and total_loss is the summed loss.
+
+        Raises
+        ------
+        NotImplementedError
+            This method must be implemented by subclasses.
         """
-        pass
+        raise NotImplementedError(
+            f'{self.__class__.__name__} must implement _shared_eval'
+        )
 
     def training_step(
         self,
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> torch.Tensor:
-        """The training step.
+        """Execute a single training step.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
 
-        Returns:
-            loss : torch.Tensor
-                The epoch loss.
+        Returns
+        -------
+        torch.Tensor
+            Training loss for the step.
         """
         _, loss = self._shared_eval(
             batch=batch,
@@ -117,40 +150,39 @@ class BaseOrchestrator(l.LightningModule, ABC):
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> None:
-        """The test step.
+        """Execute a single test step.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
-
-        Returns:
-            None
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
         """
-        _ = self._shared_eval(
+        self._shared_eval(
             batch=batch,
             batch_idx=batch_idx,
             prefix='test',
         )
-        return None
 
     def validation_step(
         self,
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> dict[int, torch.Tensor]:
-        """The validation step.
+        """Execute a single validation step.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
 
-        Returns:
-            output : dict[int, torch.Tensor]
-                The output of the network.
+        Returns
+        -------
+        dict[int, tuple[torch.Tensor, torch.Tensor]]
+            Dictionary mapping agent indices to (prediction, label) pairs.
         """
         output, _ = self._shared_eval(
             batch=batch,
@@ -164,33 +196,29 @@ class BaseOrchestrator(l.LightningModule, ABC):
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> dict[int, torch.Tensor]:
-        """The predict step.
+        """Execute a single prediction step.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
-            dataloader_idx : int
-                The dataloader idx.
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
 
-        Returns:
-            dict[int, torch.Tensor]
-                The output of the network.
+        Returns
+        -------
+        dict[int, tuple[torch.Tensor, torch.Tensor]]
+            Dictionary mapping agent indices to (prediction, label) pairs.
         """
         return self(batch)
 
     def configure_optimizers(self) -> dict[str, object]:
-        """Configure the optimizer used for training.
+        """Configure the optimizer for training.
 
-        Uses an optimizer with the learning rate defined in
-        ``self.hparams.lr``.
-
-        Returns:
-            dict[str, object]: A dictionary containing the optimizer used by
-            the training loop. The dictionary has the following key:
-
-            - "optimizer": The instantiated optimizer.
+        Returns
+        -------
+        dict[str, object]
+            Dictionary containing the configured optimizer.
         """
         optimizer = instantiate(
             self.hparams.optimizer,

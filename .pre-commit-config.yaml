@@ -1,19 +1,12 @@
-_target_: src.datamodules.SemanticDataModule
-
-repo: spaicom-lab
-name: semantic-cifar10
-
-models:
-  - aimv2_1b_patch14_224.apple_pt
-  - aimv2_1b_patch14_336.apple_pt
-
-attributes:
-  - label
-
-batch_size: 64
-num_workers: 4
-
-val_split: 0.1
-test_split: 0.1
-seed: 42
-mode: min_size
+repos:
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.10.9
+    hooks:
+      - id: uv-lock
+      - id: uv-export
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.5
+    hooks:
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format

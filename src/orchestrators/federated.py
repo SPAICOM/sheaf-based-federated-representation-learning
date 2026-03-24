@@ -5,6 +5,30 @@ from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
 class FederatedLearning(BaseOrchestrator):
+    """Federated learning orchestrator with neighbor-restricted averaging.
+
+    Implements a localized variant of Federated Averaging where each agent
+    updates its parameters by averaging only over its local neighborhood in a
+    graph, rather than aggregating across all agents.
+
+    Parameters
+    ----------
+    agents : dict[int, nn.Module]
+        Dictionary mapping agent indices to their model instances. All agents
+        must share the same architecture and parameter structure.
+    neighbors : dict[int, set[int]]
+        Dictionary mapping each agent index to the set of its neighbor indices.
+    optimizer : hydra config
+        Optimizer configuration for training.
+
+    Notes
+    -----
+    - All agents must have identical architecture (validated at init).
+    - Both model parameters and buffers (e.g., BatchNorm) are
+      aggregated via ``state_dict()``.
+    - Each agent is always included in its own aggregation set.
+    """
+
     def __init__(
         self,
         agents: dict[int, nn.Module],
@@ -20,6 +44,18 @@ class FederatedLearning(BaseOrchestrator):
         self._validate_agents_for_fedavg()
 
     def _validate_agents_for_fedavg(self):
+        """Validate that all agents have compatible architectures.
+
+        Checks that all agents share the same class type, parameter names,
+        parameter shapes, and buffer definitions.
+
+        Raises
+        ------
+        TypeError
+            If any agent has a different class than the reference agent.
+        ValueError
+            If parameter names, shapes, or buffers mismatch between agents.
+        """
         agents = list(self.agents.values())
         ref = agents[0]
 
@@ -46,15 +82,8 @@ class FederatedLearning(BaseOrchestrator):
     def on_train_epoch_end(self) -> None:
         """Perform neighbor-restricted Federated Averaging.
 
-        This method implements a localized variant of Federated Averaging
-        where, instead of aggregating parameters across all agents, each agent
-        updates its parameters by averaging only over its local neighborhood
-        in a graph.
-
         For each agent ``i``, the updated parameters are computed as the
-        average of the parameters of the agents in the set:
-
-            {i} ∪ neighbors[i]
+        average of the parameters of the agents in ``{i} ∪ neighbors[i]``.
 
         The aggregation is performed synchronously:
         1. All new averaged states are computed and stored.
@@ -62,57 +91,37 @@ class FederatedLearning(BaseOrchestrator):
 
         This avoids in-place updates that would otherwise bias the aggregation.
 
-        Notes:
-            - The method assumes that all agents share the same architecture
-              and parameter structure (validated beforehand).
-            - Both model parameters and buffers (e.g., BatchNorm statistics or
-              registered buffers) are included via ``state_dict()``.
-            - The neighborhood structure must be provided in
-              ``self.hparams.neighbors`` as a mapping:
-                  dict[int, set[int]]
-            - Each agent is always included in its own aggregation.
-
-        Raises:
-            KeyError: If an agent index is missing from the neighbor
-                      dictionary.
-
-        Returns:
-            None
+        Raises
+        ------
+        KeyError
+            If an agent index is missing from the neighbor dictionary.
         """
-        # Convert ModuleDict → int-indexed dict
         agents = {int(k): v for k, v in self.agents.items()}
 
-        # Store new states (avoid in-place updates)
         new_states = {}
 
         for idx_i, agent_i in agents.items():
-            # Include self in neighborhood
             neigh = self.hparams.neighbors[idx_i] | {idx_i}
 
-            # Initialize accumulator
             avg_state = {
                 k: torch.zeros_like(v) for k, v in agent_i.state_dict().items()
             }
 
-            # Aggregate neighbors
             for idx_j in neigh:
                 state_j = agents[idx_j].state_dict()
 
                 for k in avg_state:
                     avg_state[k] += state_j[k]
 
-            # Average
             for k in avg_state:
-                avg_state[k] /= len(neigh)
+                avg_state[k] = (avg_state[k].float() / len(neigh)).to(
+                    avg_state[k].dtype
+                )
 
-            # Store result (do NOT load yet)
             new_states[idx_i] = avg_state
 
-        # Apply updates synchronously
         for idx_i, agent in agents.items():
             agent.load_state_dict(new_states[idx_i])
-
-        return None
 
     def _shared_eval(
         self,
@@ -120,36 +129,34 @@ class FederatedLearning(BaseOrchestrator):
         batch_idx: int,
         prefix: str,
     ):
-        """A common step performed in the test and validation step.
+        """Compute losses and metrics for validation/test steps.
 
-        Args:
-            batch : dict[int, list[torch.Tensor]]
-                The current batch.
-            batch_idx : int
-                The batch index.
-            prefix : str
-                The step type for logging purposes.
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Dictionary mapping agent indices to (input, label) pairs.
+        batch_idx : int
+            Index of the current batch.
+        prefix : str
+            Prefix for logging (e.g., 'train', 'validation', 'test').
 
-        Returns:
-            (outputs, total_loss) : tuple[
-                                        dict[int, torch.Tensor],
-                                        torch.Tensor,
-                                    ]
-                The tuple with the output of the network and the epoch loss.
+        Returns
+        -------
+        tuple[dict[int, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]
+            Tuple of (outputs, total_loss) where outputs maps agent indices to
+            (prediction, label) pairs and total_loss is the summed loss.
         """
         outputs = self(batch)
 
         total_loss = 0
         total_performance = 0
 
-        # Compute the personalized loss for each agent
         for idx, agent in self.agents.items():
             y_hat, y = outputs[idx]
 
             loss = agent.compute_loss(y_hat, y)
             performance = agent.task_performance(y_hat, y)
 
-            # per-agent loss
             self.log(
                 f'{prefix}/loss_agent_{idx}',
                 loss,
@@ -157,7 +164,6 @@ class FederatedLearning(BaseOrchestrator):
                 on_epoch=True,
             )
 
-            # per-agent task
             self.log(
                 f'{prefix}/task_performance_agent_{idx}',
                 performance,
@@ -168,10 +174,8 @@ class FederatedLearning(BaseOrchestrator):
             total_loss += loss
             total_performance += performance
 
-        # Average task across agents
         avg_performance = total_performance / len(self.agents)
 
-        # Log the total
         self.log(
             f'{prefix}/total_loss_epoch',
             total_loss,
