@@ -157,17 +157,23 @@ class LatentClassifier(BaseAgent):
     ) -> torch.Tensor:
         """Compute the loss for classification.
 
+        Uses cross-entropy loss which combines log-softmax and negative
+        log-likelihood. This is more numerically stable than computing
+        softmax followed by log explicitly.
+
         Parameters
         ----------
         y_hat : torch.Tensor
             Model outputs (logits) of shape (batch_size, num_classes).
+            Raw unnormalized scores from the final linear layer.
         y : torch.Tensor
             Ground truth labels of shape (batch_size,).
+            Must be integer class indices in range [0, num_classes).
 
         Returns
         -------
         torch.Tensor
-            Scalar loss value.
+            Scalar loss value (mean over batch).
 
         Raises
         ------

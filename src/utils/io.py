@@ -1,3 +1,13 @@
+"""Input/Output utilities for experiment management.
+
+This module provides utilities for file system operations, particularly
+handling of experiment output directories and checkpoint management.
+
+Functions
+---------
+remove_non_empty_dir : Remove directory and all its contents recursively.
+"""
+
 import shutil
 from pathlib import Path
 

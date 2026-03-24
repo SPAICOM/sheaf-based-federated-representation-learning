@@ -11,6 +11,10 @@ class FederatedLearning(BaseOrchestrator):
     updates its parameters by averaging only over its local neighborhood in a
     graph, rather than aggregating across all agents.
 
+    In this framework, the communication graph defines which agents can share
+    their model updates. For each agent i, only agents in the set
+    {i} ∪ neighbors[i] contribute to the aggregation.
+
     Parameters
     ----------
     agents : dict[int, nn.Module]
@@ -21,12 +25,20 @@ class FederatedLearning(BaseOrchestrator):
     optimizer : hydra config
         Optimizer configuration for training.
 
+    Example
+    -------
+    Given 3 agents with neighbors {0: {1}, 1: {0, 2}, 2: {1}}:
+    - Agent 0 aggregates: (agent_0 + agent_1) / 2
+    - Agent 1 aggregates: (agent_0 + agent_1 + agent_2) / 3
+    - Agent 2 aggregates: (agent_1 + agent_2) / 2
+
     Notes
     -----
     - All agents must have identical architecture (validated at init).
     - Both model parameters and buffers (e.g., BatchNorm) are
       aggregated via ``state_dict()``.
     - Each agent is always included in its own aggregation set.
+    - Aggregation is performed synchronously to avoid update order bias.
     """
 
     def __init__(
@@ -91,6 +103,13 @@ class FederatedLearning(BaseOrchestrator):
 
         This avoids in-place updates that would otherwise bias the aggregation.
 
+        The algorithm:
+        1. Iterate over each agent and its neighborhood (including itself)
+        2. Initialize accumulator with zeros matching agent's state_dict
+        3. Sum state_dicts from all neighbors
+        4. Divide by number of participants to get the average
+        5. Store averaged state and apply after loop (synchronous update)
+
         Raises
         ------
         KeyError
@@ -101,18 +120,24 @@ class FederatedLearning(BaseOrchestrator):
         new_states = {}
 
         for idx_i, agent_i in agents.items():
+            # Include agent itself in aggregation set (neighbors | {self})
             neigh = self.hparams.neighbors[idx_i] | {idx_i}
 
+            # Initialize accumulator with zero tensors matching agent_i's
+            # structure
             avg_state = {
                 k: torch.zeros_like(v) for k, v in agent_i.state_dict().items()
             }
 
+            # Accumulate state_dicts from all neighbors
             for idx_j in neigh:
                 state_j = agents[idx_j].state_dict()
 
                 for k in avg_state:
                     avg_state[k] += state_j[k]
 
+            # Compute average and convert to original dtype
+            # Using float division then converting back handles mixed precision
             for k in avg_state:
                 avg_state[k] = (avg_state[k].float() / len(neigh)).to(
                     avg_state[k].dtype
@@ -120,6 +145,7 @@ class FederatedLearning(BaseOrchestrator):
 
             new_states[idx_i] = avg_state
 
+        # Apply all averaged states synchronously (avoids update order bias)
         for idx_i, agent in agents.items():
             agent.load_state_dict(new_states[idx_i])
 
@@ -157,16 +183,11 @@ class FederatedLearning(BaseOrchestrator):
             loss = agent.compute_loss(y_hat, y)
             performance = agent.task_performance(y_hat, y)
 
-            self.log(
-                f'{prefix}/loss_agent_{idx}',
-                loss,
-                on_step=False,
-                on_epoch=True,
-            )
-
-            self.log(
-                f'{prefix}/task_performance_agent_{idx}',
-                performance,
+            self.log_dict(
+                {
+                    f'{prefix}/loss_agent_{idx}': loss,
+                    f'{prefix}/task_performance_agent_{idx}': performance,
+                },
                 on_step=False,
                 on_epoch=True,
             )
@@ -176,17 +197,11 @@ class FederatedLearning(BaseOrchestrator):
 
         avg_performance = total_performance / len(self.agents)
 
-        self.log(
-            f'{prefix}/total_loss_epoch',
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-        )
-
-        self.log(
-            f'{prefix}/avg_task_performance_epoch',
-            avg_performance,
+        self.log_dict(
+            {
+                f'{prefix}/total_loss_epoch': total_loss,
+                f'{prefix}/avg_task_performance_epoch': avg_performance,
+            },
             on_step=False,
             on_epoch=True,
             prog_bar=True,

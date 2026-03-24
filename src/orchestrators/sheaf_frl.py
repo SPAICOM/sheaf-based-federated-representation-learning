@@ -63,24 +63,35 @@ class SheafFRL(BaseOrchestrator):
 
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
+        # Create Stiefel matrices for each edge in the neighbor graph
+        # Stiefel matrices V_ij map latent space of agent j to agent i
         for i_raw, neighborset in neighbors.items():
             for j_raw in neighborset:
                 i = int(i_raw)
                 j = int(j_raw)
 
+                # Sort nodes by dimension to ensure consistent edge keys
+                # Higher-dimensional node comes first for consistent key
+                # generation
                 if latent_dims_int[i] > latent_dims_int[j]:
                     node_i, node_j = i, j
                 elif latent_dims_int[i] < latent_dims_int[j]:
                     node_i, node_j = j, i
                 else:
+                    # Equal dimensions: use max/min for deterministic ordering
                     node_i, node_j = max(i, j), min(i, j)
 
                 edge_key = f'{node_i}_{node_j}'
 
+                # Only create matrix once per edge (avoid duplicates from
+                # both directions)
                 if edge_key not in self.stiefel_matrices:
                     d_i = latent_dims_int[node_i]
                     d_j = latent_dims_int[node_j]
 
+                    # Initialize as identity (identity mapping)
+                    # requires_grad=False because we use closed-form SVD
+                    # updates
                     stiefel_matrix = torch.eye(d_i, d_j)
 
                     self.stiefel_matrices[edge_key] = nn.Parameter(
@@ -219,6 +230,15 @@ class SheafFRL(BaseOrchestrator):
         Computes unbiased anchor representations, calculates cross-covariance
         matrices between neighboring agents, and updates Stiefel matrices via
         closed-form SVD-based optimization.
+
+        The Stiefel manifold optimization finds the optimal orthogonal
+        projection that aligns latent spaces between neighboring agents.
+        This is solved via:
+
+        V* = argmin_V ||A_i - A_j V^T||_F^2
+
+        The solution is given by V = UV^T where C = A_i^T A_j = UΣV^T is
+        the SVD. This enforces V^T V = I (orthonormality constraint).
         """
         if not self.epoch_anchors or not any(self.epoch_anchors.values()):
             return
@@ -238,6 +258,8 @@ class SheafFRL(BaseOrchestrator):
             if node_i not in A_dict or node_j not in A_dict:
                 continue
 
+            # Center the data (subtract mean) for unbiased covariance
+            # estimation
             A_i_unbiased = A_dict[node_i] - A_dict[node_i].mean(
                 dim=0, keepdim=True
             )
@@ -245,7 +267,12 @@ class SheafFRL(BaseOrchestrator):
                 dim=0, keepdim=True
             )
 
+            # Compute cross-covariance matrix between agents i and j
+            # C = A_i^T A_j (no division by n since we're using SVD anyway)
             C = torch.matmul(A_i_unbiased.T, A_j_unbiased)
+
+            # SVD gives C = UΣV^T; optimal Stiefel matrix is V = U @ V^T
+            # This solves the Procrustes problem for orthogonal matrices
             U, S, W_T = torch.linalg.svd(C, full_matrices=False)
             V_new = torch.matmul(U, W_T)
 
@@ -310,16 +337,11 @@ class SheafFRL(BaseOrchestrator):
             task_loss = agent.compute_loss(y_hat, y)
             task_performance = agent.task_performance(y_hat, y)
 
-            self.log(
-                f'{prefix}/task_loss_agent_{idx}',
-                task_loss,
-                on_step=False,
-                on_epoch=True,
-            )
-
-            self.log(
-                f'{prefix}/task_performance_agent_{idx}',
-                task_performance,
+            self.log_dict(
+                {
+                    f'{prefix}/task_loss_agent_{idx}': task_loss,
+                    f'{prefix}/task_performance_agent_{idx}': task_performance,
+                },
                 on_step=False,
                 on_epoch=True,
             )
@@ -329,38 +351,36 @@ class SheafFRL(BaseOrchestrator):
 
         sheaf_penalty = 0.0
 
+        # Compute sheaf regularization: penalizes discrepancy between
+        # latent spaces
+        # The penalty encourages A_i ≈ A_j @ V_ij^T where V_ij is the
+        # Stiefel matrix
+        # This enforces consistency across the sheaf (graph structure)
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
             node_i, node_j = int(node_i), int(node_j)
 
+            # Compute reconstruction: project node_j features through
+            # Stiefel matrix
+            # A_j @ V^T maps from j's latent space to i's latent space
             diff = batch_latents[node_i] - torch.matmul(
                 batch_latents[node_j], V.T
             )
+            # Frobenius norm (squared) measures reconstruction error
             frob_dist = (diff**2).sum(dim=1).mean()
             sheaf_penalty += frob_dist
-
-        self.log(
-            f'{prefix}/sheaf_penalty',
-            sheaf_penalty,
-            on_step=False,
-            on_epoch=True,
-        )
 
         total_loss = (
             total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
         )
         avg_performance = total_task_performance / len(self.agents)
 
-        self.log(
-            f'{prefix}/total_loss_epoch',
-            total_loss,
-            on_step=False,
-            on_epoch=True,
-        )
-
-        self.log(
-            f'{prefix}/avg_task_performance_epoch',
-            avg_performance,
+        self.log_dict(
+            {
+                f'{prefix}/sheaf_penalty': sheaf_penalty,
+                f'{prefix}/total_loss_epoch': total_loss,
+                f'{prefix}/avg_task_performance_epoch': avg_performance,
+            },
             on_step=False,
             on_epoch=True,
         )

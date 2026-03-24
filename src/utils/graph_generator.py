@@ -11,27 +11,29 @@ def generate_neighbors(
     m: int = 3,
     manual: dict | None = None,
 ) -> dict[int, set[int]]:
-    """
-    Generate neighbor dictionary from a graph model.
+    """Generate neighbor dictionary from a graph model.
+
+    Creates a communication graph for federated learning where edges define
+    which agents can share model updates with each other.
 
     Parameters
     ----------
     mode : str
         Graph generation mode. Options:
-        - "manual": Use provided manual dictionary
-        - "fully_connected": Complete graph
-        - "erdos_renyi": Random graph with edge probability p
-        - "barabasi": Barabasi-Albert preferential attachment
-          with m edges per new node
+        - "manual": Use provided manual dictionary (for custom topologies)
+        - "fully_connected": Complete graph (all agents can communicate)
+        - "erdos_renyi": Random graph with edge probability p (G(n,p) model)
+        - "barabasi": Barabasi-Albert preferential attachment (scale-free)
     n_agents : int
         Number of agents (nodes) in the graph
     seed : int
-        Random seed for reproducibility
+        Random seed for reproducibility (default: 42)
     p : float
         Edge probability for Erdos-Renyi (default: 0.3)
+        Higher p → more edges → denser communication
     m : int
         Number of edges to attach from a new node in Barabasi-Albert
-        (default: 3)
+        (default: 3). Controls the power-law exponent.
     manual : dict, optional
         Manual neighbor dictionary, only used when mode="manual"
 
@@ -44,6 +46,12 @@ def generate_neighbors(
     ------
     ValueError
         If mode is unknown
+
+    Graph Characteristics
+    ----------------------
+    - Erdos-Renyi: Random structure, approximate uniform degree distribution
+    - Barabasi-Albert: Scale-free, few hubs with many connections
+    - Fully Connected: Maximum communication overhead, fastest consensus
     """
     match mode:
         case 'manual':

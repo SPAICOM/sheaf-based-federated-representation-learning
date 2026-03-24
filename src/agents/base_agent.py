@@ -1,4 +1,41 @@
-"""Base agent abstract class for federated learning."""
+"""Base agent abstract class for federated learning.
+
+This module defines the interface contract that all federated learning agents
+must implement. Each agent represents a model that can be trained locally
+and potentially shared/aggregated with other agents in the federation.
+
+Subclass Requirements
+---------------------
+Derived agents must implement four abstract methods:
+    - ``forward``: Standard forward pass returning predictions (logits)
+    - ``forward_with_features``: Returns predictions AND intermediate
+      latent features
+    - ``compute_loss``: Task-specific loss computation (e.g., CrossEntropy
+      for classification)
+    - ``task_performance``: Task-specific metric (e.g., accuracy, F1, MSE)
+
+Usage Example
+-------------
+    >>> from src.agents.base_agent import BaseAgent
+    >>> from src.agents.latent_classifier import LatentClassifier
+    >>>
+    >>> # Create an agent for 10-class classification with 128-dim input
+    >>> agent = LatentClassifier(in_features=128, num_classes=10)
+    >>>
+    >>> # Standard forward pass returns logits
+    >>> x = torch.randn(32, 128)
+    >>> logits = agent(x)
+    >>> print(logits.shape)  # torch.Size([32, 10])
+    >>>
+    >>> # Forward with features returns logits and latent representation
+    >>> logits, features = agent.forward_with_features(x)
+    >>> print(features.shape)  # torch.Size([32, 64]) (last hidden layer)
+    >>>
+    >>> # Compute loss and performance metric
+    >>> y = torch.randint(0, 10, (32,))
+    >>> loss = agent.compute_loss(logits, y)
+    >>> accuracy = agent.task_performance(logits, y)
+"""
 
 from abc import ABC, abstractmethod
 

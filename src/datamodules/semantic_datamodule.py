@@ -170,6 +170,11 @@ class SemanticDataModule(l.LightningDataModule):
     def _merge_all_splits(self, ds) -> torch.utils.data.Dataset:
         """Merge all available splits into one dataset.
 
+        HuggingFace datasets often provide train/validation/test splits
+        separately. This method concatenates all splits to maximize the
+        available data before re-splitting according to our custom
+        proportions.
+
         Parameters
         ----------
         ds : datasets.DatasetDict
@@ -184,7 +189,15 @@ class SemanticDataModule(l.LightningDataModule):
         return concatenate_datasets(splits)
 
     def _resplit(self, dataset):
-        """Split dataset into train / val / test.
+        """Split dataset into train / val / test using stratified sampling.
+
+        Uses a two-stage split to avoid data leakage and ensure
+        reproducibility:
+        1. First split: separate (train) from (val + test) based on
+           combined ratio
+        2. Second split: separate val from test within the held-out portion
+
+        This ensures the test set is never seen during training/validation.
 
         Parameters
         ----------
