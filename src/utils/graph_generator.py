@@ -45,21 +45,25 @@ def generate_neighbors(
     ValueError
         If mode is unknown
     """
-    if mode == 'manual':
-        if manual is None:
-            return {}
-        return {int(k): set(v) for k, v in manual.items()}
+    match mode:
+        case 'manual':
+            if manual is None:
+                return {}
+            return {int(k): set(v) for k, v in manual.items()}
 
-    if mode == 'fully_connected':
-        G = nx.complete_graph(n_agents)
-    elif mode == 'erdos_renyi':
-        G = nx.erdos_renyi_graph(n_agents, p, seed=seed)
-    elif mode == 'barabasi':
-        G = nx.barabasi_albert_graph(n_agents, m, seed=seed)
-    else:
-        raise ValueError(
-            f'Unknown neighbors_mode: {mode}. Valid options: '
-            "'manual', 'erdos_renyi', 'barabasi', 'fully_connected'"
-        )
+        case 'fully_connected':
+            G = nx.complete_graph(n_agents)
+
+        case 'erdos_renyi':
+            G = nx.erdos_renyi_graph(n_agents, p, seed=seed)
+
+        case 'barabasi':
+            G = nx.barabasi_albert_graph(n_agents, m, seed=seed)
+
+        case _:
+            raise ValueError(
+                f'Unknown neighbors_mode: {mode}. Valid options: '
+                "'manual', 'erdos_renyi', 'barabasi', 'fully_connected'"
+            )
 
     return {i: set(G.neighbors(i)) for i in range(n_agents)}

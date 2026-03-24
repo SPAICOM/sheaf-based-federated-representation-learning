@@ -1,4 +1,4 @@
-_target_: src.orchestrators.sheafFRL.SheafFRL
+_target_: src.orchestrators.SheafFRL
 
 lambda_sheaf: 0.01
 anchor_strategy: "prototype"

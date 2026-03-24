@@ -55,24 +55,22 @@ class SheafFRL(BaseOrchestrator):
             optimizer=optimizer,
         )
 
-        self.lambda_sheaf = lambda_sheaf
-        self.anchor_strategy = anchor_strategy
-        self.num_anchors = num_anchors
+        self.save_hyperparameters()
+
         self.stiefel_matrices = nn.ParameterDict()
         self.epoch_anchors = {}
         self.epoch_labels = []
-        self.parseval_normalization = parseval_normalization
 
-        self.latent_dims = {int(k): int(v) for k, v in latent_dims.items()}
+        latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
         for i_raw, neighborset in neighbors.items():
             for j_raw in neighborset:
                 i = int(i_raw)
                 j = int(j_raw)
 
-                if self.latent_dims[i] > self.latent_dims[j]:
+                if latent_dims_int[i] > latent_dims_int[j]:
                     node_i, node_j = i, j
-                elif self.latent_dims[i] < self.latent_dims[j]:
+                elif latent_dims_int[i] < latent_dims_int[j]:
                     node_i, node_j = j, i
                 else:
                     node_i, node_j = max(i, j), min(i, j)
@@ -80,8 +78,8 @@ class SheafFRL(BaseOrchestrator):
                 edge_key = f'{node_i}_{node_j}'
 
                 if edge_key not in self.stiefel_matrices:
-                    d_i = self.latent_dims[node_i]
-                    d_j = self.latent_dims[node_j]
+                    d_i = latent_dims_int[node_i]
+                    d_j = latent_dims_int[node_j]
 
                     stiefel_matrix = torch.eye(d_i, d_j)
 
@@ -117,62 +115,65 @@ class SheafFRL(BaseOrchestrator):
         tot = len(labels)
         uniques = torch.unique(labels)
 
-        if self.anchor_strategy == 'prototype':
-            A_proto = {int(idx): [] for idx in self.agents}
+        match self.hparams.anchor_strategy:
+            case 'prototype':
+                A_proto = {int(idx): [] for idx in self.agents}
 
-            for c in uniques:
-                c_mask = labels == c
-                for idx in self.agents:
-                    idx = int(idx)
-                    mean_anchor = latents[idx][c_mask].mean(dim=0)
-                    A_proto[idx].append(mean_anchor)
+                for c in uniques:
+                    c_mask = labels == c
+                    for idx in self.agents:
+                        idx = int(idx)
+                        mean_anchor = latents[idx][c_mask].mean(dim=0)
+                        A_proto[idx].append(mean_anchor)
 
-            return {
-                idx: torch.stack(protos, dim=0)
-                for idx, protos in A_proto.items()
-            }
+                return {
+                    idx: torch.stack(protos, dim=0)
+                    for idx, protos in A_proto.items()
+                }
 
-        elif self.anchor_strategy == 'balanced':
-            k = min(self.num_anchors, tot)
-            anchors_per_class = k // len(uniques)
+            case 'balanced':
+                k = min(self.hparams.num_anchors, tot)
+                anchors_per_class = k // len(uniques)
 
-            selected_indices = []
-            for c in uniques:
-                c_idx = torch.where(labels == c)[0]
-                perm = torch.randperm(len(c_idx), device=labels.device)
-                chosen = c_idx[perm[:anchors_per_class]]
-                selected_indices.append(chosen)
+                selected_indices = []
+                for c in uniques:
+                    c_idx = torch.where(labels == c)[0]
+                    perm = torch.randperm(len(c_idx), device=labels.device)
+                    chosen = c_idx[perm[:anchors_per_class]]
+                    selected_indices.append(chosen)
 
-            selected_indices = torch.cat(selected_indices)
+                selected_indices = torch.cat(selected_indices)
 
-            remaining = k - len(selected_indices)
-            if remaining > 0:
-                all_idx = torch.arange(tot, device=labels.device)
-                mask = torch.ones(tot, dtype=torch.bool, device=labels.device)
-                mask[selected_indices] = False
-                avail_idx = all_idx[mask]
+                remaining = k - len(selected_indices)
+                if remaining > 0:
+                    all_idx = torch.arange(tot, device=labels.device)
+                    mask = torch.ones(
+                        tot, dtype=torch.bool, device=labels.device
+                    )
+                    mask[selected_indices] = False
+                    avail_idx = all_idx[mask]
 
-                extra_perm = torch.randperm(
-                    len(avail_idx), device=labels.device
+                    extra_perm = torch.randperm(
+                        len(avail_idx), device=labels.device
+                    )
+                    extra = avail_idx[extra_perm[:remaining]]
+                    selected_indices = torch.cat([selected_indices, extra])
+
+                final_perm = torch.randperm(
+                    len(selected_indices), device=labels.device
                 )
-                extra = avail_idx[extra_perm[:remaining]]
-                selected_indices = torch.cat([selected_indices, extra])
+                anchor_indices = selected_indices[final_perm]
 
-            final_perm = torch.randperm(
-                len(selected_indices), device=labels.device
-            )
-            anchor_indices = selected_indices[final_perm]
+                return {idx: A[anchor_indices] for idx, A in latents.items()}
 
-            return {idx: A[anchor_indices] for idx, A in latents.items()}
+            case 'random':
+                k = min(self.hparams.num_anchors, tot)
+                perm = torch.randperm(tot, device=labels.device)
+                anchor_indices = perm[:k]
+                return {idx: A[anchor_indices] for idx, A in latents.items()}
 
-        elif self.anchor_strategy == 'random':
-            k = min(self.num_anchors, tot)
-            perm = torch.randperm(tot, device=labels.device)
-            anchor_indices = perm[:k]
-            return {idx: A[anchor_indices] for idx, A in latents.items()}
-
-        else:
-            return latents
+            case _:
+                return latents
 
     def on_train_epoch_start(self) -> None:
         """Initialize/reset anchor and label lists at epoch start."""
@@ -294,7 +295,7 @@ class SheafFRL(BaseOrchestrator):
             y_hat, A_i_raw = agent.forward_with_features(x)
             outputs[idx] = (y_hat, y)
 
-            if self.parseval_normalization:
+            if self.hparams.parseval_normalization:
                 A_i_tilde = self.parseval_normalize(A_i_raw)
             else:
                 A_i_tilde = A_i_raw
@@ -345,7 +346,9 @@ class SheafFRL(BaseOrchestrator):
             on_epoch=True,
         )
 
-        total_loss = total_task_loss + self.lambda_sheaf * sheaf_penalty
+        total_loss = (
+            total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
+        )
         avg_performance = total_task_performance / len(self.agents)
 
         self.log(
