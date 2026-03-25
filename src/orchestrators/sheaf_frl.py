@@ -1,3 +1,11 @@
+"""
+Sheaf-based Federated Representation Learning orchestrator.
+
+This module implements a federated learning framework with Sheaf regularization
+that maintains aligned latent spaces across agents through Stiefel manifold
+optimization of cross-covariance matrices.
+"""
+
 import torch
 import torch.nn as nn
 
@@ -103,6 +111,9 @@ class SheafFRL(BaseOrchestrator):
     ) -> dict[int, torch.Tensor]:
         """Compute or select anchor representations based on strategy.
 
+        Anchors are used for computing cross-covariance matrices between
+        neighboring agents. The strategy determines how anchors are selected.
+
         Parameters
         ----------
         latents : dict[int, torch.Tensor]
@@ -123,30 +134,40 @@ class SheafFRL(BaseOrchestrator):
         - 'random': Randomly sample anchors.
         - other: Return original latents unchanged.
         """
+        # Get total samples and unique class labels
         tot = len(labels)
         uniques = torch.unique(labels)
 
         match self.hparams.anchor_strategy:
+            # Strategy 1: Prototype - use class centroids as anchors
+            # Each class contributes one anchor (mean of samples in class)
             case 'prototype':
                 A_proto = {int(idx): [] for idx in self.agents}
 
+                # Compute mean anchor for each class
                 for c in uniques:
                     c_mask = labels == c
                     for idx in self.agents:
                         idx = int(idx)
+                        # Compute mean of latent features for this class
                         mean_anchor = latents[idx][c_mask].mean(dim=0)
                         A_proto[idx].append(mean_anchor)
 
+                # Stack anchors for each agent: (num_classes, latent_dim)
                 return {
                     idx: torch.stack(protos, dim=0)
                     for idx, protos in A_proto.items()
                 }
 
+            # Strategy 2: Balanced - sample equal number from each class
+            # Ensures all classes are represented in anchor set
             case 'balanced':
+                # Number of anchors to select per class
                 k = min(self.hparams.num_anchors, tot)
                 anchors_per_class = k // len(uniques)
 
                 selected_indices = []
+                # Sample from each class
                 for c in uniques:
                     c_idx = torch.where(labels == c)[0]
                     perm = torch.randperm(len(c_idx), device=labels.device)
@@ -155,9 +176,11 @@ class SheafFRL(BaseOrchestrator):
 
                 selected_indices = torch.cat(selected_indices)
 
+                # Handle remainder: distribute remaining slots randomly
                 remaining = k - len(selected_indices)
                 if remaining > 0:
                     all_idx = torch.arange(tot, device=labels.device)
+                    # Create mask to exclude already selected indices
                     mask = torch.ones(
                         tot, dtype=torch.bool, device=labels.device
                     )
@@ -170,6 +193,7 @@ class SheafFRL(BaseOrchestrator):
                     extra = avail_idx[extra_perm[:remaining]]
                     selected_indices = torch.cat([selected_indices, extra])
 
+                # Final shuffle to randomize order
                 final_perm = torch.randperm(
                     len(selected_indices), device=labels.device
                 )
@@ -177,12 +201,14 @@ class SheafFRL(BaseOrchestrator):
 
                 return {idx: A[anchor_indices] for idx, A in latents.items()}
 
+            # Strategy 3: Random - simply sample k random samples
             case 'random':
                 k = min(self.hparams.num_anchors, tot)
                 perm = torch.randperm(tot, device=labels.device)
                 anchor_indices = perm[:k]
                 return {idx: A[anchor_indices] for idx, A in latents.items()}
 
+            # Default: return original latents unchanged
             case _:
                 return latents
 
@@ -309,20 +335,27 @@ class SheafFRL(BaseOrchestrator):
         """
         outputs = {}
 
+        # Track task metrics across agents
         total_task_loss = 0.0
         total_task_performance = 0.0
 
+        # Store latent representations for sheaf regularization
         batch_latents = {}
 
+        # Process each agent's batch
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             x_key = str(idx) if str(idx) in batch else idx
             x, y = batch[x_key]
 
+            # Forward pass through agent
             y_hat = agent.forward(x)
+            # Get latent features for sheaf regularization
             A_i_raw = agent.encode(x)
             outputs[idx] = (y_hat, y)
 
+            # Apply Parseval normalization if enabled
+            # This whitens the anchor features for better covariance estimation
             if self.hparams.parseval_normalization:
                 A_i_tilde = self.parseval_normalize(A_i_raw)
             else:
@@ -330,14 +363,18 @@ class SheafFRL(BaseOrchestrator):
 
             batch_latents[idx] = A_i_tilde
 
+            # Collect anchors during training for Stiefel matrix updates
+            # Only agent 0 stores labels (they're the same for all agents)
             if prefix == 'train':
                 self.epoch_anchors[idx].append(A_i_tilde.detach())
                 if idx == 0:
                     self.epoch_labels.append(y.detach())
 
+            # Compute task-specific loss and performance
             task_loss = agent.compute_loss(y_hat, y)
             task_performance = agent.task_performance(y_hat, y)
 
+            # Log per-agent metrics
             self.log_dict(
                 {
                     f'{prefix}/task_loss_agent_{idx}': task_loss,
@@ -350,32 +387,36 @@ class SheafFRL(BaseOrchestrator):
             total_task_loss += task_loss
             total_task_performance += task_performance
 
+        # Compute sheaf regularization penalty
+        # This penalizes discrepancy between neighboring latent spaces
+        # The penalty encourages: A_i ≈ A_j @ V_ij^T
+        # Where V_ij is the Stiefel matrix for edge (i,j)
         sheaf_penalty = 0.0
 
-        # Compute sheaf regularization: penalizes discrepancy between
-        # latent spaces
-        # The penalty encourages A_i ≈ A_j @ V_ij^T where V_ij is the
-        # Stiefel matrix
-        # This enforces consistency across the sheaf (graph structure)
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
             node_i, node_j = int(node_i), int(node_j)
 
-            # Compute reconstruction: project node_j features through
-            # Stiefel matrix
+            # Skip if either node has no data in this batch
+            if node_i not in batch_latents or node_j not in batch_latents:
+                continue
+
+            # Project node_j features through Stiefel matrix to node_i's space
             # A_j @ V^T maps from j's latent space to i's latent space
             diff = batch_latents[node_i] - torch.matmul(
                 batch_latents[node_j], V.T
             )
-            # Frobenius norm (squared) measures reconstruction error
+            # Frobenius norm squared measures reconstruction error
             frob_dist = (diff**2).sum(dim=1).mean()
             sheaf_penalty += frob_dist
 
+        # Total loss = task loss + sheaf regularization
         total_loss = (
             total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
         )
         avg_performance = total_task_performance / len(self.agents)
 
+        # Log aggregate metrics
         self.log_dict(
             {
                 f'{prefix}/sheaf_penalty': sheaf_penalty,

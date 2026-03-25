@@ -1,11 +1,25 @@
 defaults:
   - _self_
-  - dataset: semantic-cifar10
-  - model: latent_classifier
+  - dataset: cifar10
+  - model: timm_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
 
 seed: 42
+
+agent_rotations:
+  0: 0
+  1: 90
+
+agent_classes:
+  0: null
+  1: null
+
+agents:
+  0:
+    model_name: vit_tiny_patch16_224.augreg_in21k_ft_in1k
+  1:
+    model_name: vit_tiny_patch16_224.augreg_in21k_ft_in1k
 
 graph:
   neighbors_mode: "fully_connected"
@@ -16,7 +30,7 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__sheaf_frl-exp
+  project: sheaf-repr-learning__timm-agents-exp
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false

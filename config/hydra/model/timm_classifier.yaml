@@ -1,0 +1,14 @@
+_target_: src.agents.TimmClassifier
+
+num_classes: null
+
+pretrained: true
+
+decoder_hidden_dims: [256]
+
+dropout: 0.1
+
+activation:
+  _target_: torch.nn.ReLU
+
+use_batchnorm: true

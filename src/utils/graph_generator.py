@@ -1,3 +1,10 @@
+"""
+Graph generation utilities for federated learning communication topologies.
+
+This module provides functions to generate various graph structures that define
+which agents can communicate and share model updates in federated learning.
+"""
+
 from typing import Literal
 
 import networkx as nx
@@ -54,17 +61,24 @@ def generate_neighbors(
     - Fully Connected: Maximum communication overhead, fastest consensus
     """
     match mode:
+        # Mode 1: Manual - use pre-defined neighbor dictionary
         case 'manual':
             if manual is None:
                 return {}
+            # Convert keys to int and values to sets
             return {int(k): set(v) for k, v in manual.items()}
 
+        # Mode 2: Fully Connected - every agent connects to every other
         case 'fully_connected':
             G = nx.complete_graph(n_agents)
 
+        # Mode 3: Erdos-Renyi random graph
+        # Each edge exists independently with probability p
         case 'erdos_renyi':
             G = nx.erdos_renyi_graph(n_agents, p, seed=seed)
 
+        # Mode 4: Barabasi-Albert scale-free graph
+        # New nodes attach to existing hubs (preferential attachment)
         case 'barabasi':
             G = nx.barabasi_albert_graph(n_agents, m, seed=seed)
 
@@ -74,4 +88,6 @@ def generate_neighbors(
                 "'manual', 'erdos_renyi', 'barabasi', 'fully_connected'"
             )
 
+    # Convert NetworkX graph to neighbor dictionary format
+    # {node: {neighbor1, neighbor2, ...}}
     return {i: set(G.neighbors(i)) for i in range(n_agents)}

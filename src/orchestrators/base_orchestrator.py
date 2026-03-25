@@ -1,3 +1,11 @@
+"""
+Base orchestrator for federated learning with multiple agents.
+
+This module defines the abstract interface for orchestrating training
+across multiple agents in a federated learning setting. Subclasses must
+implement epoch-end aggregation logic and evaluation procedures.
+"""
+
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -72,17 +80,22 @@ class BaseOrchestrator(l.LightningModule, ABC):
         dict[str, tuple[torch.Tensor, torch.Tensor]]
             Dictionary mapping agent indices to (prediction, label) pairs.
         """
+        # Handle tuple input (CombinedLoader returns tuple)
         if isinstance(batch, tuple):
             batch = batch[0]
 
         outputs = {}
 
+        # Run forward pass for each agent on their respective data
         for idx, agent in self.agents.items():
+            # Handle both string and int keys in batch dictionary
             key = str(idx) if str(idx) in batch else idx
             x, y = batch[key]
 
+            # Get predictions (logits) from agent
             y_hat = agent(x)
 
+            # Store predictions with labels for loss computation
             outputs[idx] = (y_hat, y)
 
         return outputs
@@ -115,6 +128,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
         NotImplementedError
             This method must be implemented by subclasses.
         """
+        # Base implementation raises NotImplementedError
+        # Subclasses must implement this method to compute losses and metrics
         raise NotImplementedError(
             f'{self.__class__.__name__} must implement _shared_eval'
         )

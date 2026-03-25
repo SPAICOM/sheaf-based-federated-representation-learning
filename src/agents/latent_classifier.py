@@ -64,11 +64,38 @@ class LatentClassifier(BaseAgent):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
     ):
+        """Initialize the latent classifier with encoder-decoder architecture.
+
+        Parameters
+        ----------
+        in_features : int
+            Dimensionality of the input feature vector.
+        num_classes : int
+            Number of output classes.
+        latent_dim : int
+            Dimensionality of the latent representation.
+        encoder_hidden_dims : list[int] | None, optional
+            Hidden layer dimensions for the encoder. If None or empty,
+            encoder is a single linear layer.
+        decoder_hidden_dims : list[int], optional
+            Hidden layer dimensions for the decoder (default: [256]).
+        dropout : float, optional
+            Dropout probability applied after each hidden layer (default: 0.0).
+        activation : type[nn.Module], optional
+            Activation function class (e.g., nn.ReLU, nn.GELU).
+            Default: nn.ReLU.
+        use_batchnorm : bool, optional
+            Whether to include BatchNorm1d after each linear layer
+            (default: False).
+        """
         super().__init__()
 
+        # Default decoder hidden dimensions if not specified
         if decoder_hidden_dims is None:
             decoder_hidden_dims = [256]
 
+        # Encoder: maps input features -> latent representation
+        # Compresses high-dimensional input into lower-dimensional space
         self.encoder = MLP(
             input_dim=in_features,
             output_dim=latent_dim,
@@ -78,6 +105,8 @@ class LatentClassifier(BaseAgent):
             use_batchnorm=use_batchnorm,
         )
 
+        # Decoder: maps latent representation -> class predictions (logits)
+        # Expands from latent_dim to num_classes for classification
         self.decoder = MLP(
             input_dim=latent_dim,
             output_dim=num_classes,
@@ -87,6 +116,7 @@ class LatentClassifier(BaseAgent):
             use_batchnorm=use_batchnorm,
         )
 
+        # Initialize accuracy metric for task performance evaluation
         self.accuracy = MulticlassAccuracy(num_classes=num_classes)
 
     @property
@@ -120,11 +150,13 @@ class LatentClassifier(BaseAgent):
         torch.Tensor
             Latent representation of shape (batch_size, latent_dim).
         """
+        # Validate input shape: must be 2D (batch_size, features)
         if x.ndim != 2:
             raise ValueError(
                 'Expected input of shape (batch_size, in_features),'
                 f'got {x.shape}'
             )
+        # Pass through encoder to get latent representation
         return self.encoder(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -140,11 +172,13 @@ class LatentClassifier(BaseAgent):
         torch.Tensor
             Output logits of shape (batch_size, num_classes).
         """
+        # Validate input shape: must be 2D (batch_size, features)
         if x.ndim != 2:
             raise ValueError(
                 'Expected input of shape (batch_size, in_features),'
                 f'got {x.shape}'
             )
+        # Full forward pass: encode -> decode to get logits
         return self.decoder(self.encode(x))
 
     def compute_loss(

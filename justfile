@@ -12,3 +12,7 @@ format:
 
 # Run formatting and linting (CI-style target)
 clean: format check
+
+# Run experiment with specific config
+run_experiment config="timm_agents_experiment" *args="":
+    uv run scripts/experiment.py --config-name {{config}} {{args}}

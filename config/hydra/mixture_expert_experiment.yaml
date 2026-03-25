@@ -2,10 +2,16 @@ defaults:
   - _self_
   - dataset: semantic-cifar10
   - model: latent_classifier
-  - orchestrator: federated
-  - optimizer: adam
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
 
 seed: 42
+
+agents:
+  0:
+    model: vit_base_patch32_224.augreg_in1k
+  1:
+    model: vit_base_patch16_224.augreg_in1k
 
 graph:
   neighbors_mode: "fully_connected"
@@ -16,7 +22,7 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__mixture-experts-latents
+  project: sheaf-repr-learning__mixture-expert-exp
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false
@@ -48,8 +54,8 @@ callbacks:
     patience: 5
     mode: min
 
-  batch_size_finder:
-    _target_: lightning.pytorch.callbacks.BatchSizeFinder
-    mode: power
-    init_val: 32
-    max_trials: 5
+  #batch_size_finder:
+  #  _target_: lightning.pytorch.callbacks.BatchSizeFinder
+  #  mode: power
+  #  init_val: 32
+  #  max_trials: 5

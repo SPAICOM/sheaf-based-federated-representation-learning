@@ -1,0 +1,18 @@
+_target_: src.datamodules.ClassificationDataModule
+
+repo: ylecun
+name: mnist
+data_key: image
+
+attributes:
+  - label
+
+split_strategy: uniform
+
+batch_size: 64
+num_workers: 4
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+seed: 42

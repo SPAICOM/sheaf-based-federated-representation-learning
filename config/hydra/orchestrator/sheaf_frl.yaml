@@ -3,6 +3,7 @@ _target_: src.orchestrators.SheafFRL
 lambda_sheaf: 0.01
 anchor_strategy: "prototype"
 parseval_normalization: True
+parseval_eps: 0.01
 num_anchors: 128
 
 neighbors: {}

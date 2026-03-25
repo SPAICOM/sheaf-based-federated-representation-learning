@@ -3,10 +3,6 @@ _target_: src.datamodules.SemanticDataModule
 repo: spaicom-lab
 name: semantic-cifar10
 
-models:
-  - aimv2_1b_patch14_224.apple_pt
-  - aimv2_1b_patch14_336.apple_pt
-
 attributes:
   - label
 

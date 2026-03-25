@@ -1,3 +1,17 @@
+"""
+Semantic datamodule for loading pre-computed embedding datasets.
+
+This module provides data loading capabilities for semantic embedding tasks
+where pre-computed embeddings from vision models are used with associated
+attribute labels. Designed for federated learning with multiple agents.
+
+Features:
+- Load pre-computed embeddings from HuggingFace datasets
+- Support for multiple model embeddings per dataset
+- Custom train/val/test splits per agent
+- Class filtering per agent
+"""
+
 import lightning as l
 import torch
 from datasets import concatenate_datasets, load_dataset
@@ -59,10 +73,13 @@ class SemanticDataset(Dataset):
         """
         item = self.dataset[idx]
 
+        # Extract embedding column and convert to float tensor
         embedding = torch.tensor(item['embedding'], dtype=torch.float32)
 
+        # Extract specified attribute columns as labels
         attrs = {k: item[k] for k in self.attributes}
 
+        # Return single tensor for single attribute, dict for multiple
         if len(attrs) == 1:
             return embedding, torch.tensor(list(attrs.values())[0])
 
@@ -82,8 +99,16 @@ class SemanticDataModule(l.LightningDataModule):
         HuggingFace repository path.
     name : str
         Name of the dataset configuration.
-    models : list[str]
-        List of model names/configurations to load.
+    agents : dict, optional
+        Dictionary mapping agent indices to their model configurations.
+        Each agent should have a 'model' key specifying which embedding to use.
+        Example: {0: {model: aimv2_1b_patch14_224.apple_pt}}
+    models : list[str], optional
+        List of model names/configurations to load (backward compatibility).
+        Ignored if 'agents' is provided.
+    agent_classes : dict, optional
+        Dictionary mapping agent indices to list of class labels they see.
+        If not provided or agent not specified, all classes are used.
     attributes : list[str]
         List of attribute columns to use as labels.
     batch_size : int, optional
@@ -103,13 +128,13 @@ class SemanticDataModule(l.LightningDataModule):
     Attributes
     ----------
     train_datasets : dict[str, SemanticDataset]
-        Dictionary mapping model indices to training datasets.
+        Dictionary mapping agent indices to training datasets.
     val_datasets : dict[str, SemanticDataset]
-        Dictionary mapping model indices to validation datasets.
+        Dictionary mapping agent indices to validation datasets.
     test_datasets : dict[str, SemanticDataset]
-        Dictionary mapping model indices to test datasets.
+        Dictionary mapping agent indices to test datasets.
     input_dims : dict[str, int]
-        Dictionary mapping model indices to input feature dimensions.
+        Dictionary mapping agent indices to input feature dimensions.
     num_classes : dict
         Dictionary containing the number of classes for categorical attributes.
     """
@@ -118,8 +143,10 @@ class SemanticDataModule(l.LightningDataModule):
         self,
         repo: str,
         name: str,
-        models: list[str],
         attributes: list[str],
+        agents: dict | None = None,
+        models: list[str] | None = None,
+        agent_classes: dict | None = None,
         batch_size: int = 32,
         num_workers: int = 4,
         mode: str = 'min_size',
@@ -135,10 +162,14 @@ class SemanticDataModule(l.LightningDataModule):
             HuggingFace repository path.
         name : str
             Name of the dataset configuration.
-        models : list[str]
-            List of model names/configurations to load.
         attributes : list[str]
             List of attribute columns to use as labels.
+        agents : dict, optional
+            Dictionary mapping agent indices to their model configurations.
+        models : list[str], optional
+            List of model names (backward compatibility).
+        agent_classes : dict, optional
+            Dictionary mapping agent indices to allowed classes.
         batch_size : int, optional
             Batch size for dataloaders (default: 32).
         num_workers : int, optional
@@ -156,8 +187,10 @@ class SemanticDataModule(l.LightningDataModule):
 
         self.repo = repo
         self.name = name
-        self.models = models
         self.attributes = attributes
+        self.agents = agents
+        self.models = models
+        self.agent_classes = agent_classes or {}
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -185,6 +218,7 @@ class SemanticDataModule(l.LightningDataModule):
         datasets.Dataset
             Concatenated dataset containing all splits.
         """
+        # Collect all available splits and concatenate them into one dataset
         splits = [ds[s] for s in ds]
         return concatenate_datasets(splits)
 
@@ -225,11 +259,15 @@ class SemanticDataModule(l.LightningDataModule):
 
     def prepare_data(self) -> None:
         """Download datasets (called only once in distributed setting)."""
-        for m in self.models:
-            load_dataset(f'{self.repo}/{self.name}', m)
+        if self.agents:
+            for agent_cfg in self.agents.values():
+                load_dataset(f'{self.repo}/{self.name}', agent_cfg['model'])
+        elif self.models:
+            for m in self.models:
+                load_dataset(f'{self.repo}/{self.name}', m)
 
     def setup(self, stage: str | None = None) -> None:
-        """Set up datasets for each model.
+        """Set up datasets for each agent.
 
         Loads datasets, merges splits, and re-splits into custom partitions.
         Infers input dimensions and number of classes from the data.
@@ -244,37 +282,67 @@ class SemanticDataModule(l.LightningDataModule):
         ValueError
             If 'label' attribute is not found in the dataset.
         """
+        # Initialize dictionaries to hold datasets for each agent/model
         self.train_datasets: dict[str, SemanticDataset] = {}
         self.val_datasets: dict[str, SemanticDataset] = {}
         self.test_datasets: dict[str, SemanticDataset] = {}
 
-        for i, m in enumerate(self.models):
+        # Determine which models/embeddings to load for each agent
+        # Priority: agents dict > models list (for backward compatibility)
+        if self.agents:
+            # Extract model configuration from agents dict
+            agent_models = {
+                int(i): cfg['model'] for i, cfg in self.agents.items()
+            }
+        elif self.models:
+            # Use models list directly with sequential agent indices
+            agent_models = dict(enumerate(self.models))
+        else:
+            raise ValueError('Either "agents" or "models" must be provided')
+
+        # Load datasets for each agent/model combination
+        for i, m in agent_models.items():
+            # Load dataset with specific model configuration
             ds = load_dataset(f'{self.repo}/{self.name}', m)
 
+            # Merge all splits to maximize available data
             merged = self._merge_all_splits(ds)
+            # Re-split according to custom train/val/test ratios
             train, val, test = self._resplit(merged)
 
+            # Use string key for compatibility with Lightning
             key = str(i)
 
+            # Create semantic datasets for each split
             self.train_datasets[key] = SemanticDataset(train, self.attributes)
             self.val_datasets[key] = SemanticDataset(val, self.attributes)
             self.test_datasets[key] = SemanticDataset(test, self.attributes)
 
+        # Store agent/model indices
+        self.models = list(agent_models.keys())
+
+        # Determine input dimensions from embedding size
+        # Get first sample from first dataset to infer feature dimension
         self.input_dims = {}
         for m, ds in self.train_datasets.items():
             x, _ = ds[0]
             self.input_dims[m] = x.shape[0]
 
+        # Determine number of classes if 'label' attribute exists
         self.num_classes = {}
 
         if 'label' in self.attributes:
+            # Get first dataset to inspect label values
             first_ds = next(iter(self.train_datasets.values())).dataset
 
+            # Verify 'label' column exists in dataset
             if 'label' not in first_ds.column_names:
                 raise ValueError('Attribute "label" not found in dataset')
 
             values = list(first_ds['label'])
 
+            # Count unique classes if labels are categorical (int or bool)
+            # Set to None for continuous labels
             if isinstance(values[0], (int, bool)):
                 self.num_classes['label'] = len(set(values))
             else:
