@@ -2,8 +2,12 @@ _target_: src.agents.LatentClassifier
 
 in_features: null
 num_classes: null
+latent_dim: 128
 
-hidden_dims: [256, 128]
+encoder_hidden_dims: []
+
+decoder_hidden_dims: [256]
+
 dropout: 0.1
 
 activation:

@@ -319,7 +319,8 @@ class SheafFRL(BaseOrchestrator):
             x_key = str(idx) if str(idx) in batch else idx
             x, y = batch[x_key]
 
-            y_hat, A_i_raw = agent.forward_with_features(x)
+            y_hat = agent.forward(x)
+            A_i_raw = agent.encode(x)
             outputs[idx] = (y_hat, y)
 
             if self.hparams.parseval_normalization:

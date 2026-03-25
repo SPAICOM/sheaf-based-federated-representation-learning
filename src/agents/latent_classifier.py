@@ -6,15 +6,15 @@ import torch.nn.functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
 from .base_agent import BaseAgent
+from .utils import MLP
 
 
 class LatentClassifier(BaseAgent):
-    """A flexible multi-layer perceptron (MLP) classifier for vector inputs.
+    """A flexible MLP-based classifier with explicit encoder-decoder structure.
 
-    This module is designed to operate on inputs that are already flattened
-    feature vectors (e.g., outputs from a pretrained model or embedding layer).
-    It supports configurable hidden layers, activation functions, batch
-    normalization, and dropout.
+    The model consists of:
+    - encoder: Maps input features to latent representation
+    - decoder: Maps latent representation to class predictions
 
     Parameters
     ----------
@@ -22,21 +22,28 @@ class LatentClassifier(BaseAgent):
         Dimensionality of the input feature vector.
     num_classes : int
         Number of output classes.
-    hidden_dims : list[int] | None, optional
-        Sizes of hidden layers. If None or empty, the model reduces to a
-        single linear classifier.
-    dropout : float, default=0.0
-        Dropout probability applied after each hidden layer (if > 0).
-    activation : callable, default=nn.ReLU
+    latent_dim : int
+        Dimensionality of the latent representation.
+    encoder_hidden_dims : list[int] | None, optional
+        Hidden layer dimensions for the encoder. If None or empty,
+        encoder is a single linear layer.
+    decoder_hidden_dims : list[int], optional
+        Hidden layer dimensions for the decoder (default: [256]).
+    dropout : float, optional
+        Dropout probability applied after each hidden layer (default: 0.0).
+    activation : type[nn.Module], optional
         Activation function class (e.g., nn.ReLU, nn.GELU).
-    use_batchnorm : bool, default=False
-        Whether to include BatchNorm1d after each linear layer.
+        Default: nn.ReLU.
+    use_batchnorm : bool, optional
+        Whether to include BatchNorm1d after each linear layer
+        (default: False).
 
     Attributes
     ----------
-    classifier : nn.Sequential
-        The sequential stack of linear, normalization, activation,
-        and dropout layers.
+    encoder : MLP
+        Encoder network mapping input to latent space.
+    decoder : MLP
+        Decoder network mapping latent space to class predictions.
     accuracy : MulticlassAccuracy
         TorchMetrics accuracy calculator.
 
@@ -50,48 +57,77 @@ class LatentClassifier(BaseAgent):
         self,
         in_features: int,
         num_classes: int,
-        hidden_dims=None,
+        latent_dim: int,
+        encoder_hidden_dims: list[int] | None = None,
+        decoder_hidden_dims: list[int] | None = None,
         dropout: float = 0.0,
-        activation=nn.ReLU,
+        activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
     ):
         super().__init__()
 
-        if hidden_dims is None:
-            hidden_dims = []
+        if decoder_hidden_dims is None:
+            decoder_hidden_dims = [256]
 
-        layers = []
-        prev_dim = in_features
-
-        self.accuracy = MulticlassAccuracy(
-            num_classes=num_classes,
+        self.encoder = MLP(
+            input_dim=in_features,
+            output_dim=latent_dim,
+            hidden_dims=encoder_hidden_dims,
+            activation=activation,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
         )
 
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, h_dim))
+        self.decoder = MLP(
+            input_dim=latent_dim,
+            output_dim=num_classes,
+            hidden_dims=decoder_hidden_dims,
+            activation=activation,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
+        )
 
-            if use_batchnorm:
-                layers.append(nn.BatchNorm1d(h_dim))
+        self.accuracy = MulticlassAccuracy(num_classes=num_classes)
 
-            layers.append(
-                activation
-                if isinstance(activation, nn.Module)
-                else activation()
+    @property
+    def encoder(self) -> nn.Module:
+        """Encoder network mapping input to latent space."""
+        return self._encoder
+
+    @encoder.setter
+    def encoder(self, value: nn.Module):
+        self._encoder = value
+
+    @property
+    def decoder(self) -> nn.Module:
+        """Decoder network mapping latent space to predictions."""
+        return self._decoder
+
+    @decoder.setter
+    def decoder(self, value: nn.Module):
+        self._decoder = value
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Pass through encoder, returning latent features.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, in_features).
+
+        Returns
+        -------
+        torch.Tensor
+            Latent representation of shape (batch_size, latent_dim).
+        """
+        if x.ndim != 2:
+            raise ValueError(
+                'Expected input of shape (batch_size, in_features),'
+                f'got {x.shape}'
             )
+        return self.encoder(x)
 
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-
-            prev_dim = h_dim
-
-        layers.append(nn.Linear(prev_dim, num_classes))
-
-        self.classifier = nn.Sequential(*layers)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the classifier.
 
         Parameters
@@ -103,52 +139,13 @@ class LatentClassifier(BaseAgent):
         -------
         torch.Tensor
             Output logits of shape (batch_size, num_classes).
-
-        Raises
-        ------
-        ValueError
-            If the input tensor is not 2-dimensional.
         """
         if x.ndim != 2:
             raise ValueError(
                 'Expected input of shape (batch_size, in_features),'
                 f'got {x.shape}'
             )
-
-        return self.classifier(x)
-
-    def forward_with_features(
-        self,
-        x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning logits and latent features.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape (batch_size, in_features).
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor]
-            Tuple of (logits, features) where features are the output of the
-            last hidden layer.
-
-        Raises
-        ------
-        ValueError
-            If the input tensor is not 2-dimensional.
-        """
-        if x.ndim != 2:
-            raise ValueError(
-                'Expected input of shape (batch_size, in_features),'
-                f'got {x.shape}'
-            )
-
-        features = self.classifier[:-1](x)
-        logits = self.classifier[-1](features)
-
-        return logits, features
+        return self.decoder(self.encode(x))
 
     def compute_loss(
         self,

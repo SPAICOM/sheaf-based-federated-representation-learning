@@ -6,13 +6,12 @@ and potentially shared/aggregated with other agents in the federation.
 
 Subclass Requirements
 ---------------------
-Derived agents must implement four abstract methods:
+Derived agents must implement:
     - ``forward``: Standard forward pass returning predictions (logits)
-    - ``forward_with_features``: Returns predictions AND intermediate
-      latent features
+    - ``encode``: Pass through encoder only, returning latent features
     - ``compute_loss``: Task-specific loss computation (e.g., CrossEntropy
       for classification)
-    - ``task_performance``: Task-specific metric (e.g., accuracy, F1, MSE)
+    - ``task_performance``: Task-specific performance metric (e.g., accuracy)
 
 Usage Example
 -------------
@@ -20,16 +19,18 @@ Usage Example
     >>> from src.agents.latent_classifier import LatentClassifier
     >>>
     >>> # Create an agent for 10-class classification with 128-dim input
-    >>> agent = LatentClassifier(in_features=128, num_classes=10)
+    >>> agent = LatentClassifier(
+    ...     in_features=128, num_classes=10, latent_dim=64
+    ... )
     >>>
     >>> # Standard forward pass returns logits
     >>> x = torch.randn(32, 128)
     >>> logits = agent(x)
     >>> print(logits.shape)  # torch.Size([32, 10])
     >>>
-    >>> # Forward with features returns logits and latent representation
-    >>> logits, features = agent.forward_with_features(x)
-    >>> print(features.shape)  # torch.Size([32, 64]) (last hidden layer)
+    >>> # Encode returns latent features
+    >>> features = agent.encode(x)
+    >>> print(features.shape)  # torch.Size([32, 64])
     >>>
     >>> # Compute loss and performance metric
     >>> y = torch.randint(0, 10, (32,))
@@ -50,15 +51,64 @@ class BaseAgent(nn.Module, ABC):
     Subclasses must provide implementations for forward pass, loss computation,
     and performance evaluation.
 
+    Architecture
+    -------------
+    All agents must have an explicit encoder-decoder structure:
+    - encoder: Maps input to latent representation
+    - decoder: Maps latent representation to output predictions
+
     Notes
     -----
     All derived agents must implement the abstract methods:
     - ``forward``: Standard forward pass returning predictions.
-    - ``forward_with_features``: Forward pass returning both predictions and
-      intermediate features.
+    - ``encode``: Pass through encoder only, returning latent features.
     - ``compute_loss``: Compute task-specific loss from predictions.
     - ``task_performance``: Compute task-specific performance metric.
+
+    All derived agents must implement the properties:
+    - ``encoder``: The encoder module.
+    - ``decoder``: The decoder module.
     """
+
+    @property
+    @abstractmethod
+    def encoder(self) -> nn.Module:
+        """Encoder module that maps input to latent representation.
+
+        Returns
+        -------
+        nn.Module
+            The encoder network.
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def decoder(self) -> nn.Module:
+        """Decoder module that maps latent representation to predictions.
+
+        Returns
+        -------
+        nn.Module
+            The decoder network.
+        """
+        pass
+
+    @abstractmethod
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Pass through encoder only, returning latent features.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor.
+
+        Returns
+        -------
+        torch.Tensor
+            Latent representation from the encoder.
+        """
+        pass
 
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -73,25 +123,6 @@ class BaseAgent(nn.Module, ABC):
         -------
         torch.Tensor
             Output predictions or logits.
-        """
-        pass
-
-    @abstractmethod
-    def forward_with_features(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning predictions and intermediate features.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor]
-            Tuple of (predictions, features) where features are the
-            intermediate latent representation.
         """
         pass
 

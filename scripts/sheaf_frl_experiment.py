@@ -89,14 +89,18 @@ def main(cfg: DictConfig) -> None:
         model_cfg.in_features = in_features
         model_cfg.num_classes = num_classes
 
-        per_agent_dims = getattr(cfg.orchestrator, 'per_agent_hidden_dims', {})
-        per_agent_dims = {int(k): v for k, v in per_agent_dims.items()}
+        per_agent_hidden_dims = getattr(cfg.model, 'encoder_hidden_dims', None)
+        if per_agent_hidden_dims is not None and hasattr(
+            per_agent_hidden_dims, 'items'
+        ):
+            per_agent_hidden_dims = {
+                int(k): v for k, v in per_agent_hidden_dims.items()
+            }
+            if i in per_agent_hidden_dims:
+                model_cfg.encoder_hidden_dims = per_agent_hidden_dims[i]
 
-        if i in per_agent_dims:
-            model_cfg.hidden_dims = per_agent_dims[i]
-
-        if model_cfg.get('hidden_dims'):
-            latent_dims[i] = model_cfg.hidden_dims[-1]
+        if model_cfg.get('latent_dim'):
+            latent_dims[i] = model_cfg.latent_dim
         else:
             latent_dims[i] = in_features
 
