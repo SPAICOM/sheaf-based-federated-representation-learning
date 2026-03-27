@@ -57,6 +57,7 @@ class SheafFRL(BaseOrchestrator):
         anchor_strategy: str,
         num_anchors: int,
         parseval_normalization: bool,
+        parseval_eps: float = 1e-4,
         **kwargs,
     ):
         super().__init__(
@@ -237,9 +238,22 @@ class SheafFRL(BaseOrchestrator):
             Normalized feature matrix with orthonormal columns.
         """
         C = torch.matmul(A.T, A)
-        eps = 1e-4
+        eps = float(getattr(self.hparams, 'parseval_eps', 1e-4))
         C = C + eps * torch.eye(C.size(0), device=C.device)
-        eigenvalues, eigenvectors = torch.linalg.eigh(C)
+        
+        # Cast to double for more stable eigendecomposition
+        original_dtype = C.dtype
+        C_double = C.to(torch.float64)
+        
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(C_double)
+        except torch._C._LinAlgError:
+            # Fallback if double precision still fails: increase eps significantly
+            C_double = C_double + (eps * 10) * torch.eye(C.size(0), device=C.device, dtype=torch.float64)
+            eigenvalues, eigenvectors = torch.linalg.eigh(C_double)
+            
+        eigenvalues = eigenvalues.to(original_dtype)
+        eigenvectors = eigenvectors.to(original_dtype)
 
         inv_sqrt_eigenvalues = torch.rsqrt(eigenvalues.clamp(min=eps))
 
