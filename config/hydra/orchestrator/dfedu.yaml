@@ -1,0 +1,6 @@
+_target_: src.orchestrators.dfedu.DFedU
+
+eta: 0.05
+
+agents: null
+neighbors: {}

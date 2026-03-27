@@ -1,5 +1,6 @@
 _target_: src.agents.TimmClassifier
 
+model_name: null
 num_classes: null
 
 pretrained: true

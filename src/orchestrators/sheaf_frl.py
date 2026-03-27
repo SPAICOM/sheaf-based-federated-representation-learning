@@ -4,6 +4,8 @@ Sheaf-based Federated Representation Learning orchestrator.
 This module implements a federated learning framework with Sheaf regularization
 that maintains aligned latent spaces across agents through Stiefel manifold
 optimization of cross-covariance matrices.
+
+!!to be checked with the new specifications in the paper
 """
 
 import torch

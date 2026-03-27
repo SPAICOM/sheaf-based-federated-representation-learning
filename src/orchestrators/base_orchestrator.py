@@ -89,7 +89,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         # Run forward pass for each agent on their respective data
         for idx, agent in self.agents.items():
             # Handle both string and int keys in batch dictionary
-            key = str(idx) if str(idx) in batch else idx
+            key = idx if idx in batch else int(idx)
             x, y = batch[key]
 
             # Get predictions (logits) from agent
