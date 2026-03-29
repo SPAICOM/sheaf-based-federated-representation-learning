@@ -4,6 +4,7 @@ model_name: null
 num_classes: null
 
 pretrained: true
+freeze_encoder: false
 
 decoder_hidden_dims: [256]
 

@@ -63,6 +63,7 @@ class TimmClassifier(BaseAgent):
         model_name: str,
         num_classes: int,
         pretrained: bool = True,
+        freeze_encoder: bool = False,
         decoder_hidden_dims: list[int] | None = None,
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
@@ -78,6 +79,10 @@ class TimmClassifier(BaseAgent):
             Number of output classes.
         pretrained : bool, optional
             Whether to load pretrained encoder weights (default: True).
+        freeze_encoder : bool, optional
+            If True, freeze all encoder (backbone) parameters so only the
+            decoder MLP is trained. Enables linear probing mode which avoids
+            fine-tuning instability when per-agent data is small (default: False).
         decoder_hidden_dims : list[int], optional
             Hidden layer dimensions for the decoder MLP (default: [256]).
         dropout : float, optional
@@ -100,6 +105,13 @@ class TimmClassifier(BaseAgent):
             pretrained=pretrained,
             num_classes=0,
         )
+
+        # Freeze encoder (linear probing mode): only the decoder MLP trains.
+        # Critical when per-agent data is small relative to backbone capacity.
+        if freeze_encoder:
+            for param in self._encoder.parameters():
+                param.requires_grad = False
+            self._encoder.eval()  # also disables dropout/batchnorm in encoder
 
         # Global average pooling to reduce spatial dimensions to 1x1
         self._pool = nn.AdaptiveAvgPool2d((1, 1))

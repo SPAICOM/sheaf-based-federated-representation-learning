@@ -20,6 +20,8 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from src.utils.data_partitioner import partition_non_iid
+
 
 def _collate_fn(batch):
     """Collate function for handling mixed image and tensor data in batches.
@@ -139,10 +141,20 @@ class ClassificationDataModule(l.LightningDataModule):
         Default: None (no rotation for all agents).
     split_strategy : str, optional
         How to split data across agents. Options: 'uniform' (default),
-        'class_partition' (each agent sees specific classes).
+        'class_partition' (each agent sees specific classes),
+        'non_iid' (each agent is randomly assigned ``classes_per_agent``
+        classes and samples are distributed among assigned agents).
     agent_classes : dict[int, list[int]], optional
         Dictionary mapping agent indices to list of class labels they see.
         Only used when split_strategy='class_partition'.
+    classes_per_agent : int, optional
+        Number of classes randomly assigned to each agent. Only used when
+        split_strategy='non_iid'. Default: 2.
+    alpha : float, optional
+        Dirichlet concentration parameter controlling statistical skew
+        when split_strategy='non_iid'. Lower values produce more skew
+        (one agent gets most samples), higher values approach uniform.
+        Default: 0.5.
     batch_size : int, optional
         Batch size for dataloaders (default: 64).
     num_workers : int, optional
@@ -186,6 +198,8 @@ class ClassificationDataModule(l.LightningDataModule):
         agent_rotations: dict[int, float] | None = None,
         split_strategy: str = 'uniform',
         agent_classes: dict[int, list[int]] | None = None,
+        classes_per_agent: int = 2,
+        alpha: float = 0.5,
         batch_size: int = 64,
         num_workers: int = 4,
         mode: str = 'min_size',
@@ -203,6 +217,8 @@ class ClassificationDataModule(l.LightningDataModule):
         self.agent_rotations = agent_rotations or {}
         self.split_strategy = split_strategy
         self.agent_classes = agent_classes or {}
+        self.classes_per_agent = classes_per_agent
+        self.alpha = alpha
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -355,6 +371,56 @@ class ClassificationDataModule(l.LightningDataModule):
             )
             self.num_classes[i] = len(allowed)
 
+    def _split_data_non_iid(
+        self, train, val, test, label_key: str
+    ) -> None:
+        """Split data using automatic Non-IID partitioning.
+
+        Each agent is randomly assigned ``classes_per_agent`` classes.
+        Samples for each class are distributed among the agents assigned
+        to that class with random Dirichlet-drawn proportions, producing
+        statistical skew (``alpha`` controls the degree of imbalance).
+        No manual ``agent_classes`` needed.
+
+        Parameters
+        ----------
+        train : datasets.Dataset
+            Training data.
+        val : datasets.Dataset
+            Validation data.
+        test : datasets.Dataset
+            Test data.
+        label_key : str
+            Name of the label column.
+        """
+        for split_data, target_dict in [
+            (train, 'train_datasets'),
+            (val, 'val_datasets'),
+            (test, 'test_datasets'),
+        ]:
+            labels = split_data[label_key]
+            partition = partition_non_iid(
+                labels=labels,
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                alpha=self.alpha,
+            )
+            for i in range(self.n_agents):
+                indices = partition[i]
+                rotation = self.agent_rotations.get(i, 0)
+                getattr(self, target_dict)[i] = ClassificationDataset(
+                    split_data.select(indices),
+                    self.data_key,
+                    label_key,
+                    rotation_angle=rotation,
+                )
+
+        # Set per-agent num_classes from the actual labels each agent received
+        for i in range(self.n_agents):
+            agent_labels = self.train_datasets[i].dataset[label_key]
+            self.num_classes[i] = len(set(agent_labels))
+
     def prepare_data(self) -> None:
         """Download dataset from HuggingFace."""
         load_dataset(f'{self.repo}/{self.name}')
@@ -422,6 +488,12 @@ class ClassificationDataModule(l.LightningDataModule):
             self._split_data_class_partition(
                 train, split_2['train'], split_2['test'], label_key
             )
+        elif self.split_strategy == 'non_iid':
+            # Automatic Non-IID: each agent gets classes_per_agent random
+            # classes, samples distributed among assigned agents
+            self._split_data_non_iid(
+                train, split_2['train'], split_2['test'], label_key
+            )
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
 
@@ -446,10 +518,10 @@ class ClassificationDataModule(l.LightningDataModule):
             self.input_dims = {str(i): sample.shape[0] for i in self.models}
 
     def _make_loader(
-        self, datasets: dict[int, Dataset], shuffle: bool
+        self, dataset: Dataset, shuffle: bool
     ) -> DataLoader:
         return DataLoader(
-            datasets[0],
+            dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
@@ -459,7 +531,7 @@ class ClassificationDataModule(l.LightningDataModule):
     def train_dataloader(self) -> CombinedLoader:
         return CombinedLoader(
             {
-                i: self._make_loader(self.train_datasets, True)
+                i: self._make_loader(self.train_datasets[i], True)
                 for i in self.train_datasets
             },
             mode=self.mode,
@@ -468,7 +540,7 @@ class ClassificationDataModule(l.LightningDataModule):
     def val_dataloader(self) -> CombinedLoader:
         return CombinedLoader(
             {
-                i: self._make_loader(self.val_datasets, False)
+                i: self._make_loader(self.val_datasets[i], False)
                 for i in self.val_datasets
             },
             mode=self.mode,
@@ -477,7 +549,7 @@ class ClassificationDataModule(l.LightningDataModule):
     def test_dataloader(self) -> CombinedLoader:
         return CombinedLoader(
             {
-                i: self._make_loader(self.test_datasets, False)
+                i: self._make_loader(self.test_datasets[i], False)
                 for i in self.test_datasets
             },
             mode=self.mode,
