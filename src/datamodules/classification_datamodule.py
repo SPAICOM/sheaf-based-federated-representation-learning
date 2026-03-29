@@ -508,14 +508,9 @@ class ClassificationDataModule(l.LightningDataModule):
         # Store number of classes for the 'label' key (for compatibility)
         self.num_classes['label'] = self.num_classes.get(0)
 
-        # Create list of agent indices and determine input dimensions
+        # Create list of agent indices and determine input dimensions dynamically
         self.models = list(range(self.n_agents))
-        if isinstance(sample, Image.Image):
-            # Image data: use 3 channels (RGB)
-            self.input_dims = {str(i): 3 for i in self.models}
-        else:
-            # Tensor data: use first dimension as feature count
-            self.input_dims = {str(i): sample.shape[0] for i in self.models}
+        self.input_dims = {str(i): self.input_shape[0] for i in self.models}
 
     def _make_loader(
         self, dataset: Dataset, shuffle: bool

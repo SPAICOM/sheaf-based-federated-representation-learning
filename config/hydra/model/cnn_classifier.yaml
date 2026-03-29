@@ -1,0 +1,14 @@
+_target_: src.agents.CNNClassifier
+
+in_features: null
+num_classes: null
+
+encoder_hidden_dims: [32, 64]
+decoder_hidden_dims: [120]
+
+dropout: 0.1
+
+activation:
+  _target_: torch.nn.ReLU
+
+use_batchnorm: true

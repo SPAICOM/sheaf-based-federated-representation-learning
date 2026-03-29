@@ -152,11 +152,11 @@ def main(cfg: DictConfig) -> None:
         # Instantiate the agent model
         agents[i] = instantiate(model_cfg)
 
-        # For TimmClassifier: infer latent_dims from encoder after
-        # instantiation. TimmClassifier doesn't have latent_dim in config,
-        # so we query the encoder's num_features to get output dim.
+        # For TimmClassifier/CNNClassifier: infer latent_dims after instantiation.
         if 'TimmClassifier' in str(type(agents[i])):
             latent_dims[i] = agents[i].encoder.num_features
+        elif 'CNNClassifier' in str(type(agents[i])):
+            latent_dims[i] = agents[i].decoder.network[0].in_features
 
     # Generate neighbor graph for federated learning communication
     # Used by SheafFRL to create cross-covariance matrices between agents

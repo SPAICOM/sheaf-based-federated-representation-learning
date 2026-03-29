@@ -56,14 +56,6 @@ def partition_non_iid(
     ValueError
         If ``classes_per_agent`` exceeds the number of unique classes or is
         less than 1.
-
-    Examples
-    --------
-    >>> labels = [0]*500 + [1]*500 + [2]*500 + [3]*500
-    >>> partition = partition_non_iid(labels, n_agents=4, classes_per_agent=2)
-    >>> all(len(v) > 0 for v in partition.values())
-    True
-    >>> # With alpha=0.5, agent dataset sizes will vary significantly
     """
     labels_tensor = torch.tensor(labels, dtype=torch.long)
     unique_classes = torch.unique(labels_tensor).tolist()
@@ -77,7 +69,7 @@ def partition_non_iid(
 
     generator = torch.Generator().manual_seed(seed)
 
-    # Step 1: assign each agent a random subset of classes
+    # assign each agent a random subset of classes
     agent_class_sets: dict[int, list[int]] = {}
     for i in range(n_agents):
         perm = torch.randperm(num_classes, generator=generator)
@@ -85,17 +77,15 @@ def partition_non_iid(
             unique_classes[j] for j in perm[:classes_per_agent].tolist()
         ]
 
-    # Step 2: build a mapping  class → list of agents that have this class
     class_to_agents: dict[int, list[int]] = {c: [] for c in unique_classes}
     for agent_id, class_list in agent_class_sets.items():
         for c in class_list:
             class_to_agents[c].append(agent_id)
 
-    # Step 3: for each class, distribute its sample indices among assigned
-    # agents with Dirichlet-drawn random proportions (statistical skew)
+    # for each class, distribute its sample indices among assigned
+    # agents with Dirichlet-drawn random proportions
     agent_indices: dict[int, list[int]] = {i: [] for i in range(n_agents)}
 
-    # Dirichlet distribution for random proportions
     dirichlet = torch.distributions.Dirichlet(
         torch.ones(1)  # placeholder, resized per class below
     )
@@ -109,24 +99,22 @@ def partition_non_iid(
 
         assigned_agents = class_to_agents[c]
         if not assigned_agents:
-            # Edge case: no agent was assigned this class — skip
+            # Edge case: no agent was assigned this class
             continue
 
         n_assigned = len(assigned_agents)
         n_samples = len(c_indices)
 
         if n_assigned == 1:
-            # Only one agent gets this class — no need for proportions
+            # Only one agent gets this class
             agent_indices[assigned_agents[0]].extend(c_indices.tolist())
             continue
 
         # Draw random proportions from Dirichlet(alpha, alpha, ..., alpha)
-        # Use manual seeded sampling for reproducibility
         concentration = torch.full((n_assigned,), alpha)
-        # Seed the Dirichlet sample via Gamma draws using our generator
         gamma_samples = torch.zeros(n_assigned)
         for k in range(n_assigned):
-            # Gamma(alpha, 1) via torch — use the seeded generator
+            # Gamma(alpha, 1) via torch 
             gamma_samples[k] = torch._standard_gamma(
                 concentration[k:k+1], generator=generator
             ).item()
@@ -134,7 +122,7 @@ def partition_non_iid(
         # Normalise to get Dirichlet proportions
         proportions = gamma_samples / gamma_samples.sum()
 
-        # Convert proportions to integer counts (guaranteed to sum to n_samples)
+        # Convert proportions to integer counts
         counts = (proportions * n_samples).long()
         # Distribute rounding remainder to random agents
         remainder = n_samples - counts.sum().item()
@@ -146,7 +134,7 @@ def partition_non_iid(
             trim_idx = torch.argsort(counts, descending=True)[:abs(remainder)]
             counts[trim_idx] -= 1
 
-        # Ensure no negative counts (edge case with extreme alpha)
+        # Ensure no negative counts 
         counts = counts.clamp(min=0)
 
         # Assign sample chunks according to the random counts

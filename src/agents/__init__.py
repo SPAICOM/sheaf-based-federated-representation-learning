@@ -14,11 +14,13 @@ Each agent implements:
 """
 
 from .base_agent import BaseAgent
+from .cnn_classifier import CNNClassifier
 from .latent_classifier import LatentClassifier
 from .timm_classifier import TimmClassifier
 
 __all__ = [
     'BaseAgent',
+    'CNNClassifier',
     'LatentClassifier',
     'TimmClassifier',
 ]
