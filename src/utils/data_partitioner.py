@@ -111,7 +111,8 @@ def partition_non_iid(
             continue
 
         # Draw random proportions from Dirichlet(alpha, alpha, ..., alpha)
-        concentration = torch.full((n_assigned,), alpha)
+        # Ensure alpha is a float, as torch._standard_gamma requires a float tensor
+        concentration = torch.full((n_assigned,), float(alpha), dtype=torch.float32)
         gamma_samples = torch.zeros(n_assigned)
         for k in range(n_assigned):
             # Gamma(alpha, 1) via torch 

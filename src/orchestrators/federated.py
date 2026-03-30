@@ -191,8 +191,11 @@ class FederatedLearning(BaseOrchestrator):
         outputs = self(batch)
 
         # Accumulate metrics across all agents
-        total_loss = 0
-        total_performance = 0
+        total_loss = 0.0
+        total_performance = 0.0
+
+        losses = []
+        performances = []
 
         # Compute loss and performance for each agent
         for idx, agent in self.agents.items():
@@ -216,15 +219,27 @@ class FederatedLearning(BaseOrchestrator):
             # Accumulate for aggregate metrics
             total_loss += loss
             total_performance += performance
+            
+            losses.append(loss)
+            performances.append(performance)
 
         # Compute average performance across all agents
-        avg_performance = total_performance / len(self.agents)
+        avg_performance = total_performance / len(self.agents) if len(self.agents) > 0 else 0.0
+        
+        losses_tensor = torch.stack(losses) if losses else torch.tensor([0.0], device=self.device)
+        perfs_tensor = torch.stack(performances) if performances else torch.tensor([0.0], device=self.device)
 
         # Log aggregate metrics
         self.log_dict(
             {
                 f'{prefix}/total_loss_epoch': total_loss,
                 f'{prefix}/avg_task_performance_epoch': avg_performance,
+                f'{prefix}/loss_min': losses_tensor.min(),
+                f'{prefix}/loss_max': losses_tensor.max(),
+                f'{prefix}/loss_std': losses_tensor.std(unbiased=False) if len(losses) > 1 else 0.0,
+                f'{prefix}/task_performance_min': perfs_tensor.min(),
+                f'{prefix}/task_performance_max': perfs_tensor.max(),
+                f'{prefix}/task_performance_std': perfs_tensor.std(unbiased=False) if len(performances) > 1 else 0.0,
             },
             on_step=False,
             on_epoch=True,

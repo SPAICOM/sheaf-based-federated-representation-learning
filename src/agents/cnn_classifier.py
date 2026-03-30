@@ -38,8 +38,7 @@ class CNNClassifier(BaseAgent):
         Parameters
         ----------
         in_features : int
-            Number of input channels (e.g., 3 for RGB, 1 for grayscale).
-            Injected automatically by experiment.py from the datamodule.
+            Number of input channels, injected automatically by experiment.py from the datamodule.
         num_classes : int
             Number of output classes.
         encoder_hidden_dims : list[int], optional

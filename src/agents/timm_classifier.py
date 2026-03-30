@@ -46,6 +46,7 @@ from torchvision import transforms
 from .base_agent import BaseAgent
 from .utils import MLP
 
+# TODO: currently assumes input images have 3 channels, add flexibility for mnist 
 
 class TimmClassifier(BaseAgent):
     """Timm-based classifier with custom MLP decoder.

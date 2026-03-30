@@ -488,6 +488,8 @@ class ClassificationDataModule(l.LightningDataModule):
             self._split_data_class_partition(
                 train, split_2['train'], split_2['test'], label_key
             )
+        
+        # TODO: needs debugging
         elif self.split_strategy == 'non_iid':
             # Automatic Non-IID: each agent gets classes_per_agent random
             # classes, samples distributed among assigned agents
@@ -496,6 +498,10 @@ class ClassificationDataModule(l.LightningDataModule):
             )
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
+
+        global_classes = len(set(train[label_key]))
+        for i in range(self.n_agents):
+            self.num_classes[i] = global_classes
 
         # Determine input shape from first sample
         # Handle both PIL Images (need conversion) and pre-converted tensors

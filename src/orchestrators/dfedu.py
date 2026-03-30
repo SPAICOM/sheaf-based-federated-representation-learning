@@ -81,7 +81,7 @@ class DFedU(BaseOrchestrator):
         Apply Laplacian penalty to pull neighboring weights together after each epoch of parallel local updates.
         
         w_i_new = w_i - eta * sum_j(a_ij * (w_i - w_j))
-        where a_ij = 1 / d_i (uniform edge weights)
+        where A is the (weighted) adjacency matrix
         """
         agent_vectors = {}
         # Extract flattened parameter vectors for all agents (trainable only)
@@ -101,13 +101,14 @@ class DFedU(BaseOrchestrator):
             neighbors_i = self.hparams.neighbors.get(i, set())
             d_i = len(neighbors_i)
             
+            # laplacian regularization step
             if d_i > 0:
                 sum_diff = torch.zeros_like(w_i)
                 for j in neighbors_i:
                     w_j = agent_vectors[j]
                     sum_diff += (w_i - w_j)
                     
-                # if a_ij = 1  many different choices here (random, all ones etc )
+                # if a_ij = 1  many different choices here (random, all ones etc.) )
                 # w_i_new = w_i - eta * (sum_diff / float(d_i)))
                 w_i_new = w_i - self.hparams.eta * sum_diff 
                 new_vectors[i] = w_i_new
@@ -133,6 +134,9 @@ class DFedU(BaseOrchestrator):
         total_loss = 0.0
         total_performance = 0.0
 
+        losses = []
+        performances = []
+
         for idx, agent in self.agents.items():
             y_hat, y = outputs[idx]
 
@@ -150,14 +154,25 @@ class DFedU(BaseOrchestrator):
 
             total_loss += loss
             total_performance += performance
+            losses.append(loss)
+            performances.append(performance)
 
         num_agents = len(self.agents)
         avg_performance = total_performance / num_agents if num_agents > 0 else 0.0
+
+        losses_tensor = torch.stack(losses) if losses else torch.tensor([0.0], device=self.device)
+        perfs_tensor = torch.stack(performances) if performances else torch.tensor([0.0], device=self.device)
 
         self.log_dict(
             {
                 f'{prefix}/total_loss_epoch': total_loss,
                 f'{prefix}/avg_task_performance_epoch': avg_performance,
+                f'{prefix}/loss_min': losses_tensor.min(),
+                f'{prefix}/loss_max': losses_tensor.max(),
+                f'{prefix}/loss_std': losses_tensor.std(unbiased=False) if len(losses) > 1 else 0.0,
+                f'{prefix}/task_performance_min': perfs_tensor.min(),
+                f'{prefix}/task_performance_max': perfs_tensor.max(),
+                f'{prefix}/task_performance_std': perfs_tensor.std(unbiased=False) if len(performances) > 1 else 0.0,
             },
             on_step=False,
             on_epoch=True,
