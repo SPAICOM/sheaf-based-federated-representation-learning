@@ -8,7 +8,6 @@ This package provides helper functions for:
 - I/O operations: Managing experiment directories and checkpoints
 """
 
-from .communication import calculate_communication_cost
 from .anchors import (
     AnchorConfig,
     build_anchor_bundles,
@@ -16,6 +15,7 @@ from .anchors import (
     shared_anchor_rows,
     supported_anchor_strategy,
 )
+from .communication import calculate_communication_cost
 from .data_partitioner import partition_non_iid
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir

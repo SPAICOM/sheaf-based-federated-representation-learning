@@ -46,6 +46,7 @@ from torchvision import transforms
 from .base_agent import BaseAgent
 from .utils import MLP
 
+
 class TimmClassifier(BaseAgent):
     """Timm-based classifier with custom MLP decoder.
 
@@ -81,7 +82,8 @@ class TimmClassifier(BaseAgent):
         freeze_encoder : bool, optional
             If True, freeze all encoder (backbone) parameters so only the
             decoder MLP is trained. Enables linear probing mode which avoids
-            fine-tuning instability when per-agent data is small (default: False).
+            fine-tuning instability when per-agent data is small
+            (default: False).
         decoder_hidden_dims : list[int], optional
             Hidden layer dimensions for the decoder MLP (default: [256]).
         dropout : float, optional

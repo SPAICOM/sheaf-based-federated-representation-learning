@@ -150,7 +150,8 @@ def main(cfg: DictConfig) -> None:
         # Instantiate the agent model
         agents[i] = instantiate(model_cfg)
 
-        # For TimmClassifier/CNNClassifier: infer latent_dims after instantiation.
+        # For TimmClassifier/CNNClassifier: infer latent_dims after
+        # instantiation.
         if 'TimmClassifier' in str(type(agents[i])):
             latent_dims[i] = agents[i].encoder.num_features
         elif 'CNNClassifier' in str(type(agents[i])):

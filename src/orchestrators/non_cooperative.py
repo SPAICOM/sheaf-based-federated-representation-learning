@@ -7,10 +7,11 @@ zero throughout the run.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
-import torch.nn as nn
+if TYPE_CHECKING:
+    import torch
+    import torch.nn as nn
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 

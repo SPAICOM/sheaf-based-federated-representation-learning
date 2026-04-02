@@ -425,9 +425,7 @@ class ClassificationDataModule(l.LightningDataModule):
             )
             self.num_classes[i] = len(allowed)
 
-    def _split_data_non_iid(
-        self, train, val, test, label_key: str
-    ) -> None:
+    def _split_data_non_iid(self, train, val, test, label_key: str) -> None:
         """Split data using automatic Non-IID partitioning.
 
         Each agent is randomly assigned ``classes_per_agent`` classes.
@@ -558,20 +556,14 @@ class ClassificationDataModule(l.LightningDataModule):
         # Choose splitting strategy based on configuration
         if self.split_strategy == 'uniform':
             # Distribute data evenly across all agents
-            self._split_data_uniform(
-                train, val, test, label_key
-            )
+            self._split_data_uniform(train, val, test, label_key)
         elif self.split_strategy == 'class_partition':
             # Assign specific classes to each agent
-            self._split_data_class_partition(
-                train, val, test, label_key
-            )
+            self._split_data_class_partition(train, val, test, label_key)
         elif self.split_strategy == 'non_iid':
             # Automatic Non-IID: each agent gets classes_per_agent random
             # classes, samples distributed among assigned agents
-            self._split_data_non_iid(
-                train, val, test, label_key
-            )
+            self._split_data_non_iid(train, val, test, label_key)
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
 
@@ -586,13 +578,11 @@ class ClassificationDataModule(l.LightningDataModule):
         # Store number of classes for the 'label' key (for compatibility)
         self.num_classes['label'] = self.num_classes.get(0)
 
-        # Create list of agent indices and determine input dimensions dynamically
+        # Create agent index list and determine input dimensions
         self.models = list(range(self.n_agents))
         self.input_dims = {str(i): self.input_shape[0] for i in self.models}
 
-    def _make_loader(
-        self, dataset: Dataset, shuffle: bool
-    ) -> DataLoader:
+    def _make_loader(self, dataset: Dataset, shuffle: bool) -> DataLoader:
         return DataLoader(
             dataset,
             batch_size=self.batch_size,

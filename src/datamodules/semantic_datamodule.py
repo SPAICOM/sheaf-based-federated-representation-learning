@@ -70,7 +70,9 @@ class SemanticDataset(Dataset):
         self, idx: int
     ) -> (
         tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]
-        | tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor], torch.Tensor]
+        | tuple[
+            torch.Tensor, torch.Tensor | dict[str, torch.Tensor], torch.Tensor
+        ]
     ):
         """Get a single sample from the dataset.
 

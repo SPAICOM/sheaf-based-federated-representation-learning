@@ -153,7 +153,8 @@ class LatentClassifier(BaseAgent):
         # Validate input shape: must be 2D (batch_size, features)
         if x.ndim != 2:
             raise ValueError(
-                f'Expected input of shape (batch_size, in_features),got {x.shape}'
+                f'Expected input of shape (batch_size, in_features),'
+                f'got {x.shape}'
             )
         # Pass through encoder to get latent representation
         return self.encoder(x)
@@ -174,7 +175,8 @@ class LatentClassifier(BaseAgent):
         # Validate input shape: must be 2D (batch_size, features)
         if x.ndim != 2:
             raise ValueError(
-                f'Expected input of shape (batch_size, in_features),got {x.shape}'
+                f'Expected input of shape (batch_size, in_features),'
+                f'got {x.shape}'
             )
         # Full forward pass: encode -> decode to get logits
         return self.decoder(self.encode(x))
@@ -211,7 +213,8 @@ class LatentClassifier(BaseAgent):
         """
         if y_hat.ndim != 2:
             raise ValueError(
-                f'Expected y_hat of shape (batch_size, num_classes),got {y_hat.shape}'
+                f'Expected y_hat of shape (batch_size, num_classes),'
+                f'got {y_hat.shape}'
             )
 
         if y.ndim != 1:
@@ -248,7 +251,8 @@ class LatentClassifier(BaseAgent):
         """
         if y_hat.ndim != 2:
             raise ValueError(
-                f'Expected y_hat of shape (batch_size, num_classes), got {y_hat.shape}'
+                f'Expected y_hat of shape (batch_size, num_classes),'
+                f' got {y_hat.shape}'
             )
 
         if y.ndim != 1:

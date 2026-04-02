@@ -32,11 +32,13 @@ def _sample_class_assignments(
     classes_per_agent: int,
     generator: torch.Generator,
 ) -> dict[int, list[int]]:
-    """Assign random classes to agents while ensuring every class is covered."""
+    """Assign random classes to agents ensuring every class is covered."""
     agent_class_sets = {agent_id: set() for agent_id in range(n_agents)}
     shuffled_classes = [
         unique_classes[idx]
-        for idx in torch.randperm(len(unique_classes), generator=generator).tolist()
+        for idx in torch.randperm(
+            len(unique_classes), generator=generator
+        ).tolist()
     ]
 
     # First guarantee that every class is available to at least one agent.
@@ -159,12 +161,14 @@ def partition_non_iid(
             assigned_classes = sorted(set(agent_classes.get(agent_id, [])))
             if not assigned_classes:
                 raise ValueError(
-                    f'agent {agent_id} has no assigned classes in agent_classes'
+                    f'agent {agent_id} has no assigned classes'
+                    f' in agent_classes'
                 )
             unknown_classes = set(assigned_classes) - unique_class_set
             if unknown_classes:
                 raise ValueError(
-                    f'agent {agent_id} was assigned classes not present in the '
+                    f'agent {agent_id} was assigned classes not'
+                    f' present in the '
                     f'dataset split: {sorted(unknown_classes)}'
                 )
             resolved_agent_classes[agent_id] = assigned_classes
@@ -181,7 +185,9 @@ def partition_non_iid(
             f'Uncovered classes: {uncovered_classes}'
         )
 
-    agent_indices: dict[int, list[int]] = {agent_id: [] for agent_id in range(n_agents)}
+    agent_indices: dict[int, list[int]] = {
+        agent_id: [] for agent_id in range(n_agents)
+    }
     agent_indices_by_class: dict[int, dict[int, list[int]]] = {
         agent_id: defaultdict(list) for agent_id in range(n_agents)
     }
@@ -197,7 +203,9 @@ def partition_non_iid(
             agent_id = assigned_agents[0]
             selected_indices = class_indices.tolist()
             agent_indices[agent_id].extend(selected_indices)
-            agent_indices_by_class[agent_id][class_label].extend(selected_indices)
+            agent_indices_by_class[agent_id][class_label].extend(
+                selected_indices
+            )
             continue
 
         proportions = _draw_dirichlet_proportions(
@@ -216,19 +224,26 @@ def partition_non_iid(
         offset = 0
         for position, agent_id in enumerate(assigned_agents):
             count = counts[position].item()
-            selected_indices = class_indices[offset:offset + count].tolist()
+            selected_indices = class_indices[offset : offset + count].tolist()
             agent_indices[agent_id].extend(selected_indices)
-            agent_indices_by_class[agent_id][class_label].extend(selected_indices)
+            agent_indices_by_class[agent_id][class_label].extend(
+                selected_indices
+            )
             offset += count
 
     if n_agents == 1:
-        result: dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]
+        result: (
+            dict[int, list[int]]
+            | tuple[dict[int, list[int]], dict[int, list[int]]]
+        )
         result = agent_indices
         if return_agent_classes:
             result = (agent_indices, resolved_agent_classes)
         return result
 
-    empty_agents = [agent_id for agent_id, indices in agent_indices.items() if not indices]
+    empty_agents = [
+        agent_id for agent_id, indices in agent_indices.items() if not indices
+    ]
     for agent_id in empty_agents:
         donor_found = False
         candidate_classes = resolved_agent_classes[agent_id]
@@ -245,10 +260,14 @@ def partition_non_iid(
                         agent_indices_by_class[current_agent][class_label]
                     ),
                 )
-                moved_index = agent_indices_by_class[donor_id][class_label].pop()
+                moved_index = agent_indices_by_class[donor_id][
+                    class_label
+                ].pop()
                 agent_indices[donor_id].remove(moved_index)
                 agent_indices[agent_id].append(moved_index)
-                agent_indices_by_class[agent_id][class_label].append(moved_index)
+                agent_indices_by_class[agent_id][class_label].append(
+                    moved_index
+                )
                 donor_found = True
                 break
 
@@ -265,7 +284,9 @@ def partition_non_iid(
                 'Could not allocate at least one sample to every agent.'
             )
 
-        donor_id = max(donors, key=lambda current_agent: len(agent_indices[current_agent]))
+        donor_id = max(
+            donors, key=lambda current_agent: len(agent_indices[current_agent])
+        )
         moved_index = agent_indices[donor_id].pop()
         moved_class = labels[moved_index]
         agent_indices[agent_id].append(moved_index)

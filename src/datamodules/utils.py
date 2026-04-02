@@ -58,8 +58,8 @@ def compute_split_indices(
 
     train_count = remaining_size - val_count - test_count
     train_indices = remaining_indices[:train_count]
-    val_indices = remaining_indices[train_count:train_count + val_count]
-    test_indices = remaining_indices[train_count + val_count:]
+    val_indices = remaining_indices[train_count : train_count + val_count]
+    test_indices = remaining_indices[train_count + val_count :]
 
     return {
         'pilot': pilot_indices,

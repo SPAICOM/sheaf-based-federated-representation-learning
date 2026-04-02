@@ -16,9 +16,7 @@ from .utils import MLP
 
 
 class CNNClassifier(BaseAgent):
-
     def __init__(
-        
         self,
         in_features: int,
         num_classes: int,
@@ -33,11 +31,13 @@ class CNNClassifier(BaseAgent):
         Parameters
         ----------
         in_features : int
-            Number of input channels, injected automatically by experiment.py from the datamodule.
+            Number of input channels, injected automatically by
+            experiment.py from the datamodule.
         num_classes : int
             Number of output classes.
         encoder_hidden_dims : list[int], optional
-            Number of output channels for each Conv2d layer (default: [32, 64, 128]).
+            Number of output channels for each Conv2d layer
+            (default: [32, 64, 128]).
         decoder_hidden_dims : list[int], optional
             Hidden layer dimensions for the decoder MLP (default: [256]).
         dropout : float, optional

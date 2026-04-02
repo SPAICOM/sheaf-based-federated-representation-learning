@@ -1,7 +1,8 @@
 """
 Sheaf-based Federated Representation Learning orchestrator.
 
-This module implements the proposed federated learning framework with Sheaf regularization
+This module implements the proposed federated learning framework with
+Sheaf regularization
 that maintains aligned latent spaces across agents through Stiefel manifold
 optimization of cross-covariance matrices. Anchor strategies are implemented
 with explicit semantic correspondence keys so neighboring agents are aligned
@@ -89,7 +90,7 @@ class SheafFRL(BaseOrchestrator):
         self.stiefel_matrices = nn.ParameterDict()
         self.epoch_anchors = {}
         # Per-agent semantic anchor identifiers. For class-based strategies
-        # these are class labels; for semantic pilots they are shared sample ids.
+        # these are class labels; for semantic pilots: shared sample ids.
         self.epoch_anchor_ids: dict[int, list[torch.Tensor]] = {}
 
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
@@ -128,7 +129,7 @@ class SheafFRL(BaseOrchestrator):
                     )
 
     def on_train_epoch_start(self) -> None:
-        """Initialize/reset per-agent anchor and label buffers at epoch start."""
+        """Initialize/reset per-agent anchor and label buffers."""
         for idx_str in self.agents:
             idx = int(idx_str)
             self.epoch_anchors[idx] = []
@@ -208,7 +209,9 @@ class SheafFRL(BaseOrchestrator):
             # Cross-covariance thin-SVD
             C = torch.matmul(A_i.T, A_j)
             U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
-            V_new = torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
+            V_new = torch.matmul(U, W_T).to(
+                dtype=V_param.dtype, device=param_device
+            )
             V_param.copy_(V_new)
 
         # Clear epoch buffers
@@ -357,7 +360,9 @@ class SheafFRL(BaseOrchestrator):
 
         # Total loss: task loss (full batch) + sheaf penalty (anchor set)
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
-        total_loss = total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
+        total_loss = (
+            total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
+        )
 
         self._log_shared_metrics(
             prefix=prefix,

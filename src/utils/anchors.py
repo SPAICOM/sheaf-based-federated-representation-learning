@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-
 AnchorKeys = dict[int, list[tuple[int, int]]]
 AnchorTensors = dict[int, torch.Tensor]
 
@@ -91,7 +90,9 @@ def normalize_anchor_matrix(
 ) -> torch.Tensor:
     """Apply the configured anchor normalization to a full anchor matrix."""
     if config.parseval_normalization:
-        return parseval_normalize(anchor_matrix, eps=float(config.parseval_eps))
+        return parseval_normalize(
+            anchor_matrix, eps=float(config.parseval_eps)
+        )
     if config.l2_normalization:
         return l2_normalize(anchor_matrix)
     return anchor_matrix
@@ -125,9 +126,9 @@ def build_balanced_class_plan(
     ]
 
     if budget <= len(class_order):
-        return {class_label: 1 for class_label in class_order[:budget]}
+        return dict.fromkeys(class_order[:budget], 1)
 
-    plan = {class_label: 1 for class_label in class_order}
+    plan = dict.fromkeys(class_order, 1)
     remaining = budget - len(class_order)
     cursor = 0
     while remaining > 0:
@@ -166,7 +167,7 @@ def build_class_anchor_plan(
 
     match strategy:
         case 'prototype':
-            return {class_label: 1 for class_label in global_classes}
+            return dict.fromkeys(global_classes, 1)
         case 'balanced' | 'clustered_pilots' | 'dynamic':
             return build_balanced_class_plan(
                 global_classes,

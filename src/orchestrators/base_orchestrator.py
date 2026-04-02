@@ -125,7 +125,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         prog_bar: bool = True,
         per_agent_loss_name: str = 'loss',
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Log per-agent and aggregate metrics for validation/test reporting."""
+        """Log per-agent and aggregate metrics for val/test reporting."""
         normalized_losses = {
             idx: self._metric_tensor(loss)
             for idx, loss in agent_losses.items()
@@ -172,7 +172,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             avg_performance = torch.tensor(0.0, device=self.device)
 
         resolved_total_loss = (
-            total_task_loss if total_loss is None else self._metric_tensor(total_loss)
+            total_task_loss
+            if total_loss is None
+            else self._metric_tensor(total_loss)
         )
 
         aggregate_logs = {
