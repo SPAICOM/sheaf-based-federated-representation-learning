@@ -46,7 +46,8 @@ from torchvision import transforms
 from .base_agent import BaseAgent
 from .utils import MLP
 
-# TODO: currently assumes input images have 3 channels, add flexibility for mnist 
+# TODO: currently assumes input images have 3 channels, add flexibility for mnist
+
 
 class TimmClassifier(BaseAgent):
     """Timm-based classifier with custom MLP decoder.
@@ -166,28 +167,23 @@ class TimmClassifier(BaseAgent):
             Latent features of shape (batch_size, encoder_dim).
         """
         # Handle different input formats and ensure proper shape/dimensions
+        match x:
+            case Image.Image():
+                x = transforms.Compose(
+                    [
+                        transforms.Resize((224, 224)),
+                        transforms.ToTensor(),
+                    ]
+                )(x)
+                x = x.unsqueeze(0)
 
-        # Case 1: PIL Image - convert to tensor and resize to 224x224
-        if isinstance(x, Image.Image):
-            x = transforms.Compose(
-                [
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                ]
-            )(x)
-            # Add batch dimension: (C, H, W) -> (1, C, H, W)
-            x = x.unsqueeze(0)
-
-        # Case 2: Single image as tensor (C, H, W) - add batch dimension
-        elif x.ndim == 3:
-            x = x.unsqueeze(0)
-            # Resize to expected 224x224 if needed
-            x = transforms.Resize((224, 224))(x)
-
-        # Case 3: Batch of images (B, C, H, W) - resize if not 224x224
-        elif x.ndim == 4:
-            if x.shape[-1] != 224 or x.shape[-2] != 224:
+            case _ if isinstance(x, torch.Tensor) and x.ndim == 3:
+                x = x.unsqueeze(0)
                 x = transforms.Resize((224, 224))(x)
+
+            case _ if isinstance(x, torch.Tensor) and x.ndim == 4:
+                if x.shape[-1] != 224 or x.shape[-2] != 224:
+                    x = transforms.Resize((224, 224))(x)
 
         # Pass through encoder backbone to get feature maps
         features = self._encoder(x)

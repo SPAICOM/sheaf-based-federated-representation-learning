@@ -65,20 +65,20 @@ class CNNClassifier(BaseAgent):
             layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
             if use_batchnorm:
                 layers.append(nn.BatchNorm2d(out_ch))
-            
+
             layers.append(
                 activation() if isinstance(activation, type) else activation
             )
-            
+
             layers.append(nn.MaxPool2d(2))
-            
+
             if dropout > 0:
                 layers.append(nn.Dropout2d(p=dropout))
-                
+
             in_ch = out_ch
 
         self._encoder = nn.Sequential(*layers)
-        
+
         self._pool = nn.AdaptiveAvgPool2d((1, 1))
 
         encoder_dim = encoder_hidden_dims[-1]
@@ -104,16 +104,15 @@ class CNNClassifier(BaseAgent):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Pass through encoder and pool to get latent features."""
-        # Convert PIL to Tensor and add batch dimension
-        if isinstance(x, Image.Image):
-            x = transforms.ToTensor()(x).unsqueeze(0)
-        # Convert single image (C, H, W) to batch (1, C, H, W)
-        elif x.ndim == 3:
-            x = x.unsqueeze(0)
+        match x:
+            case Image.Image():
+                x = transforms.ToTensor()(x).unsqueeze(0)
+            case _ if isinstance(x, torch.Tensor) and x.ndim == 3:
+                x = x.unsqueeze(0)
 
         # Forward through Conv layers
         features = self._encoder(x)
-        
+
         # Reduce spatial dimensions to 1x1
         if features.ndim == 4:
             features = self._pool(features)

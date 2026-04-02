@@ -1,5 +1,1 @@
 _target_: src.orchestrators.FederatedLearning
-
-agents: null
-
-neighbors: {}

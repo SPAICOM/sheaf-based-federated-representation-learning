@@ -26,13 +26,11 @@ graph:
   seed: 42
   p: 0.3
   m: 3
-  neighbors: {}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: sheaf-repr-learning__timm-agents-exp
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
-  save_dir: logs/
   log_model: false
 
 trainer:

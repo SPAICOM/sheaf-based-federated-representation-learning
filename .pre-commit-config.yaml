@@ -10,3 +10,11 @@ repos:
       - id: ruff
         args: [ --fix ]
       - id: ruff-format
+  - repo: local
+    hooks:
+      - id: test-fast
+        name: test-fast
+        entry: just test_fast
+        language: system
+        pass_filenames: false
+        always_run: true

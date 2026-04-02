@@ -1,9 +1,9 @@
 """
 Sheaf-based Federated Representation Learning orchestrator.
 
-This module implements the proposed federated learning framework with Sheaf regularization
-that maintains aligned latent spaces across agents through Stiefel manifold
-optimization of cross-covariance matrices.
+This module implements the proposed federated learning framework with
+Sheaf regularization that maintains aligned latent spaces across agents
+through Stiefel manifold optimization of cross-covariance matrices.
 """
 
 import torch
@@ -38,6 +38,10 @@ class SheafFRL(BaseOrchestrator):
         Number of anchors to select per epoch.
     parseval_normalization : bool
         Whether to apply Parseval normalization to anchor features.
+    l2_normalization : bool
+        Whether to apply L2 normalization to anchor features.
+    parseval_eps : float
+        Epsilon for Parseval normalization numerical stability (default 1e-4).
 
     Notes
     -----
@@ -84,15 +88,18 @@ class SheafFRL(BaseOrchestrator):
                 i = int(i_raw)
                 j = int(j_raw)
 
-                # Sort nodes by dimension to ensure consistent edge keys
-                # Higher-dimensional node comes first
-                if latent_dims_int[i] > latent_dims_int[j]:
-                    node_i, node_j = i, j
-                elif latent_dims_int[i] < latent_dims_int[j]:
-                    node_i, node_j = j, i
-                else:
-                    # Equal dimensions: use max/min for deterministic ordering
-                    node_i, node_j = max(i, j), min(i, j)
+                # Sort nodes by dimension for consistent edge keys
+                match (
+                    latent_dims_int[i] > latent_dims_int[j],
+                    latent_dims_int[i] < latent_dims_int[j],
+                ):
+                    case (True, _):
+                        node_i, node_j = i, j
+                    case (_, True):
+                        node_i, node_j = j, i
+                    case _:
+                        # Equal dims: use max/min for deterministic ordering
+                        node_i, node_j = max(i, j), min(i, j)
 
                 edge_key = f'{node_i}_{node_j}'
 
@@ -147,7 +154,7 @@ class SheafFRL(BaseOrchestrator):
             # Strategy: Prototype
             case 'prototype':
                 all_labels = torch.cat(list(labels_per_agent.values()))
-                global_classes = torch.unique(all_labels) 
+                global_classes = torch.unique(all_labels)
                 num_global = global_classes.shape[0]
 
                 A_dict: dict[int, torch.Tensor] = {}
@@ -218,7 +225,7 @@ class SheafFRL(BaseOrchestrator):
                 return latents, {}
 
     def on_train_epoch_start(self) -> None:
-        """Initialize/reset per-agent anchor and label buffers at epoch start."""
+        """Reset per-agent anchor and label buffers at epoch start."""
         for idx_str in self.agents:
             idx = int(idx_str)
             self.epoch_anchors[idx] = []
@@ -251,7 +258,7 @@ class SheafFRL(BaseOrchestrator):
         try:
             eigenvalues, eigenvectors = torch.linalg.eigh(C_double)
         except torch._C._LinAlgError:
-            # Fallback if double precision still fails: increase eps significantly
+            # Fallback: increase eps significantly if double precision fails
             C_double = C_double + (eps * 10) * torch.eye(
                 C.size(0), device=C.device, dtype=torch.float64
             )
@@ -267,7 +274,7 @@ class SheafFRL(BaseOrchestrator):
         )
 
         return torch.matmul(A, C_inv)
-    
+
     def l2_normalize(self, A: torch.Tensor) -> torch.Tensor:
         """Apply L2 normalization to anchor features.
 
@@ -353,7 +360,9 @@ class SheafFRL(BaseOrchestrator):
             # Cross-covariance thin-SVD
             C = torch.matmul(A_i.T, A_j)
             U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
-            V_new = torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
+            V_new = torch.matmul(U, W_T).to(
+                dtype=V_param.dtype, device=param_device
+            )
             V_param.copy_(V_new)
 
         # Clear epoch buffers
@@ -421,14 +430,14 @@ class SheafFRL(BaseOrchestrator):
             all_y = torch.cat(
                 [batch[_resolve_key(int(k))][1] for k in self.agents]
             )
-            global_classes = torch.unique(all_y)  
+            global_classes = torch.unique(all_y)
 
-        # Per-agent latent extraction, anchor routing, and Parseval normalization
+        # Per-agent latent extraction, anchor routing, and normalization
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             x, y = batch[_resolve_key(idx)]
 
-            # Single encoder forward pass: reused for both task loss and the sheaf penalty
+            # Single encoder pass: used for task loss and sheaf penalty
             A_batch_raw = agent.encode(x)
             y_hat = agent.decoder(A_batch_raw)
 
@@ -437,7 +446,7 @@ class SheafFRL(BaseOrchestrator):
             # Anchor routing
             match self.hparams.anchor_strategy:
                 case 'prototype':
-                    # Compute per class prototype anchors 
+                    # Compute per class prototype anchors
                     assert global_classes is not None
                     num_global = global_classes.shape[0]
                     d = A_batch_raw.shape[1]
@@ -446,7 +455,7 @@ class SheafFRL(BaseOrchestrator):
                     # Map each sample label to its position in global_classes.
                     row_idx = torch.searchsorted(
                         global_classes, y
-                    )  #values in [0, num_global)
+                    )  # values in [0, num_global)
 
                     # Accumulate feature sums and per-class counts
                     proto_sum = torch.zeros(
@@ -458,10 +467,14 @@ class SheafFRL(BaseOrchestrator):
                         num_global, device=device, dtype=A_batch_raw.dtype
                     )
                     counts.index_add_(
-                        0, row_idx, torch.ones(len(y), device=device, dtype=A_batch_raw.dtype)
+                        0,
+                        row_idx,
+                        torch.ones(
+                            len(y), device=device, dtype=A_batch_raw.dtype
+                        ),
                     )
 
-                    # valid_mask: classes with at least one sample in this batch
+                    # valid_mask: True for classes present in batch
                     valid_mask = counts > 0
                     # Divide only where valid to avoid /0; invalid rows stay 0
                     protos = proto_sum / counts.clamp(min=1).unsqueeze(1)
@@ -475,17 +488,21 @@ class SheafFRL(BaseOrchestrator):
                     # using the full mini-batch latents
                     A_i_raw = A_batch_raw
 
-            # Parseval normalization
-            if self.hparams.parseval_normalization:
-                A_i_tilde = self.parseval_normalize(A_i_raw)
-            elif self.hparams.l2_normalization:
-                A_i_tilde = self.l2_normalize(A_i_raw)
-            else:
-                A_i_tilde = A_i_raw
+            # Normalization
+            match (
+                self.hparams.parseval_normalization,
+                self.hparams.l2_normalization,
+            ):
+                case (True, _):
+                    A_i_tilde = self.parseval_normalize(A_i_raw)
+                case (_, True):
+                    A_i_tilde = self.l2_normalize(A_i_raw)
+                case _:
+                    A_i_tilde = A_i_raw
 
             batch_latents[idx] = A_i_tilde
 
-            # Collect raw batch latents during training for end-of-epoch Stiefel matrix updates
+            # Collect raw batch latents for end-of-epoch Stiefel matrix updates
             if prefix == 'train':
                 self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
                 # Every agent tracks its own labels to support Non-IID splits
@@ -553,16 +570,30 @@ class SheafFRL(BaseOrchestrator):
         )
         avg_performance = total_task_performance / len(self.agents)
 
-        losses_tensor = torch.stack(losses) if losses else torch.tensor([0.0], device=self.device)
-        perfs_tensor = torch.stack(performances) if performances else torch.tensor([0.0], device=self.device)
+        losses_tensor = (
+            torch.stack(losses)
+            if losses
+            else torch.tensor([0.0], device=self.device)
+        )
+        perfs_tensor = (
+            torch.stack(performances)
+            if performances
+            else torch.tensor([0.0], device=self.device)
+        )
 
         self.log_dict(
             {
                 f'{prefix}/sheaf_penalty': sheaf_penalty,
                 f'{prefix}/total_loss_epoch': total_loss,
                 f'{prefix}/avg_task_performance_epoch': avg_performance,
-                f'{prefix}/loss_std': losses_tensor.std(unbiased=False) if len(losses) > 1 else 0.0,
-                f'{prefix}/task_performance_std': perfs_tensor.std(unbiased=False) if len(performances) > 1 else 0.0,
+                f'{prefix}/loss_std': losses_tensor.std(unbiased=False)
+                if len(losses) > 1
+                else 0.0,
+                f'{prefix}/task_performance_std': perfs_tensor.std(
+                    unbiased=False
+                )
+                if len(performances) > 1
+                else 0.0,
             },
             on_step=False,
             on_epoch=True,

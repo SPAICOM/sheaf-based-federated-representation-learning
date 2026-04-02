@@ -223,6 +223,7 @@ data/*
 
 # Others
 img/
+review/
 
 *.img
 *.jpeg

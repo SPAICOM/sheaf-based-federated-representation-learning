@@ -16,11 +16,6 @@ import shutil
 from pathlib import Path
 
 
-# ================================================================
-#
-#                        Methods Definition
-#
-# ================================================================
 def remove_non_empty_dir(path: str) -> None:
     """Remove a non-empty directory and all its contents.
 
@@ -35,17 +30,6 @@ def remove_non_empty_dir(path: str) -> None:
         If the path is not a directory.
     Exception
         For any other error during deletion.
-    """
-    """
-    Removes a non-empty directory given its path as a string.
-
-    Parameters:
-        path : str
-            Path to the directory to remove.
-
-    Raises:
-        NotADirectoryError: If the path is not a directory.
-        Exception: For any other error during deletion.
     """
     # Convert string path to Path object for filesystem operations
     dir_path = Path(path)
