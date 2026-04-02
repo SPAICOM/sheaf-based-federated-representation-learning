@@ -147,7 +147,9 @@ class BaseAgent(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def task_performance(self, y_hat: torch.Tensor, y: torch.Tensor) -> float:
+    def task_performance(
+        self, y_hat: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor | float:
         """Compute the task-specific performance metric.
 
         Parameters

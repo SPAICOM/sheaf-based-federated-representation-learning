@@ -203,12 +203,23 @@ class SheafFRL(BaseOrchestrator):
             A_i, A_j = shared_rows
 
             # Center for unbiased cross-covariance estimation
+            # Subtract mean along feature dimension to center the data
             A_i = A_i - A_i.mean(dim=0, keepdim=True)
             A_j = A_j - A_j.mean(dim=0, keepdim=True)
 
-            # Cross-covariance thin-SVD
+            # Compute cross-covariance C = A_i^T * A_j
+            # Measures linear relationship between agents' features
             C = torch.matmul(A_i.T, A_j)
+
+            # Compute thin SVD of cross-covariance: C = U * S * W^T
+            # We only need U and W (left/right singular vectors)
+            # for the orthogonal Procrustes solution
             U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+
+            # Compute optimal rotation matrix V = U * W^T
+            # that minimizes ||A_i - A_j * V||_F
+            # This solves the orthogonal Procrustes problem for
+            # aligning latent spaces
             V_new = torch.matmul(U, W_T).to(
                 dtype=V_param.dtype, device=param_device
             )

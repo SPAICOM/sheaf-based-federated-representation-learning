@@ -5,13 +5,10 @@ alignment is performed during training, so cumulative communication remains
 zero throughout the run.
 """
 
-from __future__ import annotations
+from typing import Any
 
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import torch
-    import torch.nn as nn
+import torch
+import torch.nn as nn
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
@@ -43,7 +40,28 @@ class NonCooperativeLearning(BaseOrchestrator):
         batch_idx: int,
         prefix: str,
     ) -> tuple[dict[str, Any], torch.Tensor]:
-        """Compute local losses and task metrics without cooperation."""
+        """Run each agent's forward pass and compute its own task loss.
+
+        No inter-agent communication takes place: each agent sees only
+        its own mini-batch and no gradients or parameters are exchanged.
+        Communication counters therefore remain zero for the whole run.
+
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Mapping from agent index to ``(x, y)`` pairs.
+        batch_idx : int
+            Current batch index (unused, kept for interface compatibility).
+        prefix : str
+            Logging prefix (e.g. ``'train'``, ``'validation'``).
+
+        Returns
+        -------
+        tuple[dict, torch.Tensor]
+            ``(outputs, total_loss)`` where ``outputs`` maps each agent
+            index to its ``(y_hat, y)`` pair and ``total_loss`` is the
+            sum of per-agent losses.
+        """
         outputs = self(batch)
 
         agent_losses = {}

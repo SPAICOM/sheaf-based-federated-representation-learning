@@ -248,7 +248,9 @@ class SemanticDataModule(l.LightningDataModule):
         datasets.Dataset
             Concatenated dataset containing all splits.
         """
-        # Collect all available splits and concatenate them into one dataset
+        # Collect all available splits (train, validation, test, etc.)
+        # and concatenate them into one dataset to maximize available data
+        # before applying our custom train/val/test split proportions
         splits = [ds[s] for s in ds]
         return concatenate_datasets(splits)
 
@@ -258,10 +260,12 @@ class SemanticDataModule(l.LightningDataModule):
         Uses a two-stage split to avoid data leakage and ensure
         reproducibility:
         1. First split: separate (train) from (val + test) based on
-           combined ratio
+           combined ratio (val_split + test_split)
         2. Second split: separate val from test within the held-out portion
 
-        This ensures the test set is never seen during training/validation.
+        This ensures the test set is never seen during training/validation,
+        preventing data leakage and providing a unbiased estimate of
+        generalization performance.
 
         Parameters
         ----------
@@ -273,18 +277,27 @@ class SemanticDataModule(l.LightningDataModule):
         tuple[datasets.Dataset, datasets.Dataset, datasets.Dataset]
             Tuple of (train, val, test) datasets.
         """
+        # First split: separate training data from validation+test data
+        # We use (val_split + test_split) as the test size to hold out
+        # the combined validation and test portions
         split_1 = dataset.train_test_split(
             test_size=self.val_split + self.test_split, seed=self.seed
         )
 
         train = split_1['train']
-        temp = split_1['test']
+        temp = split_1['test']  # This contains both validation and test data
 
+        # Second split: separate validation from test data
+        # Want test = test_split of original
+        # But temp = (val_split+test_split) of original
+        # Need test_split/(val_split+test_split) of temp for test
         split_2 = temp.train_test_split(
             test_size=self.test_split / (self.val_split + self.test_split),
             seed=self.seed,
         )
 
+        # split_2['train'] is validation data
+        # split_2['test'] is test data
         return train, split_2['train'], split_2['test']
 
     def prepare_data(self) -> None:
@@ -313,6 +326,7 @@ class SemanticDataModule(l.LightningDataModule):
             If 'label' attribute is not found in the dataset.
         """
         # Initialize dictionaries to hold datasets for each agent/model
+        # Using string keys for compatibility with PyTorch Lightning
         self.train_datasets: dict[str, SemanticDataset] = {}
         self.val_datasets: dict[str, SemanticDataset] = {}
         self.test_datasets: dict[str, SemanticDataset] = {}
@@ -322,25 +336,33 @@ class SemanticDataModule(l.LightningDataModule):
         # Priority: agents dict > models list (for backward compatibility)
         if self.agents:
             # Extract model configuration from agents dict
+            # Convert string keys to int for internal processing
             agent_models = {
                 int(i): cfg['model'] for i, cfg in self.agents.items()
             }
         elif self.models:
             # Use models list directly with sequential agent indices
+            # enumerate() produces (index, value) tuples
             agent_models = dict(enumerate(self.models))
         else:
             raise ValueError('Either "agents" or "models" must be provided')
 
+        # Variables to track split indices and expected dataset length
         split_indices: dict[str, list[int]] | None = None
         expected_merged_length: int | None = None
 
         # Load datasets for each agent/model combination
         for i, m in agent_models.items():
             # Load dataset with specific model configuration
+            # from HuggingFace Hub
             ds = load_dataset(f'{self.repo}/{self.name}', m)
 
-            # Merge all splits to maximize available data
+            # Merge all splits (train/val/test) to maximize data
+            # before applying custom train/val/test split proportions
             merged = self._merge_all_splits(ds)
+
+            # First agent: set expected length & compute split indices
+            # All agents need same length for calibration pilots
             if expected_merged_length is None:
                 expected_merged_length = len(merged)
                 split_indices = compute_split_indices(
@@ -358,15 +380,17 @@ class SemanticDataModule(l.LightningDataModule):
                 )
 
             assert split_indices is not None
+            # Select samples for each split using precomputed indices
             train = merged.select(split_indices['train'])
             val = merged.select(split_indices['val'])
             test = merged.select(split_indices['test'])
             pilot = merged.select(split_indices['pilot'])
 
-            # Use string key for compatibility with Lightning
+            # Use string key for PyTorch Lightning compatibility
             key = str(i)
 
             # Create semantic datasets for each split
+            # Each dataset wraps the HF dataset with attribute extraction logic
             self.train_datasets[key] = SemanticDataset(train, self.attributes)
             self.val_datasets[key] = SemanticDataset(val, self.attributes)
             self.test_datasets[key] = SemanticDataset(test, self.attributes)
@@ -377,14 +401,18 @@ class SemanticDataModule(l.LightningDataModule):
                     sample_ids=split_indices['pilot'],
                 )
 
-        # Store agent/model indices
+        # Store agent/model indices as integers for internal use
         self.models = list(agent_models.keys())
 
         # Determine input dimensions from embedding size
         # Get first sample from first dataset to infer feature dimension
         self.input_dims = {}
         for m, ds in self.train_datasets.items():
-            x, _ = ds[0]
+            # ds[0] returns (embedding, labels) or
+            # (embedding, labels, sample_id)
+            # We only need the embedding to determine input dimensions
+            sample = ds[0]
+            x = sample[0]  # First element is always the embedding tensor
             self.input_dims[m] = x.shape[0]
 
         # Determine number of classes if 'label' attribute exists
@@ -398,10 +426,11 @@ class SemanticDataModule(l.LightningDataModule):
             if 'label' not in first_ds.column_names:
                 raise ValueError('Attribute "label" not found in dataset')
 
+            # Extract label values for analysis
             values = list(first_ds['label'])
 
             # Count unique classes if labels are categorical (int or bool)
-            # Set to None for continuous labels
+            # Set to None for continuous labels (float)
             if isinstance(values[0], (int, bool)):
                 self.num_classes['label'] = len(set(values))
             else:

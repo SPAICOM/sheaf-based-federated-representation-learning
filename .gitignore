@@ -233,7 +233,6 @@ review/
 *.zip
 
 # Project specific ignores
-tests/
 logs/
 
 # Config files - ignore hetero_cifar10 and rotated_mnist experiments

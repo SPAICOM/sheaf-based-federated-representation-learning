@@ -96,7 +96,13 @@ class SheafFMTL(BaseOrchestrator):
                 self.projection_matrices[f'{i}_{j}'] = P_ij
 
     def on_train_epoch_end(self) -> None:
-        """No epoch-level aggregation is required for Sheaf-FMTL."""
+        """No epoch-level aggregation needed for Sheaf-FMTL.
+
+        Both the Laplacian gradient penalty and the projection-matrix
+        update are applied at finer granularity (per-step and per-batch
+        respectively via ``on_before_optimizer_step`` and
+        ``on_train_batch_end``), so nothing is required here.
+        """
         pass
 
     def on_before_optimizer_step(self, optimizer: Any) -> None:

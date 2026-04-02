@@ -19,7 +19,7 @@ leet:
     uv run wandb beta leet run wandb
 
 # Run experiment with specific config
-run_experiment config="timm_agents_experiment" *args="":
+experiment config="cnn_agents_experiment" *args="":
     uv run scripts/experiment.py --config-name {{config}} {{args}}
 
 # Install test dependencies

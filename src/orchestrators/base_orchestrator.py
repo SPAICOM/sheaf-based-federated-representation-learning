@@ -71,7 +71,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._reset_communication_state()
 
     def _metric_tensor(self, value: Any) -> torch.Tensor:
-        """Convert a scalar metric value to a tensor on the module device."""
+        """Ensure a metric value is a scalar tensor on the module device.
+
+        Accepts either a ``torch.Tensor`` (returned as-is) or any numeric
+        type that can be cast to ``float``. Used to normalise heterogeneous
+        outputs from ``compute_loss`` and ``task_performance`` before
+        stacking or logging.
+        """
         if isinstance(value, torch.Tensor):
             return value
         return torch.tensor(float(value), device=self.device)
@@ -82,7 +88,18 @@ class BaseOrchestrator(l.LightningModule, ABC):
         *,
         n_transmissions: int = 1,
     ) -> dict[str, float]:
-        """Accumulate communication cost for a transmitted payload."""
+        """Accumulate communication cost for a transmitted payload.
+
+        Parameters
+        ----------
+        payload : Any
+            The tensor or structure being transmitted. Its size in bits
+            is computed by ``calculate_communication_cost``.
+        n_transmissions : int, optional
+            Number of neighbours the payload is sent to. The total cost
+            is ``payload_size × n_transmissions``. A value < 1 records
+            zero cost and is silently ignored (default: 1).
+        """
         if int(n_transmissions) < 1:
             return {
                 'bits': 0.0,
@@ -100,7 +117,14 @@ class BaseOrchestrator(l.LightningModule, ABC):
         return cost
 
     def _communication_metrics(self, prefix: str) -> dict[str, float]:
-        """Return cumulative communication metrics for logging."""
+        """Return cumulative communication metrics ready for ``log_dict``.
+
+        Parameters
+        ----------
+        prefix : str
+            Logging stage prefix (e.g. ``'train'``, ``'validation'``).
+            Keys are formatted as ``'{prefix}/communication_*'``.
+        """
         return {
             f'{prefix}/communication_bits': self._communication_totals['bits'],
             f'{prefix}/communication_bytes': self._communication_totals[
@@ -232,9 +256,12 @@ class BaseOrchestrator(l.LightningModule, ABC):
         Returns
         -------
         dict[str, tuple[torch.Tensor, torch.Tensor]]
-            Dictionary mapping agent indices to (prediction, label) pairs.
+            String-keyed dict (agent index as str) mapping each agent to
+            a ``(y_hat, y)`` pair where ``y_hat`` are raw logits and
+            ``y`` are the ground-truth labels.
         """
-        # Handle tuple input (CombinedLoader returns tuple)
+        # Lightning's CombinedLoader wraps batches in a tuple; unwrap it
+        # to get the underlying dict before dispatching to agents.
         if isinstance(batch, tuple):
             batch = batch[0]
 
@@ -280,10 +307,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
         Raises
         ------
         NotImplementedError
-            This method must be implemented by subclasses.
+            Subclasses must override this method.
         """
-        # Base implementation raises NotImplementedError
-        # Subclasses must implement this method to compute losses and metrics
         raise NotImplementedError(
             f'{self.__class__.__name__} must implement _shared_eval'
         )

@@ -1,4 +1,8 @@
-"""Shared datamodule utilities."""
+"""Utility functions for semantic datamodule operations.
+
+This module provides helper functions for dataset splitting and manipulation
+used by the SemanticDataModule class.
+"""
 
 from math import ceil
 
@@ -14,7 +18,59 @@ def compute_split_indices(
     pilot_split: float = 0.0,
     pilot_num_samples: int | None = None,
 ) -> dict[str, list[int]]:
-    """Compute deterministic pilot/train/val/test indices from one dataset."""
+    """Compute deterministic pilot/train/val/test indices from one dataset.
+
+    Creates reproducible data splits for federated learning scenarios where
+    each agent needs consistent train/validation/test splits. Optionally
+    creates a pilot set for calibration or inspection purposes.
+
+    Parameters
+    ----------
+    total_size : int
+        Total number of samples in the dataset. Must be at least 1.
+    val_split : float
+        Fraction of data to allocate for validation (after pilot removal).
+        Must be non-negative.
+    test_split : float
+        Fraction of data to allocate for testing (after pilot removal).
+        Must be non-negative.
+    seed : int
+        Random seed for reproducible shuffling and splitting.
+    pilot_split : float, optional
+        Fraction of data to allocate for pilot set (default: 0.0).
+        Must be in [0, 1). If pilot_num_samples is specified, this is ignored.
+    pilot_num_samples : int or None, optional
+        Absolute number of samples for pilot set (default: None).
+        If specified, takes precedence over pilot_split. Must be non-negative.
+
+    Returns
+    -------
+    dict[str, list[int]]
+        Dictionary with keys 'pilot', 'train', 'val', 'test' mapping to
+        lists of indices for each split.
+
+    Raises
+    ------
+    ValueError
+        If any parameter constraints are violated:
+        - total_size < 1
+        - val_split or test_split < 0
+        - val_split + test_split >= 1
+        - pilot_split not in [0, 1)
+        - pilot_num_samples < 0 (when not None)
+        - Pilot split leaves no samples for train/val/test
+
+    Notes
+    -----
+    The splitting strategy:
+    1. Extract pilot set first (if requested)
+    2. Split remaining data into train/val/test with proportions:
+       - train: remaining - val_count - test_count
+       - val: remaining_size * val_split (rounded)
+       - test: remaining_size * test_split (rounded)
+    3. Adjust val/test counts if they exceed available samples
+       by preferentially reducing the larger split
+    """
     if total_size < 1:
         raise ValueError('total_size must be at least 1')
     if val_split < 0 or test_split < 0:
@@ -73,7 +129,33 @@ def repeat_dataset_to_num_samples(
     dataset: Dataset,
     target_num_samples: int,
 ) -> Dataset:
-    """Repeat a dataset until it has at least the requested size."""
+    """Repeat a dataset until it has at least the requested size.
+
+    Creates a new dataset by concatenating multiple copies of the input dataset
+    to reach or exceed the target number of samples. Useful for creating
+    pilot datasets that need to be sampled multiple times during training.
+
+    Parameters
+    ----------
+    dataset : Dataset
+        PyTorch dataset to repeat. Must implement __len__ method.
+    target_num_samples : int
+        Target number of samples for the repeated dataset.
+        If less than or equal to len(dataset), returns the original dataset.
+
+    Returns
+    -------
+    Dataset
+        Either the original dataset (if target_num_samples <= len(dataset))
+        or a ConcatDataset containing multiple copies of the original dataset
+        sufficient to reach at least target_num_samples.
+
+    Notes
+    -----
+    The repeat factor is calculated as ceil(target_num_samples / len(dataset)).
+    If the dataset is empty (len(dataset) == 0), returns the original dataset
+    to avoid division by zero.
+    """
     if target_num_samples <= len(dataset) or len(dataset) == 0:
         return dataset
 

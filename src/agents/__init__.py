@@ -16,11 +16,17 @@ Each agent implements:
 from .base_agent import BaseAgent
 from .cnn_classifier import CNNClassifier
 from .latent_classifier import LatentClassifier
+from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
+from .utils import CNN, MLP, TimmEncoder
 
 __all__ = [
     'BaseAgent',
+    'CNN',
     'CNNClassifier',
     'LatentClassifier',
+    'MLP',
+    'PersonalizedClassifier',
     'TimmClassifier',
+    'TimmEncoder',
 ]

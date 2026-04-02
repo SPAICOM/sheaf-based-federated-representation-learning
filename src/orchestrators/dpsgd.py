@@ -58,31 +58,34 @@ class DPSGD(BaseOrchestrator):
             optimizer=optimizer,
         )
 
-        # Calculate Doubly Stochastic Mixing Matrix W using
-        # Metropolis-Hastings rule
+        # Build a doubly-stochastic mixing matrix W via the
+        # Metropolis-Hastings rule.  For each edge (i, j):
+        #
+        #   W_{ij} = 1 / (max(d_i, d_j) + 1)
+        #
+        # and the self-weight W_{ii} = 1 - Σ_{j∈N(i)} W_{ij} ensures
+        # each row sums to 1.  The +1 in the denominator avoids division
+        # by zero for isolated nodes and guarantees W_{ij} < 1.
         self.mixing_weights = {}
 
-        # Calculate degree for each agent
-        # We process keys as integers since neighbors dict typically uses ints
+        # Degree of each agent (number of neighbours)
         degrees = {}
         for idx_str in self.agents:
             idx = int(idx_str)
-            # if a node doesn't have neighbors, default to empty set
             degrees[idx] = len(neighbors.get(idx, set()))
 
-        # Compute Metropolis-Hastings weights
         for idx_str in self.agents:
             i = int(idx_str)
             i_neighbors = neighbors.get(i, set())
 
             weight_sum = 0.0
             for j in i_neighbors:
-                # W_{ij} = 1 / (max(d_i, d_j) + 1)
+                # Metropolis-Hastings off-diagonal weight
                 w_ij = 1.0 / (max(degrees[i], degrees.get(j, 0)) + 1.0)
                 self.mixing_weights[(i, j)] = w_ij
                 weight_sum += w_ij
 
-            # Self-weight: W_{ii} = 1 - sum_{j in neighbors} W_{ij}
+            # Self-weight ensures the row sums to 1
             self.mixing_weights[(i, i)] = 1.0 - weight_sum
 
         self._validate_agents()
@@ -127,16 +130,18 @@ class DPSGD(BaseOrchestrator):
         pass
 
     def on_before_optimizer_step(self, optimizer: Any) -> None:
-        """
-        Mix the optimization variables with neighbors.
+        """Compute the neighbourhood-weighted parameter average (x_{k+1/2}).
 
-        This hook is called after loss.backward() (so gradients are stored
-        in .grad) but before optimizer.step().
-        We compute the neighborhood weighted average of the weights
-        (x_{k+1/2, i}) using only trainable parameters.
-        We then overwrite the models' parameters. The subsequent
-        optimizer.step() will apply the local gradients to these mixed
-        weights.
+        Called after ``loss.backward()`` (gradients are in ``.grad``) but
+        before ``optimizer.step()``.  The two-step update is:
+
+            x_{k+1/2, i} = Σ_j W_{ij} · x_{k, j}   ← done here
+            x_{k+1,   i} = x_{k+1/2, i} − γ ∇F_i   ← done by Lightning
+
+        Because the mixed weights are written back into the model's
+        parameters *in place*, the subsequent optimizer step applies the
+        locally-computed gradients to the already-mixed weights, which
+        is the intended decentralised SGD behaviour.
         """
         # Original parameter vectors for each agent before mixing
         agent_vectors = {}

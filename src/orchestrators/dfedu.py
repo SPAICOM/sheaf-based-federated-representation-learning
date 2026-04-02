@@ -84,12 +84,20 @@ class DFedU(BaseOrchestrator):
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
-        """
-        Apply Laplacian penalty to pull neighboring weights together
-        after each epoch of parallel local updates.
+        """Apply Laplacian consensus step after each epoch of local SGD.
 
-        w_i_new = w_i - eta * sum_j(a_ij * (w_i - w_j))
-        where A is the (weighted) adjacency matrix
+        Implements the weight-averaging rule:
+
+            w_i ← w_i - η · Σ_j a_ij (w_i − w_j)
+
+        where η is ``self.hparams.eta`` and a_ij = 1 for all edges
+        (uniform, unweighted adjacency). This is equivalent to one step
+        of gradient descent on the Laplacian regulariser
+        λ Σ_{(i,j)∈E} ‖w_i − w_j‖².
+
+        All updated vectors are computed from the *pre-update* snapshots
+        before any model is mutated, so the order of iteration does not
+        affect the result.
         """
         agent_vectors = {}
         # Extract flattened parameter vectors for all agents (trainable only)
@@ -122,9 +130,9 @@ class DFedU(BaseOrchestrator):
                     w_j = agent_vectors[j]
                     sum_diff += w_i - w_j
 
-                # if a_ij = 1  many different choices here
-                # (random, all ones etc.)
-                # w_i_new = w_i - eta * (sum_diff / float(d_i)))
+                # Uniform weights: a_ij = 1 for all edges.
+                # Normalising by degree (/ d_i) is an alternative but is
+                # not used here — eta implicitly controls step magnitude.
                 w_i_new = w_i - self.hparams.eta * sum_diff
                 new_vectors[i] = w_i_new
             else:
@@ -145,7 +153,23 @@ class DFedU(BaseOrchestrator):
         batch_idx: int,
         prefix: str,
     ) -> tuple[dict[str, Any], torch.Tensor]:
-        """Compute losses and metrics for validation/test steps."""
+        """Forward pass and per-agent loss/performance computation.
+
+        Parameters
+        ----------
+        batch : dict[int, list[torch.Tensor]]
+            Mapping from agent index to ``(x, y)`` pairs.
+        batch_idx : int
+            Current batch index.
+        prefix : str
+            Logging prefix (e.g. ``'train'``, ``'validation'``).
+
+        Returns
+        -------
+        tuple[dict, torch.Tensor]
+            ``(outputs, total_loss)`` where ``outputs`` maps agent indices
+            to ``(y_hat, y)`` pairs and ``total_loss`` is the summed loss.
+        """
         outputs = self(batch)
 
         agent_losses = {}

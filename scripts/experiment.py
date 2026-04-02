@@ -152,10 +152,9 @@ def main(cfg: DictConfig) -> None:
 
         # For TimmClassifier/CNNClassifier: infer latent_dims after
         # instantiation.
-        if 'TimmClassifier' in str(type(agents[i])):
-            latent_dims[i] = agents[i].encoder.num_features
-        elif 'CNNClassifier' in str(type(agents[i])):
-            latent_dims[i] = agents[i].decoder.network[0].in_features
+        agent_type = str(type(agents[i]))
+        if 'TimmClassifier' in agent_type or 'CNNClassifier' in agent_type:
+            latent_dims[i] = agents[i].encoder.out_features
 
     # Generate neighbor graph for federated learning communication
     # Used by SheafFRL to create cross-covariance matrices between agents
@@ -191,7 +190,6 @@ def main(cfg: DictConfig) -> None:
 
     # Clean up temporary directories created by Hydra, WandB, and Lightning
     # These directories can accumulate over multiple experiment runs
-    remove_non_empty_dir('./wandb/')
     remove_non_empty_dir('./multirun/')
     remove_non_empty_dir('./outputs/')
     remove_non_empty_dir('~/.cache/wandb/')
