@@ -16,14 +16,9 @@ from .utils import MLP
 
 
 class CNNClassifier(BaseAgent):
-    """Simple CNN-based classifier with custom MLP decoder.
-
-    Uses a basic Convolutional Neural Network as the encoder backbone.
-    The encoder outputs feature maps which are pooled via AdaptiveAvgPool2d
-    and flattened before being passed to the decoder.
-    """
 
     def __init__(
+        
         self,
         in_features: int,
         num_classes: int,

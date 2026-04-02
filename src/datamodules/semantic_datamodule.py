@@ -18,6 +18,11 @@ from datasets import concatenate_datasets, load_dataset
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from torch.utils.data import DataLoader, Dataset
 
+from src.datamodules.utils import (
+    compute_split_indices,
+    repeat_dataset_to_num_samples,
+)
+
 
 class SemanticDataset(Dataset):
     """Dataset wrapper for semantic embedding data with attributes.
@@ -38,7 +43,12 @@ class SemanticDataset(Dataset):
     - Attributes are converted to torch tensors for compatibility with PyTorch.
     """
 
-    def __init__(self, hf_dataset, attributes: list[str]) -> None:
+    def __init__(
+        self,
+        hf_dataset,
+        attributes: list[str],
+        sample_ids: list[int] | None = None,
+    ) -> None:
         """Initialize the semantic dataset.
 
         Parameters
@@ -50,6 +60,7 @@ class SemanticDataset(Dataset):
         """
         self.dataset = hf_dataset
         self.attributes = attributes
+        self.sample_ids = sample_ids
 
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
@@ -57,7 +68,10 @@ class SemanticDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor | dict[str, torch.Tensor], torch.Tensor]
+    ):
         """Get a single sample from the dataset.
 
         Parameters
@@ -81,9 +95,15 @@ class SemanticDataset(Dataset):
 
         # Return single tensor for single attribute, dict for multiple
         if len(attrs) == 1:
-            return embedding, torch.tensor(list(attrs.values())[0])
+            labels = torch.tensor(list(attrs.values())[0])
+        else:
+            labels = {k: torch.tensor(v) for k, v in attrs.items()}
 
-        return embedding, {k: torch.tensor(v) for k, v in attrs.items()}
+        if self.sample_ids is not None:
+            sample_id = torch.tensor(self.sample_ids[idx], dtype=torch.long)
+            return embedding, labels, sample_id
+
+        return embedding, labels
 
 
 class SemanticDataModule(l.LightningDataModule):
@@ -152,6 +172,9 @@ class SemanticDataModule(l.LightningDataModule):
         mode: str = 'min_size',
         val_split: float = 0.1,
         test_split: float = 0.1,
+        pilot_split: float = 0.0,
+        pilot_num_samples: int | None = None,
+        pilot_batch_size: int | None = None,
         seed: int = 42,
     ) -> None:
         """Initialize the semantic data module.
@@ -198,6 +221,11 @@ class SemanticDataModule(l.LightningDataModule):
 
         self.val_split = val_split
         self.test_split = test_split
+        self.pilot_split = pilot_split
+        self.pilot_num_samples = pilot_num_samples
+        self.pilot_batch_size = (
+            batch_size if pilot_batch_size is None else pilot_batch_size
+        )
         self.seed = seed
 
     def _merge_all_splits(self, ds) -> torch.utils.data.Dataset:
@@ -286,6 +314,7 @@ class SemanticDataModule(l.LightningDataModule):
         self.train_datasets: dict[str, SemanticDataset] = {}
         self.val_datasets: dict[str, SemanticDataset] = {}
         self.test_datasets: dict[str, SemanticDataset] = {}
+        self.pilot_datasets: dict[str, SemanticDataset] = {}
 
         # Determine which models/embeddings to load for each agent
         # Priority: agents dict > models list (for backward compatibility)
@@ -300,6 +329,9 @@ class SemanticDataModule(l.LightningDataModule):
         else:
             raise ValueError('Either "agents" or "models" must be provided')
 
+        split_indices: dict[str, list[int]] | None = None
+        expected_merged_length: int | None = None
+
         # Load datasets for each agent/model combination
         for i, m in agent_models.items():
             # Load dataset with specific model configuration
@@ -307,8 +339,27 @@ class SemanticDataModule(l.LightningDataModule):
 
             # Merge all splits to maximize available data
             merged = self._merge_all_splits(ds)
-            # Re-split according to custom train/val/test ratios
-            train, val, test = self._resplit(merged)
+            if expected_merged_length is None:
+                expected_merged_length = len(merged)
+                split_indices = compute_split_indices(
+                    total_size=expected_merged_length,
+                    val_split=self.val_split,
+                    test_split=self.test_split,
+                    seed=self.seed,
+                    pilot_split=self.pilot_split,
+                    pilot_num_samples=self.pilot_num_samples,
+                )
+            elif len(merged) != expected_merged_length:
+                raise ValueError(
+                    'All semantic agent datasets must have the same length to '
+                    'share calibration pilots.'
+                )
+
+            assert split_indices is not None
+            train = merged.select(split_indices['train'])
+            val = merged.select(split_indices['val'])
+            test = merged.select(split_indices['test'])
+            pilot = merged.select(split_indices['pilot'])
 
             # Use string key for compatibility with Lightning
             key = str(i)
@@ -317,6 +368,12 @@ class SemanticDataModule(l.LightningDataModule):
             self.train_datasets[key] = SemanticDataset(train, self.attributes)
             self.val_datasets[key] = SemanticDataset(val, self.attributes)
             self.test_datasets[key] = SemanticDataset(test, self.attributes)
+            if split_indices['pilot']:
+                self.pilot_datasets[key] = SemanticDataset(
+                    pilot,
+                    self.attributes,
+                    sample_ids=split_indices['pilot'],
+                )
 
         # Store agent/model indices
         self.models = list(agent_models.keys())
@@ -370,6 +427,23 @@ class SemanticDataModule(l.LightningDataModule):
             num_workers=self.num_workers,
         )
 
+    def _make_pilot_loader(
+        self,
+        dataset: Dataset,
+        target_num_batches: int,
+    ) -> DataLoader:
+        target_num_samples = target_num_batches * self.pilot_batch_size
+        repeated_dataset = repeat_dataset_to_num_samples(
+            dataset,
+            target_num_samples,
+        )
+        return DataLoader(
+            repeated_dataset,
+            batch_size=self.pilot_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+
     def train_dataloader(self) -> CombinedLoader:
         """Create and return the training data loader.
 
@@ -378,13 +452,25 @@ class SemanticDataModule(l.LightningDataModule):
         CombinedLoader
             CombinedLoader containing all training datasets.
         """
-        return CombinedLoader(
-            {
-                m: self._make_loader(ds, True)
-                for m, ds in self.train_datasets.items()
-            },
-            mode=self.mode,  # type: ignore[arg-type]
-        )
+        loaders = {
+            m: self._make_loader(ds, True)
+            for m, ds in self.train_datasets.items()
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.train_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{m}': self._make_pilot_loader(
+                        ds,
+                        target_num_batches,
+                    )
+                    for m, ds in self.pilot_datasets.items()
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
 
     def val_dataloader(self) -> CombinedLoader:
         """Create and return the validation data loader.
@@ -394,13 +480,25 @@ class SemanticDataModule(l.LightningDataModule):
         CombinedLoader
             CombinedLoader containing all validation datasets.
         """
-        return CombinedLoader(
-            {
-                m: self._make_loader(ds, False)
-                for m, ds in self.val_datasets.items()
-            },
-            mode=self.mode,  # type: ignore[arg-type]
-        )
+        loaders = {
+            m: self._make_loader(ds, False)
+            for m, ds in self.val_datasets.items()
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.val_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{m}': self._make_pilot_loader(
+                        ds,
+                        target_num_batches,
+                    )
+                    for m, ds in self.pilot_datasets.items()
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
 
     def test_dataloader(self) -> CombinedLoader:
         """Create and return the test data loader.
@@ -410,10 +508,22 @@ class SemanticDataModule(l.LightningDataModule):
         CombinedLoader
             CombinedLoader containing all test datasets.
         """
-        return CombinedLoader(
-            {
-                m: self._make_loader(ds, False)
-                for m, ds in self.test_datasets.items()
-            },
-            mode=self.mode,  # type: ignore[arg-type]
-        )
+        loaders = {
+            m: self._make_loader(ds, False)
+            for m, ds in self.test_datasets.items()
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.test_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{m}': self._make_pilot_loader(
+                        ds,
+                        target_num_batches,
+                    )
+                    for m, ds in self.pilot_datasets.items()
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]

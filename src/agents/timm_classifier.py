@@ -46,8 +46,6 @@ from torchvision import transforms
 from .base_agent import BaseAgent
 from .utils import MLP
 
-# TODO: currently assumes input images have 3 channels, add flexibility for mnist 
-
 class TimmClassifier(BaseAgent):
     """Timm-based classifier with custom MLP decoder.
 
@@ -188,6 +186,11 @@ class TimmClassifier(BaseAgent):
         elif x.ndim == 4:
             if x.shape[-1] != 224 or x.shape[-2] != 224:
                 x = transforms.Resize((224, 224))(x)
+
+        # Expand grayscale inputs to pseudo-RGB so MNIST-like datasets can be
+        # used with RGB backbones without changing the pretrained stem.
+        if x.ndim == 4 and x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
 
         # Pass through encoder backbone to get feature maps
         features = self._encoder(x)

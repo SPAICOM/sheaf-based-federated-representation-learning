@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 from hydra.utils import instantiate
 
+from src.utils import calculate_communication_cost
+
 
 class BaseOrchestrator(l.LightningModule, ABC):
     """Abstract base orchestrator for federated learning with multiple agents.
@@ -53,6 +55,156 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self.agents = nn.ModuleDict(
             {str(idx): agent for idx, agent in agents.items()}
         )
+        self._reset_communication_state()
+
+    def _reset_communication_state(self) -> None:
+        """Reset cumulative communication accounting."""
+        self._communication_totals = {
+            'bits': 0.0,
+            'bytes': 0.0,
+            'kilobytes': 0.0,
+        }
+        self._communication_rounds = 0
+
+    def on_train_start(self) -> None:
+        """Reset communication accounting at the start of training."""
+        self._reset_communication_state()
+
+    def _metric_tensor(self, value: Any) -> torch.Tensor:
+        """Convert a scalar metric value to a tensor on the module device."""
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.tensor(float(value), device=self.device)
+
+    def _record_communication(
+        self,
+        payload: Any,
+        *,
+        n_transmissions: int = 1,
+    ) -> dict[str, float]:
+        """Accumulate communication cost for a transmitted payload."""
+        if int(n_transmissions) < 1:
+            return {
+                'bits': 0.0,
+                'bytes': 0.0,
+                'kilobytes': 0.0,
+            }
+
+        cost = calculate_communication_cost(
+            payload,
+            n_transmissions=n_transmissions,
+        )
+        for unit, value in cost.items():
+            self._communication_totals[unit] += float(value)
+        self._communication_rounds += int(n_transmissions)
+        return cost
+
+    def _communication_metrics(self, prefix: str) -> dict[str, float]:
+        """Return cumulative communication metrics for logging."""
+        return {
+            f'{prefix}/communication_bits': self._communication_totals['bits'],
+            f'{prefix}/communication_bytes': self._communication_totals[
+                'bytes'
+            ],
+            f'{prefix}/communication_kilobytes': self._communication_totals[
+                'kilobytes'
+            ],
+            f'{prefix}/communication_rounds': float(
+                self._communication_rounds
+            ),
+        }
+
+    def _log_shared_metrics(
+        self,
+        *,
+        prefix: str,
+        agent_losses: dict[int, Any],
+        agent_performances: dict[int, Any],
+        total_loss: torch.Tensor | None = None,
+        extra_metrics: dict[str, Any] | None = None,
+        prog_bar: bool = True,
+        per_agent_loss_name: str = 'loss',
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Log per-agent and aggregate metrics for validation/test reporting."""
+        normalized_losses = {
+            idx: self._metric_tensor(loss)
+            for idx, loss in agent_losses.items()
+        }
+        normalized_performances = {
+            idx: self._metric_tensor(performance)
+            for idx, performance in agent_performances.items()
+        }
+
+        per_agent_logs = {}
+        for idx in sorted(normalized_losses):
+            loss = normalized_losses[idx]
+            performance = normalized_performances[idx]
+            per_agent_logs[f'{prefix}/loss_agent_{idx}'] = loss
+            if per_agent_loss_name != 'loss':
+                per_agent_logs[
+                    f'{prefix}/{per_agent_loss_name}_agent_{idx}'
+                ] = loss
+            per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
+                performance
+            )
+
+        if per_agent_logs:
+            self.log_dict(
+                per_agent_logs,
+                on_step=False,
+                on_epoch=True,
+            )
+
+        if normalized_losses:
+            losses_tensor = torch.stack(list(normalized_losses.values()))
+            total_task_loss = losses_tensor.sum()
+        else:
+            losses_tensor = torch.tensor([0.0], device=self.device)
+            total_task_loss = torch.tensor(0.0, device=self.device)
+
+        if normalized_performances:
+            performances_tensor = torch.stack(
+                list(normalized_performances.values())
+            )
+            avg_performance = performances_tensor.mean()
+        else:
+            performances_tensor = torch.tensor([0.0], device=self.device)
+            avg_performance = torch.tensor(0.0, device=self.device)
+
+        resolved_total_loss = (
+            total_task_loss if total_loss is None else self._metric_tensor(total_loss)
+        )
+
+        aggregate_logs = {
+            f'{prefix}/task_loss_total_epoch': total_task_loss,
+            f'{prefix}/total_loss_epoch': resolved_total_loss,
+            f'{prefix}/avg_task_performance_epoch': avg_performance,
+            f'{prefix}/loss_min': losses_tensor.min(),
+            f'{prefix}/loss_max': losses_tensor.max(),
+            f'{prefix}/loss_std': (
+                losses_tensor.std(unbiased=False)
+                if len(losses_tensor) > 1
+                else torch.tensor(0.0, device=self.device)
+            ),
+            f'{prefix}/task_performance_min': performances_tensor.min(),
+            f'{prefix}/task_performance_max': performances_tensor.max(),
+            f'{prefix}/task_performance_std': (
+                performances_tensor.std(unbiased=False)
+                if len(performances_tensor) > 1
+                else torch.tensor(0.0, device=self.device)
+            ),
+        }
+        aggregate_logs.update(self._communication_metrics(prefix))
+        if extra_metrics is not None:
+            aggregate_logs.update(extra_metrics)
+
+        self.log_dict(
+            aggregate_logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=prog_bar,
+        )
+        return total_task_loss, avg_performance
 
     @abstractmethod
     def on_train_epoch_end(self):

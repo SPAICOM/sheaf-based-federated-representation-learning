@@ -3,14 +3,22 @@ Sheaf-based Federated Representation Learning orchestrator.
 
 This module implements the proposed federated learning framework with Sheaf regularization
 that maintains aligned latent spaces across agents through Stiefel manifold
-optimization of cross-covariance matrices.
+optimization of cross-covariance matrices. Anchor strategies are implemented
+with explicit semantic correspondence keys so neighboring agents are aligned
+only on class-consistent anchors.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
+from src.utils.anchors import (
+    AnchorConfig,
+    build_anchor_bundles,
+    build_semantic_pilot_bundles,
+    shared_anchor_rows,
+    supported_anchor_strategy,
+)
 
 
 class SheafFRL(BaseOrchestrator):
@@ -33,7 +41,9 @@ class SheafFRL(BaseOrchestrator):
     latent_dims : dict
         Dictionary mapping agent indices to their latent space dimensions.
     anchor_strategy : str
-        Strategy for selecting anchors: 'prototype', 'balanced', or 'random'.
+        Strategy for selecting anchors. Supported values:
+        'prototype', 'random', 'balanced', 'semantic_pilots',
+        'clustered_pilots', and 'dynamic'.
     num_anchors : int
         Number of anchors to select per epoch.
     parseval_normalization : bool
@@ -68,12 +78,19 @@ class SheafFRL(BaseOrchestrator):
         )
 
         self.save_hyperparameters()
+        self.anchor_config = AnchorConfig(
+            strategy=str(anchor_strategy),
+            num_anchors=int(num_anchors),
+            parseval_normalization=bool(parseval_normalization),
+            l2_normalization=bool(l2_normalization),
+            parseval_eps=float(parseval_eps),
+        )
 
         self.stiefel_matrices = nn.ParameterDict()
         self.epoch_anchors = {}
-        # Per-agent label buffers: supports Non-IID distributions where
-        # different agents may see completely different label subsets.
-        self.epoch_labels: dict[int, list[torch.Tensor]] = {}
+        # Per-agent semantic anchor identifiers. For class-based strategies
+        # these are class labels; for semantic pilots they are shared sample ids.
+        self.epoch_anchor_ids: dict[int, list[torch.Tensor]] = {}
 
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
@@ -101,250 +118,88 @@ class SheafFRL(BaseOrchestrator):
                     d_i = latent_dims_int[node_i]
                     d_j = latent_dims_int[node_j]
 
-                    # Initialize as identity (identity mapping)
+                    # Initialize as identity mapping
                     # requires_grad=False because we use closed-form SVD
-                    # updates, might do an ablation about initialization later
+                    # updates, TODO: ablation about initialization later
                     stiefel_matrix = torch.eye(d_i, d_j)
 
                     self.stiefel_matrices[edge_key] = nn.Parameter(
                         stiefel_matrix, requires_grad=False
                     )
 
-    def _compute_anchors(
-        self,
-        latents: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-        """Compute anchor representations and validity masks per agent.
-
-        Compatible with Non-IID settings where agents may observe a different
-        subset of classes. Returns both anchor tensors and boolean validity
-        masks so that downstream SVD updates can intersect semantics.
-
-        Parameters
-        ----------
-        latents : dict[int, torch.Tensor]
-            Dictionary mapping agent indices to their accumulated latent
-            feature tensors (one tensor per agent, shape (N_i, d_i)).
-        labels_per_agent : dict[int, torch.Tensor]
-            Per-agent label tensors (shape (N_i,)). Labels may differ across
-            agents under Non-IID data distributions.
-
-        Returns
-        -------
-        A_dict : dict[int, torch.Tensor]
-            Anchor tensors, one per agent, on CPU.
-            - 'prototype': shape (num_global_classes, latent_dim). Rows for
-              classes not seen by an agent are zero-filled (never used in SVD
-              because the corresponding valid_mask entry is False).
-            - 'balanced'/'random': shape (k, latent_dim) agent-local subset.
-            - default: original latents unchanged.
-        valid_masks : dict[int, torch.Tensor]
-            Boolean mask per agent (shape (num_global_classes,) for prototype;
-            empty dict for non-prototype strategies where all rows are valid).
-        """
-        match self.hparams.anchor_strategy:
-            # Strategy: Prototype
-            case 'prototype':
-                all_labels = torch.cat(list(labels_per_agent.values()))
-                global_classes = torch.unique(all_labels) 
-                num_global = global_classes.shape[0]
-
-                A_dict: dict[int, torch.Tensor] = {}
-                valid_masks: dict[int, torch.Tensor] = {}
-
-                for idx, A in latents.items():
-                    y_i = labels_per_agent[idx]
-                    d = A.shape[1]
-
-                    protos = torch.zeros(num_global, d, dtype=A.dtype)
-                    valid_mask = torch.zeros(num_global, dtype=torch.bool)
-
-                    for c_pos, c in enumerate(global_classes):
-                        c_mask = y_i == c
-                        if c_mask.any():
-                            protos[c_pos] = A[c_mask].mean(dim=0)
-                            valid_mask[c_pos] = True
-                        # Rows for missing classes stay zero
-
-                    A_dict[idx] = protos
-                    valid_masks[idx] = valid_mask
-
-                return A_dict, valid_masks
-
-            # Strategy: Balanced
-            case 'balanced':
-                A_dict = {}
-                for idx, A in latents.items():
-                    y_i = labels_per_agent[idx]
-                    tot = len(y_i)
-                    uniques = torch.unique(y_i)
-                    k = min(self.hparams.num_anchors, tot)
-                    anchors_per_class = max(1, k // len(uniques))
-
-                    selected: list[torch.Tensor] = []
-                    for c in uniques:
-                        c_idx = torch.where(y_i == c)[0]
-                        perm = torch.randperm(len(c_idx))
-                        selected.append(c_idx[perm[:anchors_per_class]])
-
-                    sel_idx = torch.cat(selected)
-                    remaining = k - len(sel_idx)
-                    if remaining > 0:
-                        all_idx = torch.arange(tot)
-                        mask = torch.ones(tot, dtype=torch.bool)
-                        mask[sel_idx] = False
-                        avail = all_idx[mask]
-                        extra = avail[torch.randperm(len(avail))[:remaining]]
-                        sel_idx = torch.cat([sel_idx, extra])
-
-                    final = sel_idx[torch.randperm(len(sel_idx))]
-                    A_dict[idx] = A[final]
-
-                return A_dict, {}
-
-            # Strategy: Random
-            case 'random':
-                A_dict = {}
-                for idx, A in latents.items():
-                    tot = len(A)
-                    k = min(self.hparams.num_anchors, tot)
-                    perm = torch.randperm(tot)
-                    A_dict[idx] = A[perm[:k]]
-                return A_dict, {}
-
-            # Default: return original latents
-            case _:
-                return latents, {}
-
     def on_train_epoch_start(self) -> None:
         """Initialize/reset per-agent anchor and label buffers at epoch start."""
         for idx_str in self.agents:
             idx = int(idx_str)
             self.epoch_anchors[idx] = []
-            self.epoch_labels[idx] = []
-
-    def parseval_normalize(self, A: torch.Tensor) -> torch.Tensor:
-        """Apply Parseval normalization to anchor features.
-
-        Performs local whitening by computing the inverse square root of the
-        covariance matrix C = A^T A and applying the transformation.
-
-        Parameters
-        ----------
-        A : torch.Tensor
-            Input anchor feature matrix of shape (n_samples, n_features).
-
-        Returns
-        -------
-        torch.Tensor
-            Normalized feature matrix with orthonormal columns.
-        """
-        C = torch.matmul(A.T, A)
-        eps = float(getattr(self.hparams, 'parseval_eps', 1e-4))
-        C = C + eps * torch.eye(C.size(0), device=C.device, dtype=C.dtype)
-
-        # Cast to double for stable eigendecomposition
-        original_dtype = C.dtype
-        C_double = C.to(torch.float64)
-
-        try:
-            eigenvalues, eigenvectors = torch.linalg.eigh(C_double)
-        except torch._C._LinAlgError:
-            # Fallback if double precision still fails: increase eps significantly
-            C_double = C_double + (eps * 10) * torch.eye(
-                C.size(0), device=C.device, dtype=torch.float64
-            )
-            eigenvalues, eigenvectors = torch.linalg.eigh(C_double)
-
-        eigenvalues = eigenvalues.to(original_dtype)
-        eigenvectors = eigenvectors.to(original_dtype)
-
-        inv_sqrt_eigenvalues = torch.rsqrt(eigenvalues.clamp(min=eps))
-
-        C_inv = torch.matmul(
-            eigenvectors * inv_sqrt_eigenvalues.unsqueeze(0), eigenvectors.T
-        )
-
-        return torch.matmul(A, C_inv)
-    
-    def l2_normalize(self, A: torch.Tensor) -> torch.Tensor:
-        """Apply L2 normalization to anchor features.
-
-        Normalizes each row of A to have unit L2 norm.
-
-        Parameters
-        ----------
-        A : torch.Tensor
-            Input anchor feature matrix of shape (n_samples, n_features).
-
-        Returns
-        -------
-        torch.Tensor
-            Row-wise L2-normalized feature matrix.
-        """
-        return F.normalize(A, p=2, dim=1)
+            self.epoch_anchor_ids[idx] = []
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
-        """Update Stiefel matrices using Intersection SVD.
-
-        Concatenates per-agent epoch buffers, computes anchor
-        representations per agent (with per-class validity masks if non-IID),
-        and updates each Stiefel matrix via a closed-form Procrustes
-        SVD computed only on the semantically shared anchor rows (intersection
-        of valid classes for each edge).
-
-        V* = argmin_V ||A_i[shared] - A_j[shared] V^T||_F^2
-
-        The solution is V = U W^T where C = A_i^T A_j = U Σ W^T.
-        Skips any edge where the intersection is empty.
-        """
+        """Update Stiefel matrices using semantically shared anchors only."""
         if not self.epoch_anchors or not any(self.epoch_anchors.values()):
             return
 
-        A_dict: dict[int, torch.Tensor] = {}
-        labels_per_agent: dict[int, torch.Tensor] = {}
+        A_dict_raw: dict[int, torch.Tensor] = {}
+        anchor_ids_per_agent: dict[int, torch.Tensor] = {}
 
         for idx_str in self.agents:
             idx = int(idx_str)
             if self.epoch_anchors[idx]:
-                A_dict[idx] = torch.cat(self.epoch_anchors[idx], dim=0)
-            if self.epoch_labels[idx]:
-                labels_per_agent[idx] = torch.cat(
-                    self.epoch_labels[idx], dim=0
+                A_dict_raw[idx] = torch.cat(self.epoch_anchors[idx], dim=0)
+            if self.epoch_anchor_ids[idx]:
+                anchor_ids_per_agent[idx] = torch.cat(
+                    self.epoch_anchor_ids[idx], dim=0
                 )
 
+        if not A_dict_raw:
+            return
+
+        if (
+            supported_anchor_strategy(self.anchor_config.strategy)
+            == 'semantic_pilots'
+        ):
+            A_dict, anchor_keys = build_semantic_pilot_bundles(
+                A_dict_raw,
+                anchor_ids_per_agent,
+                self.anchor_config,
+            )
+        else:
+            A_dict, anchor_keys = build_anchor_bundles(
+                A_dict_raw,
+                anchor_ids_per_agent,
+                self.anchor_config,
+            )
         if not A_dict:
             return
 
-        # Compute anchors + validity masks
-        A_dict, valid_masks = self._compute_anchors(A_dict, labels_per_agent)
+        for idx, anchors in A_dict.items():
+            self._record_communication(
+                {
+                    'anchors': anchors,
+                    'anchor_keys': anchor_keys.get(idx, []),
+                },
+                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
+            )
 
         param_device = next(iter(self.stiefel_matrices.values())).device
 
-        # Per-edge Intersection SVD
         for edge_key, V_param in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
 
             if node_i not in A_dict or node_j not in A_dict:
                 continue
 
-            if valid_masks:
-                # Prototype: only use rows present in BOTH agents
-                mask_i = valid_masks.get(node_i)
-                mask_j = valid_masks.get(node_j)
-                if mask_i is None or mask_j is None:
-                    continue
-                shared = mask_i & mask_j
-                if not shared.any():
-                    continue
-                A_i = A_dict[node_i][shared]
-                A_j = A_dict[node_j][shared]
-            else:
-                # Balanced / random / dynamic: all rows are valid
-                A_i = A_dict[node_i]
-                A_j = A_dict[node_j]
+            shared_rows = shared_anchor_rows(
+                A_i=A_dict[node_i],
+                keys_i=anchor_keys.get(node_i, []),
+                A_j=A_dict[node_j],
+                keys_j=anchor_keys.get(node_j, []),
+            )
+            if shared_rows is None:
+                continue
+
+            A_i, A_j = shared_rows
 
             # Center for unbiased cross-covariance estimation
             A_i = A_i - A_i.mean(dim=0, keepdim=True)
@@ -359,8 +214,8 @@ class SheafFRL(BaseOrchestrator):
         # Clear epoch buffers
         for idx in self.epoch_anchors:
             self.epoch_anchors[idx].clear()
-        for idx in self.epoch_labels:
-            self.epoch_labels[idx].clear()
+        for idx in self.epoch_anchor_ids:
+            self.epoch_anchor_ids[idx].clear()
 
     def _shared_eval(
         self,
@@ -390,19 +245,13 @@ class SheafFRL(BaseOrchestrator):
             (prediction, label) pairs and total_loss includes both task and
             sheaf regularization terms.
         """
+        if isinstance(batch, tuple):
+            batch = batch[0]
+
         outputs = {}
 
-        # Track task metrics across agents
-        total_task_loss = 0.0
-        total_task_performance = 0.0
-
-        losses = []
-        performances = []
-
-        # Anchor tensors for the sheaf penalty (one entry per agent).
-        batch_latents: dict[int, torch.Tensor] = {}
-
-        valid_classes_masks: dict[int, torch.Tensor] = {}
+        agent_losses = {}
+        agent_performances = {}
 
         def _resolve_key(i: int):
             """Return the key used for agent i in the batch dict.
@@ -414,100 +263,73 @@ class SheafFRL(BaseOrchestrator):
             str_key = str(i)
             return str_key if str_key in batch else i
 
-        # Build global sorted class list for the 'prototype' strategy once,
-        # using the union of labels seen across all agents in this mini-batch.
-        global_classes: torch.Tensor | None = None
-        if self.hparams.anchor_strategy == 'prototype':
-            all_y = torch.cat(
-                [batch[_resolve_key(int(k))][1] for k in self.agents]
-            )
-            global_classes = torch.unique(all_y)  
+        def _resolve_pilot_key(i: int) -> str:
+            return f'pilot_{i}'
 
-        # Per-agent latent extraction, anchor routing, and Parseval normalization
+        strategy = supported_anchor_strategy(self.anchor_config.strategy)
+        raw_latents: dict[int, torch.Tensor] = {}
+        labels_per_agent: dict[int, torch.Tensor] = {}
+
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             x, y = batch[_resolve_key(idx)]
 
-            # Single encoder forward pass: reused for both task loss and the sheaf penalty
+            # Single encoder forward pass reused for both the task loss and
+            # the sheaf penalty.
             A_batch_raw = agent.encode(x)
             y_hat = agent.decoder(A_batch_raw)
 
             outputs[idx] = (y_hat.detach(), y)
-
-            # Anchor routing
-            match self.hparams.anchor_strategy:
-                case 'prototype':
-                    # Compute per class prototype anchors 
-                    assert global_classes is not None
-                    num_global = global_classes.shape[0]
-                    d = A_batch_raw.shape[1]
-                    device = A_batch_raw.device
-
-                    # Map each sample label to its position in global_classes.
-                    row_idx = torch.searchsorted(
-                        global_classes, y
-                    )  #values in [0, num_global)
-
-                    # Accumulate feature sums and per-class counts
-                    proto_sum = torch.zeros(
-                        num_global, d, device=device, dtype=A_batch_raw.dtype
-                    )
-                    proto_sum.index_add_(0, row_idx, A_batch_raw)
-
-                    counts = torch.zeros(
-                        num_global, device=device, dtype=A_batch_raw.dtype
-                    )
-                    counts.index_add_(
-                        0, row_idx, torch.ones(len(y), device=device, dtype=A_batch_raw.dtype)
-                    )
-
-                    # valid_mask: classes with at least one sample in this batch
-                    valid_mask = counts > 0
-                    # Divide only where valid to avoid /0; invalid rows stay 0
-                    protos = proto_sum / counts.clamp(min=1).unsqueeze(1)
-                    protos[~valid_mask] = 0.0
-
-                    A_i_raw = protos
-                    valid_classes_masks[idx] = valid_mask
-
-                case _:
-                    # 'dynamic' or any unrecognised key: stochastic approx
-                    # using the full mini-batch latents
-                    A_i_raw = A_batch_raw
-
-            # Parseval normalization
-            if self.hparams.parseval_normalization:
-                A_i_tilde = self.parseval_normalize(A_i_raw)
-            elif self.hparams.l2_normalization:
-                A_i_tilde = self.l2_normalize(A_i_raw)
-            else:
-                A_i_tilde = A_i_raw
-
-            batch_latents[idx] = A_i_tilde
-
-            # Collect raw batch latents during training for end-of-epoch Stiefel matrix updates
-            if prefix == 'train':
-                self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
-                # Every agent tracks its own labels to support Non-IID splits
-                self.epoch_labels[idx].append(y.detach().cpu())
+            raw_latents[idx] = A_batch_raw
+            labels_per_agent[idx] = y
 
             # Task-specific loss and performance on the mini-batch
             task_loss = agent.compute_loss(y_hat, y)
             task_performance = agent.task_performance(y_hat, y)
 
-            self.log_dict(
-                {
-                    f'{prefix}/task_loss_agent_{idx}': task_loss,
-                    f'{prefix}/task_performance_agent_{idx}': task_performance,
-                },
-                on_step=False,
-                on_epoch=True,
-            )
+            agent_losses[idx] = task_loss
+            agent_performances[idx] = task_performance
 
-            total_task_loss += task_loss
-            total_task_performance += task_performance
-            losses.append(task_loss)
-            performances.append(task_performance)
+        if strategy == 'semantic_pilots':
+            pilot_latents: dict[int, torch.Tensor] = {}
+            pilot_ids_per_agent: dict[int, torch.Tensor] = {}
+
+            for idx_str, agent in self.agents.items():
+                idx = int(idx_str)
+                pilot_key = _resolve_pilot_key(idx)
+                if pilot_key not in batch:
+                    raise ValueError(
+                        'semantic_pilots requires datamodule pilot loaders. '
+                        'Configure pilot_split or pilot_num_samples.'
+                    )
+
+                x_pilot, _unused_y, sample_ids = batch[pilot_key]
+                pilot_latents[idx] = agent.encode(x_pilot)
+                pilot_ids_per_agent[idx] = sample_ids
+
+            batch_latents, batch_anchor_keys = build_semantic_pilot_bundles(
+                pilot_latents,
+                pilot_ids_per_agent,
+                self.anchor_config,
+            )
+            if prefix == 'train':
+                for idx, A_pilot in pilot_latents.items():
+                    self.epoch_anchors[idx].append(A_pilot.detach().cpu())
+                    self.epoch_anchor_ids[idx].append(
+                        pilot_ids_per_agent[idx].detach().cpu()
+                    )
+        else:
+            batch_latents, batch_anchor_keys = build_anchor_bundles(
+                raw_latents,
+                labels_per_agent,
+                self.anchor_config,
+            )
+            if prefix == 'train':
+                for idx, A_batch_raw in raw_latents.items():
+                    self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
+                    self.epoch_anchor_ids[idx].append(
+                        labels_per_agent[idx].detach().cpu()
+                    )
 
         # Sheaf regularization penalty (evaluated on anchor set)
         sheaf_penalty = 0.0
@@ -518,54 +340,33 @@ class SheafFRL(BaseOrchestrator):
             if node_i not in batch_latents or node_j not in batch_latents:
                 continue
 
-            A_i = batch_latents[node_i]
-            A_j = batch_latents[node_j]
+            shared_rows = shared_anchor_rows(
+                A_i=batch_latents[node_i],
+                keys_i=batch_anchor_keys.get(node_i, []),
+                A_j=batch_latents[node_j],
+                keys_j=batch_anchor_keys.get(node_j, []),
+            )
+            if shared_rows is None:
+                continue
 
-            match self.hparams.anchor_strategy:
-                case 'prototype':
-                    mask_i = valid_classes_masks.get(node_i)
-                    mask_j = valid_classes_masks.get(node_j)
-
-                    if mask_i is None or mask_j is None:
-                        continue
-
-                    # Only compute penalty on classes present in BOTH agents
-                    shared_mask = mask_i & mask_j
-                    if not shared_mask.any():
-                        continue
-
-                    A_i_shared = A_i[shared_mask]
-                    A_j_shared = A_j[shared_mask]
-                    diff = A_i_shared - torch.matmul(A_j_shared, V.T)
-                    # Mean over shared class rows
-                    frob_dist = (diff**2).sum(dim=1).mean()
-
-                case _:
-                    # 'dynamic' / default: penalty over the full batch
-                    diff = A_i - torch.matmul(A_j, V.T)
-                    frob_dist = (diff**2).sum(dim=1).mean()
+            A_i_shared, A_j_shared = shared_rows
+            diff = A_i_shared - torch.matmul(A_j_shared, V.T)
+            frob_dist = (diff**2).sum(dim=1).mean()
 
             sheaf_penalty += frob_dist
 
         # Total loss: task loss (full batch) + sheaf penalty (anchor set)
-        total_loss = (
-            total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
-        )
-        avg_performance = total_task_performance / len(self.agents)
+        total_task_loss = torch.stack(list(agent_losses.values())).sum()
+        total_loss = total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
 
-        losses_tensor = torch.stack(losses) if losses else torch.tensor([0.0], device=self.device)
-        perfs_tensor = torch.stack(performances) if performances else torch.tensor([0.0], device=self.device)
-
-        self.log_dict(
-            {
-                f'{prefix}/sheaf_penalty': sheaf_penalty,
-                f'{prefix}/total_loss_epoch': total_loss,
-                f'{prefix}/avg_task_performance_epoch': avg_performance,
-                f'{prefix}/loss_std': losses_tensor.std(unbiased=False) if len(losses) > 1 else 0.0,
-                f'{prefix}/task_performance_std': perfs_tensor.std(unbiased=False) if len(performances) > 1 else 0.0,
-            },
-            on_step=False,
-            on_epoch=True,
+        self._log_shared_metrics(
+            prefix=prefix,
+            agent_losses=agent_losses,
+            agent_performances=agent_performances,
+            total_loss=total_loss,
+            extra_metrics={f'{prefix}/sheaf_penalty': sheaf_penalty},
+            prog_bar=False,
+            per_agent_loss_name='task_loss',
         )
 
         return outputs, total_loss

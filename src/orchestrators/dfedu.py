@@ -90,6 +90,10 @@ class DFedU(BaseOrchestrator):
             trainable_params = [p for p in agent.parameters() if p.requires_grad]
             vec = parameters_to_vector(trainable_params)
             agent_vectors[idx] = vec
+            self._record_communication(
+                vec,
+                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
+            )
             
         new_vectors = {}
         
@@ -131,11 +135,8 @@ class DFedU(BaseOrchestrator):
         """Compute losses and metrics for validation/test steps."""
         outputs = self(batch)
 
-        total_loss = 0.0
-        total_performance = 0.0
-
-        losses = []
-        performances = []
+        agent_losses = {}
+        agent_performances = {}
 
         for idx, agent in self.agents.items():
             y_hat, y = outputs[idx]
@@ -143,40 +144,13 @@ class DFedU(BaseOrchestrator):
             loss = agent.compute_loss(y_hat, y)
             performance = agent.task_performance(y_hat, y)
 
-            self.log_dict(
-                {
-                    f'{prefix}/loss_agent_{idx}': loss,
-                    f'{prefix}/task_performance_agent_{idx}': performance,
-                },
-                on_step=False,
-                on_epoch=True,
-            )
+            agent_losses[int(idx)] = loss
+            agent_performances[int(idx)] = performance
 
-            total_loss += loss
-            total_performance += performance
-            losses.append(loss)
-            performances.append(performance)
-
-        num_agents = len(self.agents)
-        avg_performance = total_performance / num_agents if num_agents > 0 else 0.0
-
-        losses_tensor = torch.stack(losses) if losses else torch.tensor([0.0], device=self.device)
-        perfs_tensor = torch.stack(performances) if performances else torch.tensor([0.0], device=self.device)
-
-        self.log_dict(
-            {
-                f'{prefix}/total_loss_epoch': total_loss,
-                f'{prefix}/avg_task_performance_epoch': avg_performance,
-                f'{prefix}/loss_min': losses_tensor.min(),
-                f'{prefix}/loss_max': losses_tensor.max(),
-                f'{prefix}/loss_std': losses_tensor.std(unbiased=False) if len(losses) > 1 else 0.0,
-                f'{prefix}/task_performance_min': perfs_tensor.min(),
-                f'{prefix}/task_performance_max': perfs_tensor.max(),
-                f'{prefix}/task_performance_std': perfs_tensor.std(unbiased=False) if len(performances) > 1 else 0.0,
-            },
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
+        total_loss, _avg_performance = self._log_shared_metrics(
+            prefix=prefix,
+            agent_losses=agent_losses,
+            agent_performances=agent_performances,
         )
 
         return outputs, total_loss
