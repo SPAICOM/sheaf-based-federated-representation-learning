@@ -1,44 +1,46 @@
 defaults:
   - _self_
-  - dataset: cifar10
+  - dataset: mnist
   - model: cnn_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
+
 
 seed: 42
 
 agent_rotations:
   0: 0
   1: 90
-
-agent_classes:
-  0: null
-  1: null
+  2: 180
+  3: 270
 
 agents:
   0: {}
   1: {}
+  2: {}
+  3: {}
 
 graph:
   neighbors_mode: "fully_connected"
   seed: 42
   p: 0.3
   m: 3
+  neighbors: {}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__cnn-agents-exp
+  project: sheaf-repr-learning__rotated-mnist
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+  save_dir: logs/
   log_model: false
 
 trainer:
   max_epochs: 50
   accelerator: auto
   devices: 1
-
   deterministic: true
   num_sanity_val_steps: 2
-  log_every_n_steps: 50
+  log_every_n_steps: 25
 
 callbacks:
   lr_monitor:
@@ -55,17 +57,28 @@ callbacks:
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
     monitor: validation/total_loss_epoch
-    patience: 5
+    patience: 10
     mode: min
 
-  #batch_size_finder:
-  #  _target_: lightning.pytorch.callbacks.BatchSizeFinder
-  #  mode: power
-  #  init_val: 32
-  #  max_trials: 5
+dataset:
+  split_strategy: uniform
+  batch_size: 64
+  num_workers: 4
+  mode: min_size
+  pilot_split: 0.05
+  pilot_batch_size: 64
 
 model:
-  encoder_hidden_dims: [32, 64, 128]
+  encoder_hidden_dims:
+    0: [16, 32]
+    1: [16, 32, 64]
+    2: [16, 32, 64, 128]
+    3: [16, 32, 64, 128, 256]
   decoder_hidden_dims: [256]
-  dropout: 0.1
-  use_batchnorm: true
+
+orchestrator:
+  lambda_sheaf: 0.01
+  anchor_strategy: prototype
+  num_anchors: 32
+  parseval_normalization: false
+  l2_normalization: false

@@ -1,14 +1,83 @@
 """
 Non-IID data partitioning utilities for federated learning.
 
-Provides functions to partition a dataset across agents with controlled
-heterogeneity. The main function ``partition_non_iid`` assigns each agent
-a random subset of N classes and distributes samples for each class among
-the agents assigned to it with random (Dirichlet-drawn) proportions to
-introduce statistical skew.
+``partition_non_iid`` assigns each agent a random set
+of classes and then allocates each class to its assigned agents according to a
+Dirichlet distribution. The implementation guarantees that every sample is
+assigned exactly once and that every agent receives at least one sample.
 """
 
+from collections import defaultdict
+
 import torch
+
+
+def _draw_dirichlet_proportions(
+    n_parts: int,
+    alpha: float,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Draw symmetric Dirichlet proportions with a deterministic generator."""
+    concentration = torch.full((n_parts,), float(alpha), dtype=torch.float32)
+    gamma_samples = torch._standard_gamma(concentration, generator=generator)
+    gamma_sum = gamma_samples.sum()
+    if gamma_sum <= 0:
+        return torch.full((n_parts,), 1 / n_parts, dtype=torch.float32)
+    return gamma_samples / gamma_sum
+
+
+def _sample_class_assignments(
+    unique_classes: list[int],
+    n_agents: int,
+    classes_per_agent: int,
+    generator: torch.Generator,
+) -> dict[int, list[int]]:
+    """Assign random classes to agents while ensuring every class is covered."""
+    agent_class_sets = {agent_id: set() for agent_id in range(n_agents)}
+    shuffled_classes = [
+        unique_classes[idx]
+        for idx in torch.randperm(len(unique_classes), generator=generator).tolist()
+    ]
+
+    # First guarantee that every class is available to at least one agent.
+    for class_label in shuffled_classes:
+        loads = torch.tensor(
+            [len(agent_class_sets[agent_id]) for agent_id in range(n_agents)],
+            dtype=torch.long,
+        )
+        candidate_agents = torch.where(loads == loads.min())[0]
+        chosen_idx = candidate_agents[
+            torch.randint(
+                len(candidate_agents), (1,), generator=generator
+            ).item()
+        ].item()
+        agent_class_sets[chosen_idx].add(class_label)
+
+    # Then top up each agent to the requested class count when possible.
+    shuffled_agents = torch.randperm(n_agents, generator=generator).tolist()
+    for agent_id in shuffled_agents:
+        target_count = max(classes_per_agent, len(agent_class_sets[agent_id]))
+        if len(agent_class_sets[agent_id]) >= target_count:
+            continue
+
+        available_classes = [
+            class_label
+            for class_label in shuffled_classes
+            if class_label not in agent_class_sets[agent_id]
+        ]
+        extra_needed = min(
+            target_count - len(agent_class_sets[agent_id]),
+            len(available_classes),
+        )
+        for class_idx in torch.randperm(
+            len(available_classes), generator=generator
+        )[:extra_needed].tolist():
+            agent_class_sets[agent_id].add(available_classes[class_idx])
+
+    return {
+        agent_id: sorted(class_labels)
+        for agent_id, class_labels in agent_class_sets.items()
+    }
 
 
 def partition_non_iid(
@@ -17,51 +86,59 @@ def partition_non_iid(
     classes_per_agent: int,
     seed: int = 42,
     alpha: float = 0.5,
-) -> dict[int, list[int]]:
-    """Partition dataset indices into Non-IID shards with statistical skew.
-
-    Each agent is randomly assigned exactly ``classes_per_agent`` classes.
-    For every class, its samples are distributed among the agents assigned
-    to that class with **random proportions** drawn from a symmetric
-    Dirichlet(alpha) distribution, introducing statistical skew (different
-    agents receive different amounts of data per class).
+    agent_classes: dict[int, list[int]] | None = None,
+    return_agent_classes: bool = False,
+) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Partition dataset indices into non-IID shards with Dirichlet skew.
 
     Parameters
     ----------
     labels : list[int]
-        List of integer class labels, one per sample (same length as the
-        dataset). Used only to determine which samples belong to which class.
+        Integer class labels, one per sample.
     n_agents : int
-        Number of agents (clients) to partition into.
+        Number of agents.
     classes_per_agent : int
-        Number of classes assigned to each agent. Must satisfy
-        ``1 <= classes_per_agent <= num_unique_classes``.
+        Target number of classes per agent. When the dataset has more classes
+        than total available class slots, some agents may receive more than
+        this target so that every class remains assigned.
     seed : int, optional
-        Random seed for reproducibility (default: 42).
+        Random seed for reproducibility.
     alpha : float, optional
-        Concentration parameter of the Dirichlet distribution that controls
-        the statistical skew (default: 0.5).
-        - alpha -> 0: extreme skew (one agent gets almost all samples)
-        - alpha = 1.0: uniformly random proportions
-        - alpha -> inf: near-equal split (approaches uniform)
+        Symmetric Dirichlet concentration parameter. Lower values increase
+        skew, higher values approach a more even class-wise split.
+    agent_classes : dict[int, list[int]] | None, optional
+        Explicit class assignments to reuse across multiple dataset splits.
+        When omitted, assignments are sampled randomly.
+    return_agent_classes : bool, optional
+        If ``True``, also return the sampled/reused agent-to-class mapping.
 
     Returns
     -------
-    agent_indices : dict[int, list[int]]
-        Mapping from agent index to the list of dataset sample indices that
-        agent receives.
-
-    Raises
-    ------
-    ValueError
-        If ``classes_per_agent`` exceeds the number of unique classes or is
-        less than 1.
+    dict[int, list[int]] or tuple[dict[int, list[int]], dict[int, list[int]]]
+        Per-agent dataset indices and, optionally, the class assignments.
     """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if classes_per_agent < 1:
+        raise ValueError('classes_per_agent must be at least 1')
+    if alpha <= 0:
+        raise ValueError('alpha must be strictly positive')
+
     labels_tensor = torch.tensor(labels, dtype=torch.long)
+    if labels_tensor.numel() == 0:
+        empty_partition = {agent_id: [] for agent_id in range(n_agents)}
+        if return_agent_classes:
+            resolved_classes = agent_classes or {
+                agent_id: [] for agent_id in range(n_agents)
+            }
+            return empty_partition, resolved_classes
+        return empty_partition
+
     unique_classes = torch.unique(labels_tensor).tolist()
     num_classes = len(unique_classes)
+    unique_class_set = set(unique_classes)
 
-    if not 1 <= classes_per_agent <= num_classes:
+    if classes_per_agent > num_classes:
         raise ValueError(
             f'classes_per_agent={classes_per_agent} must be in '
             f'[1, {num_classes}] (number of unique classes in the dataset)'
@@ -69,82 +146,137 @@ def partition_non_iid(
 
     generator = torch.Generator().manual_seed(seed)
 
-    # assign each agent a random subset of classes
-    agent_class_sets: dict[int, list[int]] = {}
-    for i in range(n_agents):
-        perm = torch.randperm(num_classes, generator=generator)
-        agent_class_sets[i] = [
-            unique_classes[j] for j in perm[:classes_per_agent].tolist()
+    if agent_classes is None:
+        resolved_agent_classes = _sample_class_assignments(
+            unique_classes=unique_classes,
+            n_agents=n_agents,
+            classes_per_agent=classes_per_agent,
+            generator=generator,
+        )
+    else:
+        resolved_agent_classes = {}
+        for agent_id in range(n_agents):
+            assigned_classes = sorted(set(agent_classes.get(agent_id, [])))
+            if not assigned_classes:
+                raise ValueError(
+                    f'agent {agent_id} has no assigned classes in agent_classes'
+                )
+            unknown_classes = set(assigned_classes) - unique_class_set
+            if unknown_classes:
+                raise ValueError(
+                    f'agent {agent_id} was assigned classes not present in the '
+                    f'dataset split: {sorted(unknown_classes)}'
+                )
+            resolved_agent_classes[agent_id] = assigned_classes
+
+    class_to_agents: dict[int, list[int]] = defaultdict(list)
+    for agent_id, class_labels in resolved_agent_classes.items():
+        for class_label in class_labels:
+            class_to_agents[class_label].append(agent_id)
+
+    uncovered_classes = sorted(unique_class_set - set(class_to_agents))
+    if uncovered_classes:
+        raise ValueError(
+            'Every class in the split must be assigned to at least one agent. '
+            f'Uncovered classes: {uncovered_classes}'
+        )
+
+    agent_indices: dict[int, list[int]] = {agent_id: [] for agent_id in range(n_agents)}
+    agent_indices_by_class: dict[int, dict[int, list[int]]] = {
+        agent_id: defaultdict(list) for agent_id in range(n_agents)
+    }
+
+    for class_label in unique_classes:
+        class_indices = torch.where(labels_tensor == class_label)[0]
+        class_indices = class_indices[
+            torch.randperm(len(class_indices), generator=generator)
         ]
 
-    class_to_agents: dict[int, list[int]] = {c: [] for c in unique_classes}
-    for agent_id, class_list in agent_class_sets.items():
-        for c in class_list:
-            class_to_agents[c].append(agent_id)
-
-    # for each class, distribute its sample indices among assigned
-    # agents with Dirichlet-drawn random proportions
-    agent_indices: dict[int, list[int]] = {i: [] for i in range(n_agents)}
-
-    dirichlet = torch.distributions.Dirichlet(
-        torch.ones(1)  # placeholder, resized per class below
-    )
-
-    for c in unique_classes:
-        # All sample indices belonging to this class
-        c_indices = torch.where(labels_tensor == c)[0]
-        # Shuffle deterministically
-        c_perm = torch.randperm(len(c_indices), generator=generator)
-        c_indices = c_indices[c_perm]
-
-        assigned_agents = class_to_agents[c]
-        if not assigned_agents:
-            # Edge case: no agent was assigned this class
+        assigned_agents = class_to_agents[class_label]
+        if len(assigned_agents) == 1:
+            agent_id = assigned_agents[0]
+            selected_indices = class_indices.tolist()
+            agent_indices[agent_id].extend(selected_indices)
+            agent_indices_by_class[agent_id][class_label].extend(selected_indices)
             continue
 
-        n_assigned = len(assigned_agents)
-        n_samples = len(c_indices)
+        proportions = _draw_dirichlet_proportions(
+            n_parts=len(assigned_agents),
+            alpha=alpha,
+            generator=generator,
+        )
+        draws = torch.multinomial(
+            proportions,
+            num_samples=len(class_indices),
+            replacement=True,
+            generator=generator,
+        )
+        counts = torch.bincount(draws, minlength=len(assigned_agents))
 
-        if n_assigned == 1:
-            # Only one agent gets this class
-            agent_indices[assigned_agents[0]].extend(c_indices.tolist())
-            continue
-
-        # Draw random proportions from Dirichlet(alpha, alpha, ..., alpha)
-        # Ensure alpha is a float, as torch._standard_gamma requires a float tensor
-        concentration = torch.full((n_assigned,), float(alpha), dtype=torch.float32)
-        gamma_samples = torch.zeros(n_assigned)
-        for k in range(n_assigned):
-            # Gamma(alpha, 1) via torch 
-            gamma_samples[k] = torch._standard_gamma(
-                concentration[k:k+1], generator=generator
-            ).item()
-
-        # Normalise to get Dirichlet proportions
-        proportions = gamma_samples / gamma_samples.sum()
-
-        # Convert proportions to integer counts
-        counts = (proportions * n_samples).long()
-        # Distribute rounding remainder to random agents
-        remainder = n_samples - counts.sum().item()
-        if remainder > 0:
-            bonus_idx = torch.randperm(n_assigned, generator=generator)[:remainder]
-            counts[bonus_idx] += 1
-        elif remainder < 0:
-            # Over-allocated due to rounding 
-            trim_idx = torch.argsort(counts, descending=True)[:abs(remainder)]
-            counts[trim_idx] -= 1
-
-        # Ensure no negative counts 
-        counts = counts.clamp(min=0)
-
-        # Assign sample chunks according to the random counts
         offset = 0
-        for k, agent_id in enumerate(assigned_agents):
-            count = counts[k].item()
-            agent_indices[agent_id].extend(
-                c_indices[offset:offset + count].tolist()
-            )
+        for position, agent_id in enumerate(assigned_agents):
+            count = counts[position].item()
+            selected_indices = class_indices[offset:offset + count].tolist()
+            agent_indices[agent_id].extend(selected_indices)
+            agent_indices_by_class[agent_id][class_label].extend(selected_indices)
             offset += count
 
-    return agent_indices
+    if n_agents == 1:
+        result: dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]
+        result = agent_indices
+        if return_agent_classes:
+            result = (agent_indices, resolved_agent_classes)
+        return result
+
+    empty_agents = [agent_id for agent_id, indices in agent_indices.items() if not indices]
+    for agent_id in empty_agents:
+        donor_found = False
+        candidate_classes = resolved_agent_classes[agent_id]
+        for class_label in candidate_classes:
+            donors = [
+                donor_id
+                for donor_id in class_to_agents[class_label]
+                if len(agent_indices_by_class[donor_id][class_label]) > 1
+            ]
+            if donors:
+                donor_id = max(
+                    donors,
+                    key=lambda current_agent: len(
+                        agent_indices_by_class[current_agent][class_label]
+                    ),
+                )
+                moved_index = agent_indices_by_class[donor_id][class_label].pop()
+                agent_indices[donor_id].remove(moved_index)
+                agent_indices[agent_id].append(moved_index)
+                agent_indices_by_class[agent_id][class_label].append(moved_index)
+                donor_found = True
+                break
+
+        if donor_found:
+            continue
+
+        donors = [
+            donor_id
+            for donor_id, indices in agent_indices.items()
+            if len(indices) > 1
+        ]
+        if not donors:
+            raise RuntimeError(
+                'Could not allocate at least one sample to every agent.'
+            )
+
+        donor_id = max(donors, key=lambda current_agent: len(agent_indices[current_agent]))
+        moved_index = agent_indices[donor_id].pop()
+        moved_class = labels[moved_index]
+        agent_indices[agent_id].append(moved_index)
+        agent_indices_by_class[donor_id][moved_class].remove(moved_index)
+        agent_indices_by_class[agent_id][moved_class].append(moved_index)
+        if moved_class not in resolved_agent_classes[agent_id]:
+            resolved_agent_classes[agent_id] = sorted(
+                resolved_agent_classes[agent_id] + [moved_class]
+            )
+
+    result = agent_indices
+    if return_agent_classes:
+        result = (agent_indices, resolved_agent_classes)
+    return result

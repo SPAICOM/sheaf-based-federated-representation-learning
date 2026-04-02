@@ -231,3 +231,11 @@ review/
 *.pdf
 *.ckpt
 *.zip
+
+# Project specific ignores
+tests/
+logs/
+
+# Config files - ignore hetero_cifar10 and rotated_mnist experiments
+config/hydra/hetero_cifar10_*.yaml
+config/hydra/rotated_mnist_anchor_sweep.yaml

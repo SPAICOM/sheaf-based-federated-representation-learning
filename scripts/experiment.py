@@ -100,7 +100,6 @@ def main(cfg: DictConfig) -> None:
     if num_classes is None:
         raise ValueError('Attribute "label" is not categorical')
 
-    idx_to_name = {}
     agents = {}
     latent_dims = {}
 
@@ -111,8 +110,6 @@ def main(cfg: DictConfig) -> None:
     # Instantiate agent models for each data modality
     # Each agent can have different model architectures (in cfg.agents)
     for i in range(n_agents):
-        idx_to_name[i] = str(i)
-
         # Create a deep copy of the base model config to avoid
         # modifying shared config
         model_cfg = copy.deepcopy(cfg.model)
@@ -125,9 +122,10 @@ def main(cfg: DictConfig) -> None:
                 if hasattr(model_cfg, key) or key in model_cfg:
                     setattr(model_cfg, key, value)
 
-        # Set num_classes for this specific agent
-        # Falls back to global 'label' num_classes if per-agent not set
-        model_cfg.num_classes = datamodule.num_classes.get(i, num_classes)
+        # Classification labels remain in the global label space even when an
+        # agent only observes a subset of classes, so model heads must keep
+        # the global output dimension.
+        model_cfg.num_classes = num_classes
 
         # Set in_features from datamodule input dimensions
         # Required for LatentClassifier which needs explicit input dimension
@@ -188,6 +186,7 @@ def main(cfg: DictConfig) -> None:
 
     # Run training
     trainer.fit(orchestrator, datamodule=datamodule)
+    trainer.test(orchestrator, datamodule=datamodule)
 
     # Clean up temporary directories created by Hydra, WandB, and Lightning
     # These directories can accumulate over multiple experiment runs

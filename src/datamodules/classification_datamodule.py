@@ -20,6 +20,10 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from src.datamodules.utils import (
+    compute_split_indices,
+    repeat_dataset_to_num_samples,
+)
 from src.utils.data_partitioner import partition_non_iid
 
 
@@ -40,14 +44,23 @@ def _collate_fn(batch):
     tuple[torch.Tensor, torch.Tensor]
         Stacked data tensor and stacked label tensor.
     """
-    data_list, label_list = zip(*batch)
+    if len(batch[0]) == 3:
+        data_list, label_list, id_list = zip(*batch)
+    else:
+        data_list, label_list = zip(*batch)
+        id_list = None
+
     data_out = []
     for data in data_list:
         if isinstance(data, Image.Image):
             data_out.append(transforms.ToTensor()(data))
         else:
             data_out.append(data)
-    return torch.stack(data_out), torch.stack(label_list)
+
+    stacked = (torch.stack(data_out), torch.stack(label_list))
+    if id_list is not None:
+        stacked = stacked + (torch.stack(id_list),)
+    return stacked
 
 
 class ClassificationDataset(Dataset):
@@ -73,19 +86,24 @@ class ClassificationDataset(Dataset):
         data_key: str,
         label_key: str = 'label',
         rotation_angle: float = 0,
+        sample_ids: list[int] | None = None,
     ) -> None:
         self.dataset = hf_dataset
         self.data_key = data_key
         self.label_key = label_key
         # Normalize rotation angle to [0, 360) range
         self.rotation_angle = rotation_angle % 360
+        self.sample_ids = sample_ids
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[Image.Image | torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[Image.Image | torch.Tensor, torch.Tensor]
+        | tuple[Image.Image | torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Get a single sample from the dataset.
 
         Parameters
@@ -111,6 +129,10 @@ class ClassificationDataset(Dataset):
         label = item[self.label_key]
         if isinstance(label, int):
             label = torch.tensor(label, dtype=torch.long)
+
+        if self.sample_ids is not None:
+            sample_id = torch.tensor(self.sample_ids[idx], dtype=torch.long)
+            return data, label, sample_id
 
         return data, label
 
@@ -205,6 +227,10 @@ class ClassificationDataModule(l.LightningDataModule):
         mode: str = 'min_size',
         val_split: float = 0.1,
         test_split: float = 0.1,
+        pilot_split: float = 0.0,
+        pilot_num_samples: int | None = None,
+        pilot_batch_size: int | None = None,
+        pilot_apply_agent_rotations: bool = False,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -226,7 +252,35 @@ class ClassificationDataModule(l.LightningDataModule):
 
         self.val_split = val_split
         self.test_split = test_split
+        self.pilot_split = pilot_split
+        self.pilot_num_samples = pilot_num_samples
+        self.pilot_batch_size = (
+            batch_size if pilot_batch_size is None else pilot_batch_size
+        )
+        self.pilot_apply_agent_rotations = pilot_apply_agent_rotations
         self.seed = seed
+
+    def _build_pilot_datasets(
+        self,
+        pilot_data,
+        pilot_indices: list[int],
+        label_key: str,
+    ) -> None:
+        """Create shared pilot datasets with stable sample identifiers."""
+        self.pilot_datasets = {}
+        for i in range(self.n_agents):
+            rotation = (
+                self.agent_rotations.get(i, 0)
+                if self.pilot_apply_agent_rotations
+                else 0
+            )
+            self.pilot_datasets[i] = ClassificationDataset(
+                pilot_data,
+                self.data_key,
+                label_key,
+                rotation_angle=rotation,
+                sample_ids=pilot_indices,
+            )
 
     def _filter_by_classes(
         self, dataset, allowed_classes: set[int]
@@ -393,30 +447,51 @@ class ClassificationDataModule(l.LightningDataModule):
         label_key : str
             Name of the label column.
         """
+        train_partition, sampled_agent_classes = partition_non_iid(
+            labels=train[label_key],
+            n_agents=self.n_agents,
+            classes_per_agent=self.classes_per_agent,
+            seed=self.seed,
+            alpha=self.alpha,
+            return_agent_classes=True,
+        )
+        self.agent_classes = sampled_agent_classes
+
+        split_partitions = {
+            'train_datasets': train_partition,
+            'val_datasets': partition_non_iid(
+                labels=val[label_key],
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                alpha=self.alpha,
+                agent_classes=self.agent_classes,
+            ),
+            'test_datasets': partition_non_iid(
+                labels=test[label_key],
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                alpha=self.alpha,
+                agent_classes=self.agent_classes,
+            ),
+        }
+
         for split_data, target_dict in [
             (train, 'train_datasets'),
             (val, 'val_datasets'),
             (test, 'test_datasets'),
         ]:
-            labels = split_data[label_key]
-            partition = partition_non_iid(
-                labels=labels,
-                n_agents=self.n_agents,
-                classes_per_agent=self.classes_per_agent,
-                seed=self.seed,
-                alpha=self.alpha,
-            )
+            partition = split_partitions[target_dict]
             for i in range(self.n_agents):
-                indices = partition[i]
                 rotation = self.agent_rotations.get(i, 0)
                 getattr(self, target_dict)[i] = ClassificationDataset(
-                    split_data.select(indices),
+                    split_data.select(partition[i]),
                     self.data_key,
                     label_key,
                     rotation_angle=rotation,
                 )
 
-        # Set per-agent num_classes from the actual labels each agent received
         for i in range(self.n_agents):
             agent_labels = self.train_datasets[i].dataset[label_key]
             self.num_classes[i] = len(set(agent_labels))
@@ -437,31 +512,28 @@ class ClassificationDataModule(l.LightningDataModule):
         ds = load_dataset(f'{self.repo}/{self.name}')
 
         # Merge all splits to maximize data before re-splitting
-        # according to custom ratios
+        # according to custom ratios.
         splits = [ds[s] for s in ds]
         all_data = concatenate_datasets(splits)
-
-        # Two-stage split to avoid data leakage:
-        # Stage 1: Split off (validation + test) from training data
-        split_1 = all_data.train_test_split(
-            test_size=self.val_split + self.test_split,
+        split_indices = compute_split_indices(
+            total_size=len(all_data),
+            val_split=self.val_split,
+            test_split=self.test_split,
             seed=self.seed,
+            pilot_split=self.pilot_split,
+            pilot_num_samples=self.pilot_num_samples,
         )
 
-        train = split_1['train']
-        temp = split_1['test']
-
-        # Stage 2: Split the held-out portion into validation and test sets
-        # This ensures test set is never seen during training/validation
-        split_2 = temp.train_test_split(
-            test_size=self.test_split / (self.val_split + self.test_split),
-            seed=self.seed,
-        )
+        pilot = all_data.select(split_indices['pilot'])
+        train = all_data.select(split_indices['train'])
+        val = all_data.select(split_indices['val'])
+        test = all_data.select(split_indices['test'])
 
         # Initialize dictionaries to hold datasets for each agent
         self.train_datasets: dict[int, ClassificationDataset] = {}
         self.val_datasets: dict[int, ClassificationDataset] = {}
         self.test_datasets: dict[int, ClassificationDataset] = {}
+        self.pilot_datasets: dict[int, ClassificationDataset] = {}
         self.num_classes: dict[int, int] = {}
 
         # Infer number of agents if not explicitly provided
@@ -476,32 +548,32 @@ class ClassificationDataModule(l.LightningDataModule):
 
         # Use first attribute as the label key for classification
         label_key = self.attributes[0]
+        if split_indices['pilot']:
+            self._build_pilot_datasets(
+                pilot_data=pilot,
+                pilot_indices=split_indices['pilot'],
+                label_key=label_key,
+            )
 
         # Choose splitting strategy based on configuration
         if self.split_strategy == 'uniform':
             # Distribute data evenly across all agents
             self._split_data_uniform(
-                train, split_2['train'], split_2['test'], label_key
+                train, val, test, label_key
             )
         elif self.split_strategy == 'class_partition':
             # Assign specific classes to each agent
             self._split_data_class_partition(
-                train, split_2['train'], split_2['test'], label_key
+                train, val, test, label_key
             )
-        
-        # TODO: needs debugging
         elif self.split_strategy == 'non_iid':
             # Automatic Non-IID: each agent gets classes_per_agent random
             # classes, samples distributed among assigned agents
             self._split_data_non_iid(
-                train, split_2['train'], split_2['test'], label_key
+                train, val, test, label_key
             )
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
-
-        global_classes = len(set(train[label_key]))
-        for i in range(self.n_agents):
-            self.num_classes[i] = global_classes
 
         # Determine input shape from first sample
         # Handle both PIL Images (need conversion) and pre-converted tensors
@@ -529,29 +601,83 @@ class ClassificationDataModule(l.LightningDataModule):
             collate_fn=_collate_fn,
         )
 
-    def train_dataloader(self) -> CombinedLoader:
-        return CombinedLoader(
-            {
-                i: self._make_loader(self.train_datasets[i], True)
-                for i in self.train_datasets
-            },
-            mode=self.mode,
+    def _make_pilot_loader(
+        self,
+        dataset: Dataset,
+        target_num_batches: int,
+    ) -> DataLoader:
+        target_num_samples = target_num_batches * self.pilot_batch_size
+        repeated_dataset = repeat_dataset_to_num_samples(
+            dataset,
+            target_num_samples,
         )
+        return DataLoader(
+            repeated_dataset,
+            batch_size=self.pilot_batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=_collate_fn,
+        )
+
+    def train_dataloader(self) -> CombinedLoader:
+        loaders = {
+            i: self._make_loader(self.train_datasets[i], True)
+            for i in self.train_datasets
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.train_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{i}': self._make_pilot_loader(
+                        self.pilot_datasets[i],
+                        target_num_batches,
+                    )
+                    for i in self.pilot_datasets
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)
 
     def val_dataloader(self) -> CombinedLoader:
-        return CombinedLoader(
-            {
-                i: self._make_loader(self.val_datasets[i], False)
-                for i in self.val_datasets
-            },
-            mode=self.mode,
-        )
+        loaders = {
+            i: self._make_loader(self.val_datasets[i], False)
+            for i in self.val_datasets
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.val_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{i}': self._make_pilot_loader(
+                        self.pilot_datasets[i],
+                        target_num_batches,
+                    )
+                    for i in self.pilot_datasets
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)
 
     def test_dataloader(self) -> CombinedLoader:
-        return CombinedLoader(
-            {
-                i: self._make_loader(self.test_datasets[i], False)
-                for i in self.test_datasets
-            },
-            mode=self.mode,
-        )
+        loaders = {
+            i: self._make_loader(self.test_datasets[i], False)
+            for i in self.test_datasets
+        }
+        if self.pilot_datasets:
+            target_num_batches = max(
+                (len(dataset) + self.batch_size - 1) // self.batch_size
+                for dataset in self.test_datasets.values()
+            )
+            loaders.update(
+                {
+                    f'pilot_{i}': self._make_pilot_loader(
+                        self.pilot_datasets[i],
+                        target_num_batches,
+                    )
+                    for i in self.pilot_datasets
+                }
+            )
+        return CombinedLoader(loaders, mode=self.mode)

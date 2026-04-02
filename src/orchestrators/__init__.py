@@ -4,7 +4,11 @@ Orchestrators for federated learning coordination.
 This package provides orchestration classes that manage training across
 multiple federated learning agents:
 - FederatedLearning: Federated averaging with neighbor-restricted updates
-- SheafFRL: Sheaf-based FRL with latent alignment
+- DPSGD: decentralized parallel SGD with per-step model mixing
+- DFedU: decentralized federated multitask learning with Laplacian updates
+- SheafFMTL: sheaf multitask learning in parameter space
+- SheafFRL: sheaf-based FRL with latent alignment
+- NonCooperativeLearning: independent local training baseline
 
 Each orchestrator:
 - Coordinates multi-agent training in PyTorch Lightning
@@ -12,10 +16,18 @@ Each orchestrator:
 - Handles validation and testing across agents
 """
 
+from .dfedu import DFedU
+from .dpsgd import DPSGD
 from .federated import FederatedLearning
+from .non_cooperative import NonCooperativeLearning
+from .sheaf_fmtl import SheafFMTL
 from .sheaf_frl import SheafFRL
 
 __all__ = [
+    'DFedU',
+    'DPSGD',
     'FederatedLearning',
+    'NonCooperativeLearning',
+    'SheafFMTL',
     'SheafFRL',
 ]
