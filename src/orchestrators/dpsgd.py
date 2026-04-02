@@ -229,6 +229,7 @@ class DPSGD(BaseOrchestrator):
             prefix=prefix,
             agent_losses=agent_losses,
             agent_performances=agent_performances,
+            batch_size=self._resolve_batch_size(batch),
         )
 
         return outputs, total_loss

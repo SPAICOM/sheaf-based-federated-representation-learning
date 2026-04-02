@@ -144,6 +144,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         prefix: str,
         agent_losses: dict[int, Any],
         agent_performances: dict[int, Any],
+        batch_size: int,
         total_loss: torch.Tensor | None = None,
         extra_metrics: dict[str, Any] | None = None,
         prog_bar: bool = True,
@@ -177,6 +178,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 per_agent_logs,
                 on_step=False,
                 on_epoch=True,
+                batch_size=batch_size,
             )
 
         if normalized_losses:
@@ -229,8 +231,31 @@ class BaseOrchestrator(l.LightningModule, ABC):
             on_step=False,
             on_epoch=True,
             prog_bar=prog_bar,
+            batch_size=batch_size,
         )
         return total_task_loss, avg_performance
+
+    def _resolve_batch_size(
+        self,
+        batch: dict[int, list[torch.Tensor]] | tuple[dict[int, list[torch.Tensor]]],
+    ) -> int:
+        """Infer an explicit batch size from a multi-agent combined batch."""
+        if isinstance(batch, tuple):
+            batch = batch[0]
+
+        batch_sizes = []
+        for key, values in batch.items():
+            if isinstance(key, str) and key.startswith('pilot_'):
+                continue
+            if not isinstance(values, (list, tuple)) or not values:
+                continue
+            x = values[0]
+            if isinstance(x, torch.Tensor) and x.ndim > 0:
+                batch_sizes.append(int(x.shape[0]))
+
+        if batch_sizes:
+            return max(batch_sizes)
+        return 1
 
     @abstractmethod
     def on_train_epoch_end(self):

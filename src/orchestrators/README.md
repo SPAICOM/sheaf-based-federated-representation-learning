@@ -40,12 +40,13 @@ This module contains orchestrator implementations for federated learning that co
   - **Typical Use**: When you want to learn representations that are both task-relevant and aligned across agents
 
 - [`sheaf_fmtl.py`](sheaf_fmtl.py): Sheaf-based Federated Multi-Task Learning orchestrator
-  - **Algorithm**: Extends Sheaf FRL to multi-task learning scenarios where each agent may have different but related tasks
+  - **Algorithm**: Implements the Sheaf-FMTL formulation from "Tackling Feature and Sample Heterogeneity in Decentralized
+  Multi-Task Learning: A Sheaf-Theoretic Approach", which introduces the sheaf framework in federated multitask learning by communicating and aligning agents in parameter space.
   - **Key Features**:
-    - Task-specific heads while sharing aligned representations
-    - Sheaf regularization applied to shared representation spaces
-    - Handles heterogeneous label spaces across agents
-  - **Typical Use**: When agents have different label sets but share underlying feature distributions (e.g., different medical conditions from same imaging data)
+    - Trainable projection matrices `P_ij` map each agent's parameter vector into edge-specific shared latent subspaces
+    - Sheaf Laplacian penalty is applied directly to local parameter gradients before the optimizer step
+    - Projection matrices are updated manually after each training batch following the paper's update rule
+  - **Typical Use**: When you want the earlier sheaf-based multitask learning baseline that couples neighboring agents through parameter-space alignment
 
 - [`federated.py`](federated.py): Standard Federated Learning orchestrator implementing Federated Averaging (FedAvg)
   - **Algorithm**: 
@@ -58,23 +59,23 @@ This module contains orchestrator implementations for federated learning that co
     - Baseline for comparison with more advanced methods
   - **Typical Use**: As a baseline or when simplicity and broad compatibility are priorities
 
-- [`dpsgd.py`](dpsgd.py): Differentially Private SGD orchestrator
-  - **Algorithm**: Implements federated learning with differential privacy guarantees using DP-SGD
+- [`dpsgd.py`](dpsgd.py): Decentralized Parallel SGD orchestrator
+  - **Algorithm**: Implements D-PSGD from "Can Decentralized Algorithms Outperform Centralized Algorithms? A Case Study for Decentralized Parallel Stochastic Gradient Descent", where each agent mixes parameters with its neighbors and then takes its local SGD step
   - **Key Features**:
-    - Gradient clipping to bound sensitivity
-    - Gaussian noise addition for privacy
-    - Privacy budget tracking (epsilon, delta)
-    - Compatible with standard federated learning workflows
-  - **Typical Use**: When privacy guarantees are required for sensitive data (medical, financial, personal)
+    - Peer-to-peer parameter mixing with a Metropolis-Hastings doubly stochastic weight matrix
+    - Per-step communication performed in `on_before_optimizer_step`
+    - Homogeneous-architecture requirement because agents exchange and overwrite flattened parameter vectors
+    - No privacy-specific clipping, noise injection, or privacy budget accounting
+  - **Typical Use**: When you want a decentralized data-parallel SGD baseline with direct neighbor averaging at every optimization step
 
-- [`dfedu.py`](dfedu.py): Decentralized Federated Learning with Dual Encoders orchestrator
-  - **Algorithm**: Decentralized approach where agents communicate directly with neighbors without central server
+- [`dfedu.py`](dfedu.py): d-FedU orchestrator
+  - **Algorithm**: Implements the method from "A New Look and Convergence Rate of Federated Multitask Learning With Laplacian Regularization", performing local training followed by an epoch-end Laplacian consensus step in parameter space
   - **Key Features**:
-    - Dual encoder architecture for privacy-preserving communication
-    - Peer-to-peer agent communication topology
-    - No central coordinator required
-    - Emergent consensus through local interactions
-  - **Typical Use**: When decentralization is important or central server creates bottlenecks/trust issues
+    - End-of-epoch update `w_i <- w_i - eta * sum_j (w_i - w_j)` over graph neighbors
+    - Synchronous parameter-space consensus computed from pre-update snapshots
+    - Direct parameter mixing across neighbors, so all agents must share the same architecture
+    - Fully decentralized communication without a central server
+  - **Typical Use**: When you want decentralized federated multitask learning with Laplacian regularization over homogeneous models
 
 - [`non_cooperative.py`](non_cooperative.py): Non-cooperative game-theoretic approach to federated learning
   - **Algorithm**: Models federated learning as a game where agents optimize individual objectives
@@ -141,8 +142,8 @@ Each orchestrator implements a specific federated learning algorithm while shari
 
 The choice of orchestrator depends on your specific federated learning requirements:
 - Use `sheaf_frl` for learning aligned representations
-- Use `sheaf_fmtl` for multi-task learning with shared representations
+- Use `sheaf_fmtl` for the prior sheaf-based multitask learning method with parameter-space alignment
 - Use `federated` for standard FedAvg baseline
-- Use `dpsgd` when differential privacy is required
-- Use `dfedu` for fully decentralized setups
+- Use `dpsgd` for decentralized parallel SGD with per-step neighbor mixing
+- Use `dfedu` for decentralized federated multitask learning with Laplacian regularization
 - Use `non_cooperative` when modeling strategic agent behavior

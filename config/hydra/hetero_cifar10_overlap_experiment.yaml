@@ -1,0 +1,85 @@
+defaults:
+  - _self_
+  - dataset: cifar10
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+
+seed: 42
+
+agents:
+  0:
+    encoder_hidden_dims: [32, 64, 128]
+  1:
+    encoder_hidden_dims: [32, 64, 128]
+  2:
+    encoder_hidden_dims: [32, 64, 128]
+  3:
+    encoder_hidden_dims: [32, 64, 128 ]
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.3
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sheaf-repr-learning__hetero-cifar10-overlap
+  name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 25
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: validation/total_loss_epoch
+    mode: min
+    save_top_k: 1
+    save_last: true
+
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: validation/total_loss_epoch
+    patience: 5
+    mode: min
+
+dataset:
+  split_strategy: class_partition
+  n_agents: 4
+  shared_classes: 2
+  batch_size: 64
+  num_workers: 4
+  mode: min_size
+  pilot_split: 0.05
+  pilot_batch_size: 64
+
+model:
+  encoder_hidden_dims: [32, 64, 128]
+  decoder_hidden_dims: [256]
+  dropout: 0.1
+  use_batchnorm: true
+
+orchestrator:
+  lambda_sheaf: 0.05
+  anchor_strategy: semantic_pilots
+  num_anchors: 64
+  parseval_normalization: false
+  l2_normalization: false
+
+optimization:
+  objective_metric: validation/total_loss_epoch
+  run_test: true

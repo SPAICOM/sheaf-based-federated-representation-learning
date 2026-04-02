@@ -12,6 +12,60 @@ from collections import defaultdict
 import torch
 
 
+def build_shared_class_partition(
+    unique_classes: list[int],
+    n_agents: int,
+    shared_classes: int,
+    seed: int = 42,
+) -> dict[int, list[int]]:
+    """Build class assignments with an exact globally shared-label count.
+
+    The resulting mapping is intended for ``split_strategy='class_partition'``:
+    ``shared_classes`` labels are visible to every agent, while the remaining
+    labels are distributed approximately evenly across agents.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+
+    resolved_classes = sorted(set(unique_classes))
+    num_classes = len(resolved_classes)
+    if num_classes == 0:
+        return {agent_id: [] for agent_id in range(n_agents)}
+
+    if shared_classes < 0 or shared_classes > num_classes:
+        raise ValueError(
+            f'shared_classes={shared_classes} must be in [0, {num_classes}]'
+        )
+    if shared_classes == 0 and n_agents > num_classes:
+        raise ValueError(
+            'shared_classes=0 cannot guarantee a non-empty class set for '
+            'each agent when n_agents exceeds the number of classes'
+        )
+
+    generator = torch.Generator().manual_seed(seed)
+    shuffled_indices = torch.randperm(
+        num_classes, generator=generator
+    ).tolist()
+    shuffled_classes = [resolved_classes[idx] for idx in shuffled_indices]
+
+    shared = shuffled_classes[:shared_classes]
+    residual = shuffled_classes[shared_classes:]
+
+    assignments = {
+        agent_id: list(shared) for agent_id in range(n_agents)
+    }
+    agent_order = torch.randperm(n_agents, generator=generator).tolist()
+
+    for offset, class_label in enumerate(residual):
+        agent_id = agent_order[offset % n_agents]
+        assignments[agent_id].append(class_label)
+
+    return {
+        agent_id: sorted(class_labels)
+        for agent_id, class_labels in assignments.items()
+    }
+
+
 def _draw_dirichlet_proportions(
     n_parts: int,
     alpha: float,

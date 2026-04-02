@@ -20,4 +20,12 @@ def remove_non_empty_dir(path: str | Path) -> None:
     path : str | Path
         Path to the directory to remove.
     """
-    shutil.rmtree(path)
+    resolved_path = Path(path).expanduser()
+    if not resolved_path.exists():
+        return None
+    if not resolved_path.is_dir():
+        raise NotADirectoryError(
+            f'The path {resolved_path} is not a directory.'
+        )
+    shutil.rmtree(resolved_path, ignore_errors=True)
+    return None

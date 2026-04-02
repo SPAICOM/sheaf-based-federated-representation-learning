@@ -24,7 +24,10 @@ from src.datamodules.utils import (
     compute_split_indices,
     repeat_dataset_to_num_samples,
 )
-from src.utils.data_partitioner import partition_non_iid
+from src.utils.data_partitioner import (
+    build_shared_class_partition,
+    partition_non_iid,
+)
 
 
 def _collate_fn(batch):
@@ -169,6 +172,10 @@ class ClassificationDataModule(l.LightningDataModule):
     agent_classes : dict[int, list[int]], optional
         Dictionary mapping agent indices to list of class labels they see.
         Only used when split_strategy='class_partition'.
+    shared_classes : int, optional
+        Number of classes shared by all agents when
+        ``split_strategy='class_partition'`` and ``agent_classes`` is not
+        provided. The remaining classes are distributed across agents.
     classes_per_agent : int, optional
         Number of classes randomly assigned to each agent. Only used when
         split_strategy='non_iid'. Default: 2.
@@ -220,6 +227,7 @@ class ClassificationDataModule(l.LightningDataModule):
         agent_rotations: dict[int, float] | None = None,
         split_strategy: str = 'uniform',
         agent_classes: dict[int, list[int]] | None = None,
+        shared_classes: int | None = None,
         classes_per_agent: int = 2,
         alpha: float = 0.5,
         batch_size: int = 64,
@@ -243,6 +251,7 @@ class ClassificationDataModule(l.LightningDataModule):
         self.agent_rotations = agent_rotations or {}
         self.split_strategy = split_strategy
         self.agent_classes = agent_classes or {}
+        self.shared_classes = shared_classes
         self.classes_per_agent = classes_per_agent
         self.alpha = alpha
 
@@ -394,6 +403,12 @@ class ClassificationDataModule(l.LightningDataModule):
         ValueError
             If an agent has no classes assigned.
         """
+        if not self.agent_classes:
+            raise ValueError(
+                'class_partition requires either explicit agent_classes or '
+                'dataset.shared_classes to generate them automatically'
+            )
+
         for i in range(self.n_agents):
             allowed_classes = self.agent_classes.get(i, None)
             if allowed_classes is None:
@@ -551,6 +566,18 @@ class ClassificationDataModule(l.LightningDataModule):
                 pilot_data=pilot,
                 pilot_indices=split_indices['pilot'],
                 label_key=label_key,
+            )
+
+        if (
+            self.split_strategy == 'class_partition'
+            and not self.agent_classes
+            and self.shared_classes is not None
+        ):
+            self.agent_classes = build_shared_class_partition(
+                unique_classes=sorted(set(all_data[label_key])),
+                n_agents=self.n_agents,
+                shared_classes=int(self.shared_classes),
+                seed=self.seed,
             )
 
         # Choose splitting strategy based on configuration
