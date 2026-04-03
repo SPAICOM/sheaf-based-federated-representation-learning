@@ -207,20 +207,6 @@ class BaseOrchestrator(l.LightningModule, ABC):
             f'{prefix}/task_loss_total_epoch': total_task_loss,
             f'{prefix}/total_loss_epoch': resolved_total_loss,
             f'{prefix}/avg_task_performance_epoch': avg_performance,
-            f'{prefix}/loss_min': losses_tensor.min(),
-            f'{prefix}/loss_max': losses_tensor.max(),
-            f'{prefix}/loss_std': (
-                losses_tensor.std(unbiased=False)
-                if len(losses_tensor) > 1
-                else torch.tensor(0.0, device=self.device)
-            ),
-            f'{prefix}/task_performance_min': performances_tensor.min(),
-            f'{prefix}/task_performance_max': performances_tensor.max(),
-            f'{prefix}/task_performance_std': (
-                performances_tensor.std(unbiased=False)
-                if len(performances_tensor) > 1
-                else torch.tensor(0.0, device=self.device)
-            ),
         }
         aggregate_logs.update(self._communication_metrics(prefix))
         if extra_metrics is not None:
