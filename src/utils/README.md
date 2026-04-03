@@ -20,7 +20,7 @@ This module contains various utility functions and classes used throughout the f
     - `diversity`: diversity-aware farthest-point anchors within each class
     - `clustering`: centroid anchors from latent-space clustering within each class
     - `semantic_pilots`: anchors keyed by shared pilot sample ids
-    - `dynamic`: disagreement-driven subset chosen in `SheafFRL` from a larger candidate pool
+    - `dynamic`: disagreement-driven based on residuals. Fixes some across batches via `dynamic_persistent_ratio` and refreshed the rest
   - **Usage**: Used by orchestrators to select anchors for computing cross-covariance matrices and alignment
 
 ### Communication Tracking

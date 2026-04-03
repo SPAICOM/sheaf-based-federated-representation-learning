@@ -144,7 +144,10 @@ def build_coverage_class_plan(
     *,
     num_anchors: int,
 ) -> dict[int, int]:
-    """Distribute the anchor budget as evenly as possible across classes."""
+    """
+    Distribute the anchor budget as evenly as possible across classes, 
+    used by 'diversity' and 'clustering' strategies.
+    """
     if not global_classes:
         return {}
 
@@ -170,7 +173,10 @@ def build_proportional_class_plan(
     *,
     num_anchors: int,
 ) -> dict[int, int]:
-    """Allocate anchor budget proportionally to the empirical class mass."""
+    """
+    Allocate anchor budget proportionally to the empirical class mass within the batch.
+    Used by the 'uniform' strategy to reflect the global class distribution.
+    """
     class_counts = _global_class_counts(labels_per_agent)
     if not class_counts:
         return {}
@@ -234,7 +240,9 @@ def build_class_anchor_plan(
     labels_per_agent: dict[int, torch.Tensor],
     config: AnchorConfig,
 ) -> dict[int, int]:
-    """Build a shared class-to-slot plan for the current anchor strategy."""
+    """
+    Build a shared class-to-slot plan for the current anchor strategy.
+    """
     strategy = supported_anchor_strategy(config.strategy)
     global_classes = sorted_global_classes(labels_per_agent)
 
@@ -254,18 +262,22 @@ def build_class_anchor_plan(
         case _:
             raise ValueError(f'Unsupported anchor strategy: {strategy}')
 
-
 def farthest_point_indices(
     anchor_source: torch.Tensor,
     n_points: int,
 ) -> torch.Tensor:
-    """Select a diverse subset with farthest-point sampling to ensure geometric coverage."""
+    """
+    Select a diverse subset with farthest-point sampling to ensure geometric coverage.
+    Used by the 'diversity' and 'dynamic' strategies to cover the latent space.
+    """
     if n_points < 1 or len(anchor_source) == 0:
         return torch.empty(0, dtype=torch.long, device=anchor_source.device)
 
     valid_points = min(int(n_points), len(anchor_source))
     source = anchor_source.detach()
     center = source.mean(dim=0, keepdim=True)
+    # if using l2_normalization (latents projected to Hypersphere),
+    # l2 dist (euclidean) prop to cosine distance (semantic) 
     distances_to_center = torch.linalg.vector_norm(source - center, dim=1)
     first_idx = int(torch.argmax(distances_to_center).item())
 
@@ -292,7 +304,10 @@ def random_sample_anchors(
     class_latents: torch.Tensor,
     n_slots: int,
 ) -> list[torch.Tensor]:
-    """Draw raw class-conditioned sample anchors without replacement."""
+    """
+    Draw raw class-conditioned sample anchors without replacement.
+    Used by the 'uniform' strategy to reflect the global class distribution without geometric coverage guarantees.
+    """
     if n_slots < 1 or len(class_latents) == 0:
         return []
 
@@ -308,7 +323,10 @@ def diversity_sample_anchors(
     class_latents: torch.Tensor,
     n_slots: int,
 ) -> list[torch.Tensor]:
-    """Use farthest-point sampling to cover each class with diverse anchors."""
+    """
+    Use farthest-point sampling to cover each class with diverse anchors.
+    Used by the 'diversity' strategy to ensure geometric coverage within each class.
+    """
     selected = farthest_point_indices(class_latents, n_slots)
     return [class_latents[idx] for idx in selected.tolist()]
 
@@ -319,7 +337,10 @@ def cluster_centroid_anchors(
     *,
     max_iter: int = 10,
 ) -> list[torch.Tensor]:
-    """Approximate K-means centroids for class-conditioned coverage."""
+    """
+    Approximate K-means centroids for class-conditioned coverage.
+    Used by the 'clustering' strategy to find representative anchors for each class.
+    """
     if n_slots < 1 or len(class_latents) == 0:
         return []
 
@@ -368,7 +389,9 @@ def build_class_anchors(
     *,
     strategy: str,
 ) -> list[torch.Tensor]:
-    """Build semantically keyed anchors for one class."""
+    """
+    Build semantically keyed anchors for one class according to the specified strategy.
+    """
     if len(class_latents) == 0 or n_slots < 1:
         return []
 
