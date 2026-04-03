@@ -602,8 +602,9 @@ class ClassificationDataModule(l.LightningDataModule):
         else:
             self.input_shape = sample.shape
 
-        # Store number of classes for the 'label' key (for compatibility)
-        self.num_classes['label'] = self.num_classes.get(0)
+        # Keep the global label-space size for classifier heads even when
+        # each agent only observes a strict subset of classes.
+        self.num_classes['label'] = len(set(all_data[label_key]))
 
         # Create agent index list and determine input dimensions
         self.models = list(range(self.n_agents))

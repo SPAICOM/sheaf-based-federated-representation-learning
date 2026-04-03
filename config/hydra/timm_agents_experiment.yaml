@@ -1,9 +1,9 @@
 defaults:
-  - _self_
   - dataset: cifar10
   - model: timm_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
+  - _self_
 
 seed: 42
 
@@ -72,4 +72,3 @@ callbacks:
   #  mode: power
   #  init_val: 32
   #  max_trials: 5
-

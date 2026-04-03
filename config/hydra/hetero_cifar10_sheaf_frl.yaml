@@ -1,9 +1,9 @@
 defaults:
-  - _self_
   - dataset: cifar10
   - model: cnn_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
+  - _self_
 
 seed: 42
 
@@ -15,7 +15,7 @@ agents:
   2:
     encoder_hidden_dims: [32, 64, 128]
   3:
-    encoder_hidden_dims: [32, 64, 128 ]
+    encoder_hidden_dims: [32, 64, 128]
 
 graph:
   neighbors_mode: "fully_connected"
@@ -26,9 +26,9 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__hetero-cifar10-overlap
-  group: sweep_Hcifar10_homo_arch
-  name: trial_${hydra.job.num}
+  project: sheaf-repr-learning__hetero-cifar10-sheaf_frl
+  group: sweep_${orchestrator.anchor_strategy}
+  name: trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -47,16 +47,16 @@ callbacks:
 
   checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    monitor: validation/total_loss_epoch
-    mode: min
+    monitor: validation/avg_task_performance_epoch
+    mode: max
     save_top_k: 1
     save_last: true
 
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: validation/total_loss_epoch
+    monitor: validation/avg_task_performance_epoch
     patience: 5
-    mode: min
+    mode: max
 
 dataset:
   split_strategy: class_partition
@@ -82,5 +82,5 @@ orchestrator:
   l2_normalization: false
 
 optimization:
-  objective_metric: validation/total_loss_epoch
+  objective_metric: validation/avg_task_performance_epoch
   run_test: true

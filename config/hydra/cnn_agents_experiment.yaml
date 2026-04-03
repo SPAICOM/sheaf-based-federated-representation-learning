@@ -1,9 +1,9 @@
 defaults:
-  - _self_
   - dataset: cifar10
   - model: cnn_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
+  - _self_
 
 seed: 42
 
