@@ -9,6 +9,8 @@ with explicit semantic correspondence keys so neighboring agents are aligned
 only on class-consistent anchors.
 """
 
+from dataclasses import replace
+
 import torch
 import torch.nn as nn
 
@@ -17,6 +19,7 @@ from src.utils.anchors import (
     AnchorConfig,
     build_anchor_bundles,
     build_semantic_pilot_bundles,
+    filter_anchor_bundles,
     shared_anchor_rows,
     supported_anchor_strategy,
 )
@@ -43,8 +46,8 @@ class SheafFRL(BaseOrchestrator):
         Dictionary mapping agent indices to their latent space dimensions.
     anchor_strategy : str
         Strategy for selecting anchors. Supported values:
-        'prototype', 'random', 'balanced', 'semantic_pilots',
-        'clustered_pilots', and 'dynamic'.
+        'prototype', 'uniform', 'diversity', 'semantic_pilots',
+        'clustering', and 'dynamic'.
     num_anchors : int
         Number of anchors to select per epoch.
     parseval_normalization : bool
@@ -70,6 +73,9 @@ class SheafFRL(BaseOrchestrator):
         parseval_normalization: bool,
         l2_normalization: bool,
         parseval_eps: float = 1e-4,
+        dynamic_persistent_ratio: float = 0.25,
+        dynamic_candidate_multiplier: int = 2,
+        dynamic_refresh_interval: int = 10,
         **kwargs,
     ):
         super().__init__(
@@ -92,6 +98,7 @@ class SheafFRL(BaseOrchestrator):
         # Per-agent semantic anchor identifiers. For class-based strategies
         # these are class labels; for semantic pilots: shared sample ids.
         self.epoch_anchor_ids: dict[int, list[torch.Tensor]] = {}
+        self.dynamic_persistent_keys: set[tuple[int, int]] = set()
 
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
@@ -128,6 +135,142 @@ class SheafFRL(BaseOrchestrator):
                         stiefel_matrix, requires_grad=False
                     )
 
+    def _dynamic_candidate_config(self) -> AnchorConfig:
+        """Build the larger candidate budget used by dynamic anchors."""
+        candidate_budget = max(
+            int(self.hparams.num_anchors),
+            int(self.hparams.num_anchors)
+            * max(1, int(self.hparams.dynamic_candidate_multiplier)),
+        )
+        return replace(
+            self.anchor_config,
+            strategy='clustering',
+            num_anchors=candidate_budget,
+        )
+
+    def _dynamic_key_scores(
+        self,
+        candidate_tensors: dict[int, torch.Tensor],
+        candidate_keys: dict[int, list[tuple[int, int]]],
+    ) -> dict[tuple[int, int], float]:
+        """Score semantic anchor keys by current cross-client disagreement."""
+        scores: dict[tuple[int, int], float] = {}
+
+        for edge_key, V in self.stiefel_matrices.items():
+            node_i, node_j = map(int, edge_key.split('_'))
+            if node_i not in candidate_tensors or node_j not in candidate_tensors:
+                continue
+
+            keys_i = candidate_keys.get(node_i, [])
+            keys_j = candidate_keys.get(node_j, [])
+            if not keys_i or not keys_j:
+                continue
+
+            key_to_idx_i = {key: pos for pos, key in enumerate(keys_i)}
+            key_to_idx_j = {key: pos for pos, key in enumerate(keys_j)}
+            shared_keys = sorted(set(key_to_idx_i) & set(key_to_idx_j))
+
+            for key in shared_keys:
+                row_i = candidate_tensors[node_i][key_to_idx_i[key]]
+                row_j = candidate_tensors[node_j][key_to_idx_j[key]]
+                residual = row_i - torch.matmul(row_j, V.T)
+                score = float(residual.pow(2).sum().detach().cpu().item())
+                scores[key] = scores.get(key, 0.0) + score
+
+        return scores
+
+    def _select_dynamic_keys(
+        self,
+        candidate_keys: dict[int, list[tuple[int, int]]],
+        scores: dict[tuple[int, int], float],
+        *,
+        update_persistent: bool,
+        batch_idx: int,
+    ) -> set[tuple[int, int]]:
+        """Combine a persistent subset with refreshed disagreement anchors."""
+        available_keys = set()
+        for keys in candidate_keys.values():
+            available_keys.update(keys)
+        if not available_keys:
+            return set()
+
+        ranked_keys = sorted(
+            available_keys,
+            key=lambda key: (-scores.get(key, 0.0), key),
+        )
+
+        total_budget = max(1, int(self.hparams.num_anchors))
+        persistent_budget = min(
+            total_budget,
+            max(
+                1,
+                int(
+                    round(
+                        total_budget
+                        * float(self.hparams.dynamic_persistent_ratio)
+                    )
+                ),
+            ),
+        )
+        refresh_budget = max(0, total_budget - persistent_budget)
+
+        persistent_keys = [
+            key
+            for key in ranked_keys
+            if key in self.dynamic_persistent_keys
+        ][:persistent_budget]
+
+        refreshed_keys = [
+            key for key in ranked_keys if key not in set(persistent_keys)
+        ][:refresh_budget]
+
+        selected_keys = list(dict.fromkeys(persistent_keys + refreshed_keys))
+        if len(selected_keys) < total_budget:
+            for key in ranked_keys:
+                if key not in selected_keys:
+                    selected_keys.append(key)
+                if len(selected_keys) == total_budget:
+                    break
+
+        if (
+            update_persistent
+            and batch_idx % max(1, int(self.hparams.dynamic_refresh_interval))
+            == 0
+        ):
+            self.dynamic_persistent_keys = set(ranked_keys[:persistent_budget])
+
+        return set(selected_keys)
+
+    def _build_dynamic_anchor_bundles(
+        self,
+        latents: dict[int, torch.Tensor],
+        anchor_ids_per_agent: dict[int, torch.Tensor],
+        *,
+        update_persistent: bool,
+        batch_idx: int,
+    ) -> tuple[dict[int, torch.Tensor], dict[int, list[tuple[int, int]]]]:
+        """Build dynamic anchors from a persistent plus refreshed subset."""
+        candidate_tensors, candidate_keys = build_anchor_bundles(
+            latents,
+            anchor_ids_per_agent,
+            self._dynamic_candidate_config(),
+        )
+        if not candidate_tensors:
+            return candidate_tensors, candidate_keys
+
+        scores = self._dynamic_key_scores(candidate_tensors, candidate_keys)
+        selected_keys = self._select_dynamic_keys(
+            candidate_keys,
+            scores,
+            update_persistent=update_persistent,
+            batch_idx=batch_idx,
+        )
+        return filter_anchor_bundles(
+            candidate_tensors,
+            candidate_keys,
+            selected_keys,
+        )
+
     def on_train_epoch_start(self) -> None:
         """Initialize/reset per-agent anchor and label buffers."""
         for idx_str in self.agents:
@@ -156,14 +299,20 @@ class SheafFRL(BaseOrchestrator):
         if not A_dict_raw:
             return
 
-        if (
-            supported_anchor_strategy(self.anchor_config.strategy)
-            == 'semantic_pilots'
-        ):
+        strategy = supported_anchor_strategy(self.anchor_config.strategy)
+
+        if strategy == 'semantic_pilots':
             A_dict, anchor_keys = build_semantic_pilot_bundles(
                 A_dict_raw,
                 anchor_ids_per_agent,
                 self.anchor_config,
+            )
+        elif strategy == 'dynamic':
+            A_dict, anchor_keys = self._build_dynamic_anchor_bundles(
+                A_dict_raw,
+                anchor_ids_per_agent,
+                update_persistent=False,
+                batch_idx=0,
             )
         else:
             A_dict, anchor_keys = build_anchor_bundles(
@@ -331,6 +480,19 @@ class SheafFRL(BaseOrchestrator):
                     self.epoch_anchors[idx].append(A_pilot.detach().cpu())
                     self.epoch_anchor_ids[idx].append(
                         pilot_ids_per_agent[idx].detach().cpu()
+                    )
+        elif strategy == 'dynamic':
+            batch_latents, batch_anchor_keys = self._build_dynamic_anchor_bundles(
+                raw_latents,
+                labels_per_agent,
+                update_persistent=(prefix == 'train'),
+                batch_idx=batch_idx,
+            )
+            if prefix == 'train':
+                for idx, A_batch_raw in raw_latents.items():
+                    self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
+                    self.epoch_anchor_ids[idx].append(
+                        labels_per_agent[idx].detach().cpu()
                     )
         else:
             batch_latents, batch_anchor_keys = build_anchor_bundles(

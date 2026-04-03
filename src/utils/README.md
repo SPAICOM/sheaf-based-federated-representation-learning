@@ -6,13 +6,21 @@ This module contains various utility functions and classes used throughout the f
 
 ### Anchor Management
 - [`anchors.py`](anchors.py): Functions for building anchor bundles, managing anchor strategies, and handling semantic pilot anchors for federated learning alignment.
-  - **Purpose**: Implements anchor selection strategies for computing alignment in sheaf-based federated learning
+  - **Purpose**: Implements mathematically distinct anchor selection strategies for computing alignment in sheaf-based federated learning
   - **Key Functions**:
-    - `build_anchor_bundles`: Creates anchor bundles for standard strategies (prototype, random, balanced)
+    - `build_anchor_bundles`: Creates anchor bundles for class-keyed strategies
     - `build_semantic_pilot_bundles`: Creates anchor bundles for semantic pilot strategies
+    - `filter_anchor_bundles`: Restricts candidate anchors to a chosen semantic subset
     - `shared_anchor_rows`: Finds shared anchors between agents for alignment computation
     - `supported_anchor_strategy`: Validates and returns normalized anchor strategy names
     - `AnchorConfig`: Configuration class for anchor selection parameters
+  - **Strategies**:
+    - `prototype`: one prototype per observed class
+    - `uniform`: Monte Carlo baseline over raw latent samples, with budget allocated proportionally to class frequency
+    - `diversity`: diversity-aware farthest-point anchors within each class
+    - `clustering`: centroid anchors from latent-space clustering within each class
+    - `semantic_pilots`: anchors keyed by shared pilot sample ids
+    - `dynamic`: disagreement-driven subset chosen in `SheafFRL` from a larger candidate pool
   - **Usage**: Used by orchestrators to select anchors for computing cross-covariance matrices and alignment
 
 ### Communication Tracking
@@ -90,7 +98,8 @@ import torch
 anchor_config = AnchorConfig(
     strategy='prototype',
     num_anchors=5,
-    parseval_normalization=True
+    parseval_normalization=True,
+    l2_normalization=False,
 )
 
 # Simulate agent features and labels
@@ -109,7 +118,7 @@ A_dict, anchor_keys = build_anchor_bundles(
     agent_labels,
     anchor_config
 )
-# Returns selected anchor features and their indices for each agent
+# Returns selected anchor matrices plus semantic keys for each row
 
 # Example: Partitioning data for non-IID federated learning
 from src.utils.data_partitioner import dirichlet_partition

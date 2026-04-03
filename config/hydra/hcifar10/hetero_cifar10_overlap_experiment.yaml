@@ -27,7 +27,8 @@ graph:
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: sheaf-repr-learning__hetero-cifar10-overlap
-  name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+  group: sweep_Hcifar10_homo_arch
+  name: trial_${hydra.job.num}
   save_dir: logs/
   log_model: false
 
@@ -61,7 +62,7 @@ dataset:
   split_strategy: class_partition
   n_agents: 4
   shared_classes: 2
-  batch_size: 64
+  batch_size: 128
   num_workers: 4
   mode: min_size
   pilot_split: 0.05

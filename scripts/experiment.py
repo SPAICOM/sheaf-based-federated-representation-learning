@@ -25,6 +25,33 @@ from src.utils import remove_non_empty_dir
 from src.utils.graph_generator import generate_neighbors
 
 
+def _finish_active_wandb_run() -> None:
+    """Close any active WandB run before starting a new trial."""
+    try:
+        import wandb
+    except ImportError:
+        return None
+
+    if getattr(wandb, 'run', None) is not None:
+        wandb.finish()
+    return None
+
+
+def _update_logger_config(logger: Any, payload: dict[str, Any]) -> None:
+    """Update WandB config while allowing resolved metadata overrides."""
+    if logger is None:
+        return None
+    sanitized_payload = _json_ready(payload)
+    try:
+        logger.experiment.config.update(
+            sanitized_payload,
+            allow_val_change=True,
+        )
+    except TypeError:
+        logger.experiment.config.update(sanitized_payload)
+    return None
+
+
 def _resolve_agent_overrides(
     cfg: DictConfig,
     *,
@@ -225,11 +252,12 @@ def main(cfg: DictConfig) -> float:
     RESULTS_PATH: Path = CURRENT / 'results/'
     RESULTS_PATH.mkdir(exist_ok=True, parents=True)
 
+    _finish_active_wandb_run()
     logger = instantiate(cfg.logger)
-    if logger is not None:
-        logger.experiment.config.update(
-            OmegaConf.to_container(cfg, resolve=True)
-        )
+    _update_logger_config(
+        logger,
+        OmegaConf.to_container(cfg, resolve=True),
+    )
 
     callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
 
@@ -273,13 +301,13 @@ def main(cfg: DictConfig) -> float:
         for agent_idx, num_agent_classes in datamodule.num_classes.items()
         if isinstance(agent_idx, int)
     }
-    if logger is not None:
-        logger.experiment.config.update(
-            {
-                'resolved_agent_classes': resolved_agent_classes,
-                'resolved_num_classes_per_agent': resolved_num_classes_per_agent,
-            }
-        )
+    _update_logger_config(
+        logger,
+        {
+            'resolved_agent_classes': resolved_agent_classes,
+            'resolved_num_classes_per_agent': resolved_num_classes_per_agent,
+        },
+    )
 
     num_classes = datamodule.num_classes.get('label')
     if num_classes is None:
@@ -387,15 +415,15 @@ def main(cfg: DictConfig) -> float:
         test_results=test_results,
         datamodule=datamodule,
     )
-    if logger is not None:
-        logger.experiment.config.update({'results_file': str(result_file)})
+    _update_logger_config(logger, {'results_file': str(result_file)})
 
     # Clean up temporary directories created by Hydra, WandB, and Lightning
     # These directories can accumulate over multiple experiment runs
-    remove_non_empty_dir('./multirun/')
-    remove_non_empty_dir('./outputs/')
+    #remove_non_empty_dir('./multirun/')
+    #remove_non_empty_dir('./outputs/')
     remove_non_empty_dir('~/.cache/wandb/')
     remove_non_empty_dir(cfg.logger.project)
+    _finish_active_wandb_run()
     return objective_value
 
 

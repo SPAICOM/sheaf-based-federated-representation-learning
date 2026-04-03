@@ -7,4 +7,4 @@ hydra:
   sweeper:
     params:
       orchestrator: sheaf_frl,sheaf_fmtl,federated,dpsgd,dfedu,non_cooperative
-      dataset.shared_classes: 2,3,4,5,6,7,8,9,10
+      dataset.shared_classes: 2,4,6,8,10

@@ -1,8 +1,0 @@
-optuna: 'we can conclude that your projects requirements are
-      unsatisfiable.
-
-      hint: While the active Python version is 3.12, the resolution failed for other
-      Python versions supported by your project. Consider limiting your projects' is not an optuna command. See 'optuna --help'.
-Did you mean one of these?
-  help
-  tell

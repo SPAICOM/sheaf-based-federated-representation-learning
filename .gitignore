@@ -234,6 +234,8 @@ review/
 
 # Project specific ignores
 logs/
+tests/test_*
+results/
 
 # Config files - ignore hetero_cifar10 and rotated_mnist experiments
 config/hydra/rotated_mnist_anchor_sweep.yaml

@@ -1,0 +1,20 @@
+defaults:
+  - hetero_cifar10_overlap_experiment
+  - override hydra/sweeper: optuna
+  - _self_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    direction: minimize
+    study_name: hetero_cifar10_overlap_sheaf_frl
+    n_trials: 25
+    n_jobs: 1
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: ${seed}
+    params:
+      orchestrator.lambda_sheaf: choice(1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1e0)
+      orchestrator.anchor_strategy: choice(prototype,uniform,diversity,semantic_pilots,clustering,dynamic)
+      orchestrator.num_anchors: choice(32,64,128,256)
+      dataset.shared_classes: choice(2,4,6,8,10)

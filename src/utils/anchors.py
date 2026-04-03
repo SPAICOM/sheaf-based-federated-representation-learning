@@ -12,11 +12,19 @@ AnchorTensors = dict[int, torch.Tensor]
 
 VALID_ANCHOR_STRATEGIES = {
     'prototype',
-    'random',
-    'balanced',
+    'uniform',
+    'diversity',
     'semantic_pilots',
-    'clustered_pilots',
+    'clustering',
     'dynamic',
+}
+
+LEGACY_ANCHOR_STRATEGY_ALIASES = {
+    'random': 'uniform',
+    'balanced': 'diversity',
+    'geometric': 'diversity',
+    'diversity_pilots': 'dynamic',
+    'clustered_pilots': 'clustering',
 }
 
 
@@ -33,7 +41,10 @@ class AnchorConfig:
 
 def supported_anchor_strategy(anchor_strategy: str) -> str:
     """Validate and normalize the configured anchor strategy name."""
-    strategy = str(anchor_strategy)
+    strategy = LEGACY_ANCHOR_STRATEGY_ALIASES.get(
+        str(anchor_strategy),
+        str(anchor_strategy),
+    )
     if strategy not in VALID_ANCHOR_STRATEGIES:
         raise ValueError(
             f'Unknown anchor_strategy: {strategy}. Valid options: '
@@ -110,7 +121,25 @@ def sorted_global_classes(
     return sorted(int(label) for label in torch.unique(all_labels).tolist())
 
 
-def build_balanced_class_plan(
+def _global_class_counts(
+    labels_per_agent: dict[int, torch.Tensor],
+) -> dict[int, int]:
+    """Count how often each class appears across all agents."""
+    counts: dict[int, int] = {}
+    for labels in labels_per_agent.values():
+        unique_labels, class_counts = torch.unique(
+            labels.detach().cpu(),
+            return_counts=True,
+        )
+        for class_label, count in zip(
+            unique_labels.tolist(), class_counts.tolist()
+        ):
+            class_idx = int(class_label)
+            counts[class_idx] = counts.get(class_idx, 0) + int(count)
+    return counts
+
+
+def build_coverage_class_plan(
     global_classes: list[int],
     *,
     num_anchors: int,
@@ -120,13 +149,10 @@ def build_balanced_class_plan(
         return {}
 
     budget = max(1, int(num_anchors))
-    class_order = [
-        global_classes[idx]
-        for idx in torch.randperm(len(global_classes)).tolist()
-    ]
+    class_order = list(global_classes)
 
     if budget <= len(class_order):
-        return dict.fromkeys(class_order[:budget], 1)
+        return {class_label: 1 for class_label in class_order[:budget]}
 
     plan = dict.fromkeys(class_order, 1)
     remaining = budget - len(class_order)
@@ -139,22 +165,69 @@ def build_balanced_class_plan(
     return plan
 
 
-def build_random_class_plan(
-    global_classes: list[int],
+def build_proportional_class_plan(
+    labels_per_agent: dict[int, torch.Tensor],
     *,
     num_anchors: int,
 ) -> dict[int, int]:
-    """Sample a random class allocation plan under the anchor budget."""
-    if not global_classes:
+    """Allocate anchor budget proportionally to the empirical class mass."""
+    class_counts = _global_class_counts(labels_per_agent)
+    if not class_counts:
         return {}
 
+    ordered_classes = sorted(class_counts)
     budget = max(1, int(num_anchors))
-    draws = torch.randint(len(global_classes), (budget,))
-    plan: dict[int, int] = {}
-    for draw in draws.tolist():
-        class_label = global_classes[draw]
-        plan[class_label] = plan.get(class_label, 0) + 1
-    return plan
+    if budget <= len(ordered_classes):
+        selected = sorted(
+            ordered_classes,
+            key=lambda class_label: (
+                -class_counts[class_label],
+                class_label,
+            ),
+        )[:budget]
+        return {class_label: 1 for class_label in sorted(selected)}
+
+    total_count = sum(class_counts.values())
+    fractional_targets = {
+        class_label: budget * class_counts[class_label] / total_count
+        for class_label in ordered_classes
+    }
+    plan = {
+        class_label: max(1, int(fractional_targets[class_label]))
+        for class_label in ordered_classes
+    }
+    allocated = sum(plan.values())
+
+    if allocated > budget:
+        removable = sorted(
+            ordered_classes,
+            key=lambda class_label: (
+                fractional_targets[class_label] - plan[class_label],
+                class_label,
+            ),
+        )
+        for class_label in removable:
+            while allocated > budget and plan[class_label] > 1:
+                plan[class_label] -= 1
+                allocated -= 1
+            if allocated == budget:
+                break
+    elif allocated < budget:
+        expandable = sorted(
+            ordered_classes,
+            key=lambda class_label: (
+                plan[class_label] - fractional_targets[class_label],
+                class_label,
+            ),
+        )
+        cursor = 0
+        while allocated < budget:
+            class_label = expandable[cursor % len(expandable)]
+            plan[class_label] += 1
+            allocated += 1
+            cursor += 1
+
+    return {class_label: count for class_label, count in plan.items() if count > 0}
 
 
 def build_class_anchor_plan(
@@ -168,13 +241,13 @@ def build_class_anchor_plan(
     match strategy:
         case 'prototype':
             return dict.fromkeys(global_classes, 1)
-        case 'balanced' | 'clustered_pilots' | 'dynamic':
-            return build_balanced_class_plan(
-                global_classes,
+        case 'uniform':
+            return build_proportional_class_plan(
+                labels_per_agent,
                 num_anchors=config.num_anchors,
             )
-        case 'random':
-            return build_random_class_plan(
+        case 'diversity' | 'clustering' | 'dynamic':
+            return build_coverage_class_plan(
                 global_classes,
                 num_anchors=config.num_anchors,
             )
@@ -182,37 +255,37 @@ def build_class_anchor_plan(
             raise ValueError(f'Unsupported anchor strategy: {strategy}')
 
 
-def class_distance_order(class_latents: torch.Tensor) -> torch.Tensor:
-    """Order class samples from most central to most peripheral."""
-    class_center = class_latents.mean(dim=0, keepdim=True)
-    distances = torch.linalg.vector_norm(class_latents - class_center, dim=1)
-    return torch.argsort(distances)
+def farthest_point_indices(
+    anchor_source: torch.Tensor,
+    n_points: int,
+) -> torch.Tensor:
+    """Select a diverse subset with farthest-point sampling to ensure geometric coverage."""
+    if n_points < 1 or len(anchor_source) == 0:
+        return torch.empty(0, dtype=torch.long, device=anchor_source.device)
 
+    valid_points = min(int(n_points), len(anchor_source))
+    source = anchor_source.detach()
+    center = source.mean(dim=0, keepdim=True)
+    distances_to_center = torch.linalg.vector_norm(source - center, dim=1)
+    first_idx = int(torch.argmax(distances_to_center).item())
 
-def chunk_mean_anchors(
-    class_latents: torch.Tensor,
-    n_slots: int,
-    ordered_indices: torch.Tensor | None = None,
-) -> list[torch.Tensor]:
-    """Split class samples into chunks and average each chunk."""
-    if n_slots < 1 or len(class_latents) == 0:
-        return []
+    selected = [first_idx]
+    min_distances = torch.cdist(source, source[first_idx : first_idx + 1]).squeeze(
+        1
+    )
 
-    valid_slots = min(int(n_slots), len(class_latents))
-    if ordered_indices is None:
-        ordered_indices = torch.randperm(
-            len(class_latents),
-            device=class_latents.device,
-        )
-    else:
-        ordered_indices = ordered_indices[: len(class_latents)]
+    while len(selected) < valid_points:
+        candidate_idx = int(torch.argmax(min_distances).item())
+        if candidate_idx in selected:
+            break
+        selected.append(candidate_idx)
+        candidate_distances = torch.cdist(
+            source,
+            source[candidate_idx : candidate_idx + 1],
+        ).squeeze(1)
+        min_distances = torch.minimum(min_distances, candidate_distances)
 
-    splits = torch.tensor_split(ordered_indices, valid_slots)
-    return [
-        class_latents[split].mean(dim=0)
-        for split in splits
-        if split.numel() > 0
-    ]
+    return torch.tensor(selected, dtype=torch.long, device=anchor_source.device)
 
 
 def random_sample_anchors(
@@ -231,6 +304,64 @@ def random_sample_anchors(
     return [class_latents[idx] for idx in perm.tolist()]
 
 
+def diversity_sample_anchors(
+    class_latents: torch.Tensor,
+    n_slots: int,
+) -> list[torch.Tensor]:
+    """Use farthest-point sampling to cover each class with diverse anchors."""
+    selected = farthest_point_indices(class_latents, n_slots)
+    return [class_latents[idx] for idx in selected.tolist()]
+
+
+def cluster_centroid_anchors(
+    class_latents: torch.Tensor,
+    n_slots: int,
+    *,
+    max_iter: int = 10,
+) -> list[torch.Tensor]:
+    """Approximate K-means centroids for class-conditioned coverage."""
+    if n_slots < 1 or len(class_latents) == 0:
+        return []
+
+    valid_slots = min(int(n_slots), len(class_latents))
+    if valid_slots == len(class_latents):
+        return [class_latents[idx] for idx in range(len(class_latents))]
+
+    with torch.no_grad():
+        init_idx = farthest_point_indices(class_latents, valid_slots)
+        source = class_latents.detach()
+        centers = source.index_select(0, init_idx)
+
+        for _ in range(max_iter):
+            distances = torch.cdist(source, centers)
+            assignments = torch.argmin(distances, dim=1)
+
+            new_centers = []
+            for cluster_idx in range(valid_slots):
+                mask = assignments == cluster_idx
+                if mask.any():
+                    new_centers.append(source[mask].mean(dim=0))
+                else:
+                    new_centers.append(centers[cluster_idx])
+            new_centers = torch.stack(new_centers)
+
+            if torch.allclose(new_centers, centers):
+                centers = new_centers
+                break
+            centers = new_centers
+
+        final_distances = torch.cdist(source, centers)
+        assignments = torch.argmin(final_distances, dim=1)
+
+    centroids: list[torch.Tensor] = []
+    for cluster_idx in range(valid_slots):
+        mask = assignments == cluster_idx
+        if mask.any():
+            centroids.append(class_latents[mask].mean(dim=0))
+
+    return centroids
+
+
 def build_class_anchors(
     class_latents: torch.Tensor,
     n_slots: int,
@@ -244,16 +375,12 @@ def build_class_anchors(
     match strategy:
         case 'prototype':
             return [class_latents.mean(dim=0)]
-        case 'random':
+        case 'uniform':
             return random_sample_anchors(class_latents, n_slots)
-        case 'balanced' | 'dynamic':
-            return chunk_mean_anchors(class_latents, n_slots)
-        case 'clustered_pilots':
-            return chunk_mean_anchors(
-                class_latents=class_latents,
-                n_slots=n_slots,
-                ordered_indices=class_distance_order(class_latents),
-            )
+        case 'diversity' | 'dynamic':
+            return diversity_sample_anchors(class_latents, n_slots)
+        case 'clustering':
+            return cluster_centroid_anchors(class_latents, n_slots)
         case _:
             raise ValueError(f'Unsupported anchor strategy: {strategy}')
 
@@ -338,6 +465,34 @@ def build_semantic_pilot_bundles(
     return anchor_tensors, anchor_keys
 
 
+def filter_anchor_bundles(
+    anchor_tensors: AnchorTensors,
+    anchor_keys: AnchorKeys,
+    selected_keys: set[tuple[int, int]],
+) -> tuple[AnchorTensors, AnchorKeys]:
+    """Keep only anchor rows whose semantic keys were selected."""
+    filtered_tensors: AnchorTensors = {}
+    filtered_keys: AnchorKeys = {}
+
+    for idx, anchors in anchor_tensors.items():
+        keys = anchor_keys.get(idx, [])
+        keep_positions = [
+            pos for pos, key in enumerate(keys) if key in selected_keys
+        ]
+        if not keep_positions:
+            continue
+
+        indices = torch.tensor(
+            keep_positions,
+            dtype=torch.long,
+            device=anchors.device,
+        )
+        filtered_tensors[idx] = anchors.index_select(0, indices)
+        filtered_keys[idx] = [keys[pos] for pos in keep_positions]
+
+    return filtered_tensors, filtered_keys
+
+
 def shared_anchor_rows(
     A_i: torch.Tensor,
     keys_i: list[tuple[int, int]],
@@ -376,6 +531,7 @@ __all__ = [
     'build_anchor_bundles',
     'build_class_anchor_plan',
     'build_semantic_pilot_bundles',
+    'filter_anchor_bundles',
     'l2_normalize',
     'normalize_anchor_matrix',
     'parseval_normalize',

@@ -6,6 +6,9 @@ parseval_normalization: False
 l2_normalization: False
 parseval_eps: 0.01
 num_anchors: 128
+dynamic_persistent_ratio: 0.25
+dynamic_candidate_multiplier: 2
+dynamic_refresh_interval: 10
 
 neighbors: {}
 
