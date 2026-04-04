@@ -18,6 +18,7 @@ from .anchors import (
 from .communication import calculate_communication_cost
 from .data_partitioner import (
     build_shared_class_partition,
+    partition_by_agent_classes,
     partition_non_iid,
 )
 from .graph_generator import generate_neighbors
@@ -30,6 +31,7 @@ __all__ = [
     'build_shared_class_partition',
     'calculate_communication_cost',
     'generate_neighbors',
+    'partition_by_agent_classes',
     'partition_non_iid',
     'remove_non_empty_dir',
     'shared_anchor_rows',

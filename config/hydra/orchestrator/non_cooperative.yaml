@@ -1,9 +1,1 @@
 _target_: src.orchestrators.NonCooperativeLearning
-
-anchor_strategy: "prototype"
-num_anchors: 0
-parseval_normalization: false
-l2_normalization: false
-
-agents: null
-neighbors: {}

@@ -66,6 +66,12 @@ val_loader = datamodule.val_dataloader()
 test_loader = datamodule.test_dataloader()
 ```
 
+Supported `split_strategy` values include:
+
+- `uniform`: splits each dataset partition evenly across agents.
+- `class_partition`: creates a partial label-overlap federated setting with disjoint local datasets. Each sample belongs to exactly one agent, so no example is duplicated across clients in train/val/test. When `shared_classes = k`, exactly `k` class labels are assigned to every agent, while the remaining labels are distributed across agents. For shared labels, agents see different local samples from the same class rather than replicated examples.
+- `non_iid`: assigns each agent a subset of classes and distributes samples with Dirichlet-drawn proportions to create label and quantity skew.
+
 ### Utility Functions
 
 #### compute_split_indices

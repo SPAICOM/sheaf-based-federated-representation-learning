@@ -26,6 +26,7 @@ from src.datamodules.utils import (
 )
 from src.utils.data_partitioner import (
     build_shared_class_partition,
+    partition_by_agent_classes,
     partition_non_iid,
 )
 
@@ -409,35 +410,51 @@ class ClassificationDataModule(l.LightningDataModule):
                 'dataset.shared_classes to generate them automatically'
             )
 
-        for i in range(self.n_agents):
-            allowed_classes = self.agent_classes.get(i, None)
-            if allowed_classes is None:
-                allowed = set(train[label_key])
-            else:
-                allowed = set(allowed_classes)
-            train_idx = self._filter_by_classes(train, allowed)
-            val_idx = self._filter_by_classes(val, allowed)
-            test_idx = self._filter_by_classes(test, allowed)
+        split_partitions = {
+            'train_datasets': partition_by_agent_classes(
+                labels=train[label_key],
+                agent_classes=self.agent_classes,
+                n_agents=self.n_agents,
+                seed=self.seed,
+            ),
+            'val_datasets': partition_by_agent_classes(
+                labels=val[label_key],
+                agent_classes=self.agent_classes,
+                n_agents=self.n_agents,
+                seed=self.seed + 1,
+            ),
+            'test_datasets': partition_by_agent_classes(
+                labels=test[label_key],
+                agent_classes=self.agent_classes,
+                n_agents=self.n_agents,
+                seed=self.seed + 2,
+            ),
+        }
 
-            rotation = self.agent_rotations.get(i, 0)
-            self.train_datasets[i] = ClassificationDataset(
-                train.select(train_idx),
-                self.data_key,
-                label_key,
-                rotation_angle=rotation,
-            )
-            self.val_datasets[i] = ClassificationDataset(
-                val.select(val_idx),
-                self.data_key,
-                label_key,
-                rotation_angle=rotation,
-            )
-            self.test_datasets[i] = ClassificationDataset(
-                test.select(test_idx),
-                self.data_key,
-                label_key,
-                rotation_angle=rotation,
-            )
+        for split_data, target_dict in [
+            (train, 'train_datasets'),
+            (val, 'val_datasets'),
+            (test, 'test_datasets'),
+        ]:
+            partition = split_partitions[target_dict]
+            for i in range(self.n_agents):
+                allowed = set(self.agent_classes.get(i, []))
+                if not allowed:
+                    raise ValueError(
+                        f'agent {i} has no assigned classes in agent_classes'
+                    )
+                split_idx = partition[i]
+
+                rotation = self.agent_rotations.get(i, 0)
+                getattr(self, target_dict)[i] = ClassificationDataset(
+                    split_data.select(split_idx),
+                    self.data_key,
+                    label_key,
+                    rotation_angle=rotation,
+                )
+
+        for i in range(self.n_agents):
+            allowed = set(self.agent_classes.get(i, []))
             self.num_classes[i] = len(allowed)
 
     def _split_data_non_iid(self, train, val, test, label_key: str) -> None:

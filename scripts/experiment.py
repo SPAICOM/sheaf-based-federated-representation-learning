@@ -243,7 +243,7 @@ def main(cfg: DictConfig) -> float:
 
     objective_metric_name = str(
         cfg.get('optimization', {}).get(
-            'objective_metric', 'validation/total_loss_epoch'
+            'objective_metric', 'validation/global_task_performance_epoch'
         )
     )
     run_test = bool(cfg.get('optimization', {}).get('run_test', True))

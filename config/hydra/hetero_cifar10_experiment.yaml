@@ -26,8 +26,8 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__hetero-cifar10-sheaf_frl
-  group: sweep_${orchestrator.anchor_strategy}
+  project: sheaf-repr-learning__hetero-cifar10
+  group: ${study_name}
   name: trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
@@ -47,22 +47,28 @@ callbacks:
 
   checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    monitor: validation/avg_task_performance_epoch
+    monitor: validation/global_task_performance_epoch
     mode: max
     save_top_k: 1
     save_last: true
 
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: validation/avg_task_performance_epoch
+    monitor: validation/global_task_performance_epoch
     patience: 5
     mode: max
 
 dataset:
+  # Partial label-overlap federated setting with disjoint local datasets.
+  # Each client receives unique local samples only: no example is duplicated
+  # across clients in train/val/test. Exactly `shared_classes` labels are
+  # shared across all clients, while the remaining classes are distributed
+  # non-uniformly across clients. For shared labels, clients observe different
+  # samples from the same class rather than replicated examples.
   split_strategy: class_partition
   n_agents: 4
   shared_classes: 2
-  batch_size: 128
+  batch_size: 256
   num_workers: 4
   mode: min_size
   pilot_split: 0.05
@@ -82,5 +88,5 @@ orchestrator:
   l2_normalization: false
 
 optimization:
-  objective_metric: validation/avg_task_performance_epoch
+  objective_metric: validation/global_task_performance_epoch
   run_test: true

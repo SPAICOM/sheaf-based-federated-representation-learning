@@ -1,0 +1,6 @@
+_target_: src.orchestrators.FedPer
+
+local_steps: 4
+global_steps: 100
+sample_counts: null
+sync_on_train_start: true

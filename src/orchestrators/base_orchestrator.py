@@ -145,6 +145,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         agent_losses: dict[int, Any],
         agent_performances: dict[int, Any],
         batch_size: int,
+        agent_sample_counts: dict[int, int] | None = None,
         total_loss: torch.Tensor | None = None,
         extra_metrics: dict[str, Any] | None = None,
         prog_bar: bool = True,
@@ -197,6 +198,31 @@ class BaseOrchestrator(l.LightningModule, ABC):
             performances_tensor = torch.tensor([0.0], device=self.device)
             avg_performance = torch.tensor(0.0, device=self.device)
 
+        if agent_sample_counts:
+            sample_weights = torch.tensor(
+                [
+                    float(max(agent_sample_counts.get(idx, 0), 0))
+                    for idx in sorted(normalized_losses)
+                ],
+                device=self.device,
+            )
+        else:
+            sample_weights = torch.ones(
+                len(normalized_losses),
+                device=self.device,
+            )
+
+        if len(normalized_losses) > 0 and float(sample_weights.sum()) > 0.0:
+            global_task_loss = (
+                losses_tensor * sample_weights
+            ).sum() / sample_weights.sum()
+            global_task_performance = (
+                performances_tensor * sample_weights
+            ).sum() / sample_weights.sum()
+        else:
+            global_task_loss = torch.tensor(0.0, device=self.device)
+            global_task_performance = torch.tensor(0.0, device=self.device)
+
         resolved_total_loss = (
             total_task_loss
             if total_loss is None
@@ -205,8 +231,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         aggregate_logs = {
             f'{prefix}/task_loss_total_epoch': total_task_loss,
+            f'{prefix}/global_task_loss_epoch': global_task_loss,
             f'{prefix}/total_loss_epoch': resolved_total_loss,
             f'{prefix}/avg_task_performance_epoch': avg_performance,
+            f'{prefix}/global_task_performance_epoch': global_task_performance,
         }
         aggregate_logs.update(self._communication_metrics(prefix))
         if extra_metrics is not None:
@@ -242,6 +270,31 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if batch_sizes:
             return max(batch_sizes)
         return 1
+
+    def _resolve_agent_sample_counts(
+        self,
+        batch: dict[int, list[torch.Tensor]] | tuple[dict[int, list[torch.Tensor]]],
+    ) -> dict[int, int]:
+        """Infer per-agent sample counts from a combined multi-agent batch."""
+        if isinstance(batch, tuple):
+            batch = batch[0]
+
+        sample_counts: dict[int, int] = {}
+        for idx_str in self.agents:
+            idx = int(idx_str)
+            key = idx if idx in batch else idx_str
+            if key not in batch:
+                continue
+
+            values = batch[key]
+            if not isinstance(values, (list, tuple)) or len(values) == 0:
+                continue
+
+            x = values[0]
+            if isinstance(x, torch.Tensor) and x.ndim > 0:
+                sample_counts[idx] = int(x.shape[0])
+
+        return sample_counts
 
     @abstractmethod
     def on_train_epoch_end(self):

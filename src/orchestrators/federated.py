@@ -215,6 +215,7 @@ class FederatedLearning(BaseOrchestrator):
             agent_losses=agent_losses,
             agent_performances=agent_performances,
             batch_size=self._resolve_batch_size(batch),
+            agent_sample_counts=self._resolve_agent_sample_counts(batch),
         )
 
         return outputs, total_loss

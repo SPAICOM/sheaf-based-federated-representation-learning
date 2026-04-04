@@ -542,6 +542,7 @@ class SheafFRL(BaseOrchestrator):
             agent_losses=agent_losses,
             agent_performances=agent_performances,
             batch_size=self._resolve_batch_size(batch),
+            agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
             extra_metrics={f'{prefix}/sheaf_penalty': sheaf_penalty},
             prog_bar=False,

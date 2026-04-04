@@ -66,6 +66,59 @@ def build_shared_class_partition(
     }
 
 
+def partition_by_agent_classes(
+    labels: list[int],
+    agent_classes: dict[int, list[int]],
+    n_agents: int,
+    seed: int = 42,
+) -> dict[int, list[int]]:
+    """Partition indices disjointly while respecting per-agent class sets.
+
+    Each sample index is assigned to exactly one agent. For a class label
+    available to multiple agents, its examples are split approximately evenly
+    among those agents, preserving label overlap without duplicating samples.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    if labels_tensor.numel() == 0:
+        return {agent_id: [] for agent_id in range(n_agents)}
+
+    unique_classes = torch.unique(labels_tensor).tolist()
+    label_to_agents: dict[int, list[int]] = {}
+    for class_label in unique_classes:
+        assigned_agents = [
+            agent_id
+            for agent_id in range(n_agents)
+            if class_label in set(agent_classes.get(agent_id, []))
+        ]
+        if not assigned_agents:
+            raise ValueError(
+                f'class {class_label} is not assigned to any agent'
+            )
+        label_to_agents[int(class_label)] = sorted(assigned_agents)
+
+    partition = {agent_id: [] for agent_id in range(n_agents)}
+    generator = torch.Generator().manual_seed(seed)
+
+    for class_label in unique_classes:
+        class_indices = torch.where(labels_tensor == int(class_label))[0]
+        shuffled = class_indices[
+            torch.randperm(len(class_indices), generator=generator)
+        ].tolist()
+        assigned_agents = label_to_agents[int(class_label)]
+
+        for offset, sample_idx in enumerate(shuffled):
+            agent_id = assigned_agents[offset % len(assigned_agents)]
+            partition[agent_id].append(int(sample_idx))
+
+    for agent_id in range(n_agents):
+        partition[agent_id].sort()
+
+    return partition
+
+
 def _draw_dirichlet_proportions(
     n_parts: int,
     alpha: float,
