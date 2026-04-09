@@ -52,6 +52,17 @@ class DummyDataModule:
 
 
 class TestFedPer:
+    def test_default_schedule_is_epoch_based_without_round_cap(self):
+        orchestrator = FedPer(
+            agents={0: _make_agent(), 1: _make_agent()},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+        )
+
+        assert orchestrator.hparams.aggregation_interval == 1
+        assert orchestrator.hparams.aggregation_unit == 'epoch'
+        assert orchestrator.hparams.max_global_rounds is None
+
     def test_initialization_allows_personalized_heads(self):
         orchestrator = FedPer(
             agents={
@@ -121,8 +132,9 @@ class TestFedPer:
             agents={0: _make_agent(), 1: _make_agent()},
             neighbors={0: {1}, 1: {0}},
             optimizer=MockOptimizer(),
-            local_steps=2,
-            global_steps=1,
+            aggregation_interval=2,
+            aggregation_unit='step',
+            max_global_rounds=1,
             sync_on_train_start=False,
         )
 
@@ -148,3 +160,51 @@ class TestFedPer:
         assert calls == [2]
         assert orchestrator._global_aggregation_count == 1
         assert orchestrator._trainer.should_stop is True
+
+    def test_on_train_epoch_end_aggregates_on_epoch_schedule_and_stops(self):
+        orchestrator = FedPer(
+            agents={0: _make_agent(), 1: _make_agent()},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+            aggregation_interval=2,
+            aggregation_unit='epoch',
+            max_global_rounds=1,
+            sync_on_train_start=False,
+        )
+
+        calls = []
+
+        def _mark_sync():
+            calls.append(orchestrator.current_epoch + 1)
+
+        orchestrator._synchronize_base_layers = _mark_sync
+        orchestrator.log_dict = lambda *args, **kwargs: None
+        orchestrator._trainer = SimpleNamespace(
+            current_epoch=0,
+            should_stop=False,
+            datamodule=None,
+        )
+
+        orchestrator.on_train_epoch_end()
+        assert calls == []
+        assert orchestrator._trainer.should_stop is False
+
+        orchestrator._trainer.current_epoch = 1
+        orchestrator.on_train_epoch_end()
+
+        assert calls == [2]
+        assert orchestrator._global_aggregation_count == 1
+        assert orchestrator._trainer.should_stop is True
+
+    def test_legacy_step_aliases_are_supported(self):
+        orchestrator = FedPer(
+            agents={0: _make_agent(), 1: _make_agent()},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+            local_steps=4,
+            global_steps=100,
+        )
+
+        assert orchestrator.hparams.aggregation_interval == 4
+        assert orchestrator.hparams.aggregation_unit == 'step'
+        assert orchestrator.hparams.max_global_rounds == 100

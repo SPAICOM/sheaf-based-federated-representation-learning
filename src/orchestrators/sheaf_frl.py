@@ -148,6 +148,46 @@ class SheafFRL(BaseOrchestrator):
             num_anchors=candidate_budget,
         )
 
+    def _anchor_key_scalar_count(
+        self,
+        anchor_keys: list[int] | list[tuple[int, int]],
+    ) -> int:
+        """Count transmitted anchor-key scalars without using key values."""
+        scalar_count = 0
+        for key in anchor_keys:
+            if isinstance(key, tuple):
+                scalar_count += len(key)
+            else:
+                scalar_count += 1
+        return scalar_count
+
+    def _record_anchor_bundle_communication(
+        self,
+        anchor_tensors: dict[int, torch.Tensor],
+        anchor_keys: dict[int, list[int] | list[tuple[int, int]]],
+        *,
+        prefix: str,
+    ) -> None:
+        """Record one anchor-exchange round for all participating agents."""
+        total_transmissions = sum(
+            len(self.hparams.neighbors.get(idx, set())) for idx in anchor_tensors
+        )
+        if total_transmissions < 1:
+            return
+
+        self._record_communication_round(prefix=prefix)
+        for idx, anchors in anchor_tensors.items():
+            self._record_communication(
+                {
+                    'anchors': anchors,
+                    'anchor_key_scalar_count': self._anchor_key_scalar_count(
+                        anchor_keys.get(idx, [])
+                    ),
+                },
+                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
+                prefix=prefix,
+            )
+
     def _dynamic_key_scores(
         self,
         candidate_tensors: dict[int, torch.Tensor],
@@ -273,6 +313,7 @@ class SheafFRL(BaseOrchestrator):
 
     def on_train_epoch_start(self) -> None:
         """Initialize/reset per-agent anchor and label buffers."""
+        super().on_train_epoch_start()
         for idx_str in self.agents:
             idx = int(idx_str)
             self.epoch_anchors[idx] = []
@@ -282,6 +323,7 @@ class SheafFRL(BaseOrchestrator):
     def on_train_epoch_end(self) -> None:
         """Update Stiefel matrices using semantically shared anchors only."""
         if not self.epoch_anchors or not any(self.epoch_anchors.values()):
+            self._finalize_train_epoch_communication()
             return
 
         A_dict_raw: dict[int, torch.Tensor] = {}
@@ -321,16 +363,14 @@ class SheafFRL(BaseOrchestrator):
                 self.anchor_config,
             )
         if not A_dict:
+            self._finalize_train_epoch_communication()
             return
 
-        for idx, anchors in A_dict.items():
-            self._record_communication(
-                {
-                    'anchors': anchors,
-                    'anchor_keys': anchor_keys.get(idx, []),
-                },
-                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
-            )
+        self._record_anchor_bundle_communication(
+            A_dict,
+            anchor_keys,
+            prefix='train',
+        )
 
         param_device = next(iter(self.stiefel_matrices.values())).device
 
@@ -379,6 +419,8 @@ class SheafFRL(BaseOrchestrator):
             self.epoch_anchors[idx].clear()
         for idx in self.epoch_anchor_ids:
             self.epoch_anchor_ids[idx].clear()
+
+        self._finalize_train_epoch_communication()
 
     def _shared_eval(
         self,
@@ -506,6 +548,13 @@ class SheafFRL(BaseOrchestrator):
                     self.epoch_anchor_ids[idx].append(
                         labels_per_agent[idx].detach().cpu()
                     )
+
+        if prefix in {'train', 'test'} and batch_latents:
+            self._record_anchor_bundle_communication(
+                batch_latents,
+                batch_anchor_keys,
+                prefix=prefix,
+            )
 
         # Sheaf regularization penalty (evaluated on anchor set)
         sheaf_penalty = 0.0

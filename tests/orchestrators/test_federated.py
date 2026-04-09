@@ -3,8 +3,11 @@
 import pytest
 import torch
 from lightning.pytorch import Trainer
+from lightning.pytorch import LightningDataModule
+from torch.utils.data import DataLoader, TensorDataset
 
 from src.agents.cnn_classifier import CNNClassifier
+from src.agents.latent_classifier import LatentClassifier
 from src.datamodules.classification_datamodule import ClassificationDataModule
 from src.orchestrators.federated import FederatedLearning
 
@@ -14,6 +17,26 @@ class MockOptimizer:
 
     _target_ = 'torch.optim.Adam'
     lr = 0.001
+
+
+class _ToyFederatedDataModule(LightningDataModule):
+    def setup(self, stage=None):
+        self.train_datasets = {
+            0: TensorDataset(
+                torch.randn(16, 8),
+                torch.randint(0, 10, (16,)),
+            ),
+            1: TensorDataset(
+                torch.randn(16, 8),
+                torch.randint(0, 10, (16,)),
+            ),
+        }
+
+    def train_dataloader(self):
+        return {
+            agent_idx: DataLoader(dataset, batch_size=4)
+            for agent_idx, dataset in self.train_datasets.items()
+        }
 
 
 class TestFederatedLearning:
@@ -92,6 +115,48 @@ class TestFederatedLearning:
 
         outputs, total_loss = orchestrator._shared_eval(batch, 0, 'train')
         assert isinstance(total_loss, torch.Tensor)
+
+    def test_trainer_logs_nonzero_train_communication_metrics(self):
+        """Epoch-end aggregation should emit positive train communication."""
+        orchestrator = FederatedLearning(
+            agents={
+                0: LatentClassifier(
+                    in_features=8,
+                    num_classes=10,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+                1: LatentClassifier(
+                    in_features=8,
+                    num_classes=10,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+            },
+            neighbors={0: {1}, 1: {0}},
+            optimizer={'_target_': 'torch.optim.SGD', 'lr': 0.1},
+        )
+
+        trainer = Trainer(
+            max_epochs=1,
+            accelerator='cpu',
+            logger=False,
+            enable_checkpointing=False,
+            enable_model_summary=False,
+            num_sanity_val_steps=0,
+            limit_val_batches=0,
+        )
+
+        trainer.fit(orchestrator, datamodule=_ToyFederatedDataModule())
+
+        assert (
+            float(trainer.callback_metrics['train/communication_kilobytes'])
+            > 0.0
+        )
+        assert (
+            float(trainer.callback_metrics['train/communication_rounds'])
+            == 1.0
+        )
 
     @pytest.mark.slow
     def test_train_one_epoch_with_cnn(self):

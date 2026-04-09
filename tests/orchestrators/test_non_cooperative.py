@@ -69,8 +69,9 @@ class TestNonCooperativeLearning:
             optimizer=MockOptimizer(),
         )
         orch.training_step(_batch(), batch_idx=0)
-        assert orch._communication_rounds == 0
-        assert orch._communication_totals['bits'] == 0.0
+        metrics = orch._communication_metrics('train')
+        assert metrics['train/communication_rounds'] == 0.0
+        assert metrics['train/communication_kilobytes'] == 0.0
 
     def test_heterogeneous_agents_allowed(self):
         """NonCooperative imposes no architecture constraints."""

@@ -4,8 +4,8 @@ Sheaf-FMTL Orchestrator.
 Implements Algorithm 1 from the Sheaf-FMTL paper using PyTorch Lightning hooks.
 This orchestrator utilizes trainable projection matrices P_ij to map
 agent local parameters into a shared latent space where a Laplacian
-penalty enforces alignment
-among neighboring agents in a communication graph.
+penalty enforces alignment among neighboring agents in a communication
+graph.
 
 Implementation Details:
 -----------------------
@@ -16,11 +16,15 @@ Implementation Details:
 2. Local Parameter Regularization (`on_before_optimizer_step` hook):
    - Modifies the local gradients before the optimizer steps with the
      Sheaf Laplacian penalty
+   - Communication is accounted only for the exchanged projected vectors
+     `P_ij * theta_i`, not for raw parameters or full matrices
 
 3. Projection Matrix Update (`on_train_batch_end` hook):
    - P_ij matrices are updated manually as
      P_ij = P_ij - eta * lambda_reg
           * (P_ij * theta_i - P_ji * theta_j) * theta_i^T
+   - A full AGD iteration therefore incurs two projected-vector exchange
+     rounds: one before the optimizer step and one after it
 """
 
 from typing import Any
@@ -103,7 +107,47 @@ class SheafFMTL(BaseOrchestrator):
         respectively via ``on_before_optimizer_step`` and
         ``on_train_batch_end``), so nothing is required here.
         """
-        pass
+        self._finalize_train_epoch_communication()
+
+    def _collect_agent_vectors(self) -> dict[int, torch.Tensor]:
+        """Return flattened trainable parameter vectors for each agent."""
+        agent_vectors = {}
+        with torch.no_grad():
+            for idx_str, agent in self.agents.items():
+                idx = int(idx_str)
+                trainable_params = [
+                    p for p in agent.parameters() if p.requires_grad
+                ]
+                agent_vectors[idx] = parameters_to_vector(trainable_params)
+        return agent_vectors
+
+    def _projected_edge_vectors(
+        self, agent_vectors: dict[int, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Return the communicated projected vector for each directed edge."""
+        projected_vectors = {}
+        with torch.no_grad():
+            for edge_key, P_ij in self.projection_matrices.items():
+                i_str, _j_str = edge_key.split('_')
+                i = int(i_str)
+                projected_vectors[edge_key] = torch.matmul(
+                    P_ij, agent_vectors[i]
+                )
+        return projected_vectors
+
+    def _record_projected_vector_exchange(
+        self,
+        projected_vectors: dict[str, torch.Tensor],
+        *,
+        prefix: str = 'train',
+    ) -> None:
+        """Record one exchange round of transmitted projected vectors."""
+        if not projected_vectors:
+            return
+
+        self._record_communication_round(prefix=prefix)
+        for projected_vector in projected_vectors.values():
+            self._record_communication(projected_vector, prefix=prefix)
 
     def on_before_optimizer_step(self, optimizer: Any) -> None:
         """
@@ -113,22 +157,12 @@ class SheafFMTL(BaseOrchestrator):
         Penalty on theta_i:
         lambda * sum(P_ij^T * (P_ij*theta_i - P_ji*theta_j))
         """
-        agent_vectors = {}
-        for idx_str, agent in self.agents.items():
-            idx = int(idx_str)
-            # Ensure we only use trainable parameters
-            trainable_params = [
-                p for p in agent.parameters() if p.requires_grad
-            ]
-            vec = parameters_to_vector(trainable_params)
-            agent_vectors[idx] = vec
-            self._record_communication(
-                vec,
-                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
-            )
-
-        for P_ij in self.projection_matrices.values():
-            self._record_communication(P_ij)
+        agent_vectors = self._collect_agent_vectors()
+        projected_vectors = self._projected_edge_vectors(agent_vectors)
+        self._record_projected_vector_exchange(
+            projected_vectors,
+            prefix='train',
+        )
 
         # Compute gradients manually without autograd to avoid graph issues
         with torch.no_grad():
@@ -143,12 +177,11 @@ class SheafFMTL(BaseOrchestrator):
                     theta_j = agent_vectors[j]
 
                     P_ij = self.projection_matrices[f'{i}_{j}']
-                    P_ji = self.projection_matrices[f'{j}_{i}']
 
                     # diff_ij = P_ij * theta_i - P_ji * theta_j
-                    diff_ij = torch.matmul(P_ij, theta_i) - torch.matmul(
-                        P_ji, theta_j
-                    )
+                    diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
+                        f'{j}_{i}'
+                    ]
 
                     # grad_contribution = lambda * P_ij^T * diff_ij
                     grad_penalty_i += self.hparams.lambda_reg * torch.matmul(
@@ -178,15 +211,12 @@ class SheafFMTL(BaseOrchestrator):
 
         P_ij = P_ij - eta * lambda * (P_ij*theta_i - P_ji*theta_j) * theta_i^T
         """
-        agent_vectors = {}
-        for idx_str, agent in self.agents.items():
-            idx = int(idx_str)
-            trainable_params = [
-                p for p in agent.parameters() if p.requires_grad
-            ]
-            with torch.no_grad():
-                vec = parameters_to_vector(trainable_params)
-            agent_vectors[idx] = vec
+        agent_vectors = self._collect_agent_vectors()
+        projected_vectors = self._projected_edge_vectors(agent_vectors)
+        self._record_projected_vector_exchange(
+            projected_vectors,
+            prefix='train',
+        )
 
         with torch.no_grad():
             # We must compute all differences synchronously before updating
@@ -196,14 +226,9 @@ class SheafFMTL(BaseOrchestrator):
                 i, j = int(i_str), int(j_str)
 
                 theta_i = agent_vectors[i]
-                theta_j = agent_vectors[j]
-
-                P_ji = self.projection_matrices[f'{j}_{i}']
 
                 # diff = P_ij * theta_i - P_ji * theta_j  (shape: d_ij)
-                diff = torch.matmul(P_ij, theta_i) - torch.matmul(
-                    P_ji, theta_j
-                )
+                diff = projected_vectors[edge_key] - projected_vectors[f'{j}_{i}']
 
                 # update: outer product diff * theta_i^T (shape: d_ij x d_i)
                 grad_P_ij = torch.outer(diff, theta_i)

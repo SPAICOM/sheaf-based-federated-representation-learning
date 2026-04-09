@@ -41,6 +41,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
     - Subclasses must implement ``_shared_eval`` for evaluation logic.
     """
 
+    _COMMUNICATION_SPLITS = ('train', 'validation', 'test')
+
     def __init__(
         self,
         agents: dict[int, nn.Module],
@@ -57,18 +59,37 @@ class BaseOrchestrator(l.LightningModule, ABC):
         )
         self._reset_communication_state()
 
-    def _reset_communication_state(self) -> None:
-        """Reset cumulative communication accounting."""
-        self._communication_totals = {
-            'bits': 0.0,
-            'bytes': 0.0,
+    def _empty_communication_state(self) -> dict[str, float]:
+        """Return a zero-initialized communication state."""
+        return {
             'kilobytes': 0.0,
+            'rounds': 0.0,
         }
-        self._communication_rounds = 0
+
+    def _reset_communication_state(self) -> None:
+        """Reset cumulative communication accounting for all stages."""
+        self._communication_by_split = {
+            split: self._empty_communication_state()
+            for split in self._COMMUNICATION_SPLITS
+        }
 
     def on_train_start(self) -> None:
         """Reset communication accounting at the start of training."""
         self._reset_communication_state()
+
+    def on_validation_start(self) -> None:
+        """Reset validation communication accounting at validation start."""
+        self._reset_split_communication('validation')
+
+    def on_test_start(self) -> None:
+        """Reset test communication accounting at test start."""
+        self._reset_split_communication('test')
+
+    def _reset_split_communication(self, prefix: str) -> None:
+        """Reset communication accounting for a single stage."""
+        self._communication_by_split[prefix] = (
+            self._empty_communication_state()
+        )
 
     def _metric_tensor(self, value: Any) -> torch.Tensor:
         """Ensure a metric value is a scalar tensor on the module device.
@@ -87,34 +108,43 @@ class BaseOrchestrator(l.LightningModule, ABC):
         payload: Any,
         *,
         n_transmissions: int = 1,
+        prefix: str = 'train',
     ) -> dict[str, float]:
-        """Accumulate communication cost for a transmitted payload.
+        """Accumulate communication volume in kilobytes for a payload.
 
         Parameters
         ----------
         payload : Any
-            The tensor or structure being transmitted. Its size in bits
-            is computed by ``calculate_communication_cost``.
+            The tensor or structure being transmitted.
         n_transmissions : int, optional
             Number of neighbours the payload is sent to. The total cost
             is ``payload_size × n_transmissions``. A value < 1 records
             zero cost and is silently ignored (default: 1).
         """
         if int(n_transmissions) < 1:
-            return {
-                'bits': 0.0,
-                'bytes': 0.0,
-                'kilobytes': 0.0,
-            }
+            return {'kilobytes': 0.0}
 
         cost = calculate_communication_cost(
             payload,
             n_transmissions=n_transmissions,
         )
-        for unit, value in cost.items():
-            self._communication_totals[unit] += float(value)
-        self._communication_rounds += int(n_transmissions)
-        return cost
+        stage_state = self._communication_by_split[prefix]
+        stage_state['kilobytes'] += float(cost['kilobytes'])
+        return {'kilobytes': float(cost['kilobytes'])}
+
+    def _record_communication_round(
+        self,
+        n_rounds: int = 1,
+        *,
+        prefix: str = 'train',
+    ) -> None:
+        """Accumulate protocol-level communication rounds."""
+        if int(n_rounds) < 1:
+            return None
+        self._communication_by_split[prefix]['rounds'] += float(
+            int(n_rounds)
+        )
+        return None
 
     def _communication_metrics(self, prefix: str) -> dict[str, float]:
         """Return cumulative communication metrics ready for ``log_dict``.
@@ -125,18 +155,39 @@ class BaseOrchestrator(l.LightningModule, ABC):
             Logging stage prefix (e.g. ``'train'``, ``'validation'``).
             Keys are formatted as ``'{prefix}/communication_*'``.
         """
+        stage_state = self._communication_by_split[prefix]
         return {
-            f'{prefix}/communication_bits': self._communication_totals['bits'],
-            f'{prefix}/communication_bytes': self._communication_totals[
-                'bytes'
-            ],
-            f'{prefix}/communication_kilobytes': self._communication_totals[
-                'kilobytes'
-            ],
-            f'{prefix}/communication_rounds': float(
-                self._communication_rounds
-            ),
+            f'{prefix}/communication_kilobytes': stage_state['kilobytes'],
+            f'{prefix}/communication_rounds': stage_state['rounds'],
         }
+
+    def _finalize_train_epoch_communication(self) -> None:
+        """Log cumulative train communication metrics once per epoch."""
+        communication_logs = self._communication_metrics('train')
+        self.log_dict(
+            communication_logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
+
+    def _finalize_stage_communication(self, prefix: str) -> None:
+        """Log cumulative stage communication metrics once per stage epoch."""
+        communication_logs = self._communication_metrics(prefix)
+        self.log_dict(
+            communication_logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+        )
+
+    def on_validation_epoch_end(self) -> None:
+        """Log cumulative validation communication metrics."""
+        self._finalize_stage_communication('validation')
+
+    def on_test_epoch_end(self) -> None:
+        """Log cumulative test communication metrics."""
+        self._finalize_stage_communication('test')
 
     def _log_shared_metrics(
         self,
@@ -236,7 +287,6 @@ class BaseOrchestrator(l.LightningModule, ABC):
             f'{prefix}/avg_task_performance_epoch': avg_performance,
             f'{prefix}/global_task_performance_epoch': global_task_performance,
         }
-        aggregate_logs.update(self._communication_metrics(prefix))
         if extra_metrics is not None:
             aggregate_logs.update(extra_metrics)
 

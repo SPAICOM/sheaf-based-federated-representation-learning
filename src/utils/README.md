@@ -30,7 +30,7 @@ This module contains various utility functions and classes used throughout the f
     - `calculate_communication_cost`: Computes the communication cost (size in bits) of transmitting a payload
     - Handles various payload types (tensors, dictionaries, lists, etc.)
     - Accounts for precision (bits vs bytes) and transmission counts
-  - **Usage**: Integrated into BaseOrchestrator to track communication rounds and bandwidth usage
+  - **Usage**: Integrated into BaseOrchestrator to track cumulative communication rounds and exchanged kilobytes
 
 ### Data Partitioning
 - [`data_partitioner.py`](data_partitioner.py): Functions for partitioning data across agents in federated learning scenarios, including label-based and Dirichlet partitioning.

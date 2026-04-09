@@ -99,6 +99,12 @@ class DFedU(BaseOrchestrator):
         before any model is mutated, so the order of iteration does not
         affect the result.
         """
+        total_transmissions = sum(
+            len(self.hparams.neighbors.get(int(idx_str), set()))
+            for idx_str in self.agents
+        )
+        if total_transmissions > 0:
+            self._record_communication_round(prefix='train')
         agent_vectors = {}
         # Extract flattened parameter vectors for all agents (trainable only)
         for idx_str, agent in self.agents.items():
@@ -111,6 +117,7 @@ class DFedU(BaseOrchestrator):
             self._record_communication(
                 vec,
                 n_transmissions=len(self.hparams.neighbors.get(idx, set())),
+                prefix='train',
             )
 
         new_vectors = {}
@@ -132,7 +139,7 @@ class DFedU(BaseOrchestrator):
 
                 # Uniform weights: a_ij = 1 for all edges.
                 # Normalising by degree (/ d_i) is an alternative but is
-                # not used here — eta implicitly controls step magnitude.
+                # not used here - eta implicitly controls step magnitude.
                 w_i_new = w_i - self.hparams.eta * sum_diff
                 new_vectors[i] = w_i_new
             else:
@@ -146,6 +153,8 @@ class DFedU(BaseOrchestrator):
                 p for p in agent.parameters() if p.requires_grad
             ]
             vector_to_parameters(new_vectors[idx], trainable_params)
+
+        self._finalize_train_epoch_communication()
 
     def _shared_eval(
         self,

@@ -3,8 +3,8 @@
 This module implements a centralized FedPer-style training loop where all
 agents share encoder/base layers while keeping their decoder/classification
 head private. Base layers are aggregated on a server with sample-count
-weights, then broadcast back to every client after a fixed number of local
-SGD steps.
+weights, then broadcast back to every client on a configurable global
+aggregation schedule.
 """
 
 from typing import Any
@@ -31,13 +31,21 @@ class FedPer(BaseOrchestrator):
         with the base orchestrator and experiment pipeline.
     optimizer : hydra config
         Optimizer used for local SGD updates.
-    local_steps : int, optional
-        Number of local optimizer steps between successive global
-        aggregations (default: 4).
+    aggregation_interval : int | None, optional
+        Number of local epochs or optimizer steps between successive global
+        aggregations. When omitted, defaults to one aggregation per epoch.
+    aggregation_unit : str | None, optional
+        Unit used by ``aggregation_interval``. Supported values are
+        ``'epoch'`` and ``'step'``. When omitted, defaults to ``'epoch'``.
+    max_global_rounds : int | None, optional
+        Optional cap on scheduled server aggregation rounds. If ``None`` or
+        non-positive, training is not stopped by the orchestrator.
+    local_steps : int | None, optional
+        Legacy alias for step-based aggregation. When provided, it maps to
+        ``aggregation_interval=local_steps`` and
+        ``aggregation_unit='step'``.
     global_steps : int | None, optional
-        Number of server aggregation rounds to execute. If ``None`` or
-        non-positive, training is not stopped by the orchestrator
-        (default: 100).
+        Legacy alias for ``max_global_rounds``.
     sample_counts : dict[int, int] | None, optional
         Optional per-client training sample counts. When omitted, the
         orchestrator tries to infer them from ``trainer.datamodule`` and
@@ -52,12 +60,29 @@ class FedPer(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer: Any,
-        local_steps: int = 4,
-        global_steps: int | None = 100,
+        aggregation_interval: int | None = None,
+        aggregation_unit: str | None = None,
+        max_global_rounds: int | None = None,
+        local_steps: int | None = None,
+        global_steps: int | None = None,
         sample_counts: dict[int, int] | None = None,
         sync_on_train_start: bool = True,
         **kwargs,
     ):
+        (
+            aggregation_interval,
+            aggregation_unit,
+            max_global_rounds,
+        ) = self._resolve_aggregation_schedule(
+            aggregation_interval=aggregation_interval,
+            aggregation_unit=aggregation_unit,
+            max_global_rounds=max_global_rounds,
+            local_steps=local_steps,
+            global_steps=global_steps,
+        )
+        local_steps = None
+        global_steps = None
+
         super().__init__(
             agents=agents,
             neighbors=neighbors,
@@ -70,7 +95,49 @@ class FedPer(BaseOrchestrator):
             sample_counts
         )
         self._last_aggregated_step = 0
+        self._last_aggregated_epoch = 0
         self._global_aggregation_count = 0
+
+    @staticmethod
+    def _resolve_aggregation_schedule(
+        *,
+        aggregation_interval: int | None,
+        aggregation_unit: str | None,
+        max_global_rounds: int | None,
+        local_steps: int | None,
+        global_steps: int | None,
+    ) -> tuple[int, str, int | None]:
+        """Resolve the configured FedPer aggregation schedule."""
+        if local_steps is not None:
+            if aggregation_interval is not None or aggregation_unit is not None:
+                raise ValueError(
+                    'Specify either aggregation_interval/aggregation_unit or '
+                    'the legacy local_steps alias, not both.'
+                )
+            aggregation_interval = int(local_steps)
+            aggregation_unit = 'step'
+
+        if global_steps is not None:
+            if max_global_rounds is not None:
+                raise ValueError(
+                    'Specify either max_global_rounds or the legacy '
+                    'global_steps alias, not both.'
+                )
+            max_global_rounds = int(global_steps)
+
+        resolved_interval = (
+            1 if aggregation_interval is None else int(aggregation_interval)
+        )
+        resolved_unit = (
+            'epoch' if aggregation_unit is None else str(aggregation_unit)
+        ).lower()
+
+        if resolved_unit not in {'epoch', 'step'}:
+            raise ValueError(
+                "aggregation_unit must be either 'epoch' or 'step'."
+            )
+
+        return resolved_interval, resolved_unit, max_global_rounds
 
     def _normalize_sample_counts(
         self,
@@ -173,7 +240,11 @@ class FedPer(BaseOrchestrator):
 
         for idx, agent in agents.items():
             base_state = agent.encoder.state_dict()
-            self._record_communication(base_state, n_transmissions=1)
+            self._record_communication(
+                base_state,
+                n_transmissions=1,
+                prefix='train',
+            )
             for name, tensor in base_state.items():
                 aggregated_state[name] += (
                     tensor.detach().to(dtype=torch.float32) * weights[idx]
@@ -187,6 +258,7 @@ class FedPer(BaseOrchestrator):
         self._record_communication(
             aggregated_state,
             n_transmissions=len(agents),
+            prefix='train',
         )
         return aggregated_state
 
@@ -204,19 +276,52 @@ class FedPer(BaseOrchestrator):
         """Aggregate encoder parameters on the server and broadcast them."""
         aggregated_state = self._aggregate_base_layers()
         self._broadcast_base_layers(aggregated_state)
+        self._record_communication_round(prefix='train')
 
     def on_train_start(self) -> None:
         """Initialize counters and optionally synchronize shared base layers."""
         super().on_train_start()
         self._infer_client_sample_counts()
         self._last_aggregated_step = 0
+        self._last_aggregated_epoch = 0
         self._global_aggregation_count = 0
 
         if self.hparams.sync_on_train_start:
             self._synchronize_base_layers()
 
+    def _maybe_stop_after_global_aggregation(self) -> None:
+        """Stop training once the configured aggregation budget is reached."""
+        max_global_rounds = self.hparams.max_global_rounds
+        if (
+            max_global_rounds is None
+            or int(max_global_rounds) <= 0
+            or self._global_aggregation_count < int(max_global_rounds)
+        ):
+            return None
+
+        trainer = getattr(self, '_trainer', None)
+        if trainer is not None:
+            trainer.should_stop = True
+        return None
+
     def on_train_epoch_end(self) -> None:
-        """No epoch-level action: FedPer aggregates on the step schedule."""
+        """Aggregate shared encoders according to the configured schedule."""
+        if self.hparams.aggregation_unit == 'epoch':
+            completed_epochs = int(self.current_epoch) + 1
+            interval = int(self.hparams.aggregation_interval)
+
+            if (
+                interval > 0
+                and completed_epochs > 0
+                and completed_epochs != self._last_aggregated_epoch
+                and completed_epochs % interval == 0
+            ):
+                self._synchronize_base_layers()
+                self._last_aggregated_epoch = completed_epochs
+                self._global_aggregation_count += 1
+                self._maybe_stop_after_global_aggregation()
+
+        self._finalize_train_epoch_communication()
         return None
 
     def on_train_batch_end(
@@ -225,30 +330,24 @@ class FedPer(BaseOrchestrator):
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> None:
-        """Run a server aggregation after every ``local_steps`` optimizer steps."""
+        """Run step-scheduled FedPer aggregation when configured."""
+        if self.hparams.aggregation_unit != 'step':
+            return None
+
         step = int(self.global_step)
-        local_steps = int(self.hparams.local_steps)
+        interval = int(self.hparams.aggregation_interval)
         if (
-            local_steps <= 0
+            interval <= 0
             or step <= 0
             or step == self._last_aggregated_step
-            or step % local_steps != 0
+            or step % interval != 0
         ):
             return None
 
         self._synchronize_base_layers()
         self._last_aggregated_step = step
         self._global_aggregation_count += 1
-
-        max_global_steps = self.hparams.global_steps
-        if (
-            max_global_steps is not None
-            and int(max_global_steps) > 0
-            and self._global_aggregation_count >= int(max_global_steps)
-        ):
-            trainer = getattr(self, '_trainer', None)
-            if trainer is not None:
-                trainer.should_stop = True
+        self._maybe_stop_after_global_aggregation()
 
         return None
 
