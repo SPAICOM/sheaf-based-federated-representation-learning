@@ -1,0 +1,18 @@
+_target_: src.datamodules.DeepSenseDataModule
+
+data_path: ./data/DeepSense
+gdrive_folder_id: null
+
+split_strategy: full
+agent_modalities: null
+
+n_agents: 3
+batch_size: 32
+num_workers: 4
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.0
+pilot_num_samples: null
+seed: 42
