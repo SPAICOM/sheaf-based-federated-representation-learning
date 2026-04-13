@@ -1,13 +1,18 @@
-"""Heterogeneous Federated Learning orchestrator.
+"""Decentralized HeteroFL orchestrator.
 
-This module implements the HeteroFL algorithm (Diao et al., ICLR 2021) where
-clients receive sub-models that are channel-width slices of a server-side
-global full-width model. The server aggregates client updates using a nested
-averaging scheme: each parameter position is averaged only over the clients
-whose allocated sub-model covers that position.
+This module implements a neighborhood-level variant of HeteroFL (Diao et al.,
+ICLR 2021) where aggregation is restricted to each node's local neighborhood
+rather than a central server.  Each node i averages encoder parameters only
+with the sub-networks possessed by its neighbors, using the nested HeteroFL
+scheme extended to all tensor dimensions:
 
-Only encoder parameters participate in global aggregation; each agent's
-decoder (classification head) remains local/personalized.
+    For every parameter tensor, node i and neighbor j contribute to the
+    intersection of their shapes in every dimension.  Within that intersection
+    each output-channel position is weighted by the neighbor's sample count,
+    and the denominator accumulates the total weight per position.
+
+Only encoder parameters participate in aggregation; decoder (classification
+head) parameters remain local/personalized.
 
 Reference
 ---------
@@ -25,45 +30,48 @@ from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
 class HeteroFL(BaseOrchestrator):
-    """Centralized HeteroFL orchestrator with heterogeneous client widths.
+    """Decentralized HeteroFL orchestrator with neighbor-level aggregation.
 
-    The server maintains a global full-width encoder. At each aggregation
-    round it:
+    Each node maintains its own encoder sub-model whose channel width is
+    determined by its rate.  At each aggregation round every node i:
 
-    1. Collects each client's locally-trained encoder sub-model.
-    2. Reconstructs the global encoder via nested weighted averaging: for
-       each output-channel position ``i`` in a parameter tensor of shape
-       ``(C_full, ...)``, only clients whose sub-model covers position ``i``
-       (i.e. whose rate satisfies ``int(rate * C_full) > i``) contribute
-       to the average.  Weights are proportional to per-client sample counts.
-    3. Broadcasts the appropriate leading-channel slice back to every client.
+    1. Snapshots all neighbors' (and its own) current encoder states.
+    2. Builds a new encoder by nested weighted averaging restricted to its
+       local neighborhood: for each parameter tensor, positions covered by
+       neighbor j (i.e. within j's sub-model shape) contribute with weight
+       proportional to j's sample count.  The intersection is computed in
+       every tensor dimension so that multi-layer encoders where input
+       channels also scale with rate are handled correctly.
+    3. Loads the averaged state back into its own encoder.
 
-    Decoder parameters are never aggregated and remain local to each client.
+    No central server or global encoder exists.  Decoders are never
+    aggregated and remain local to each node.
 
     Parameters
     ----------
     agents : dict[int, nn.Module]
-        Client models. Each agent must expose an ``encoder`` and a
+        Client models.  Each agent must expose an ``encoder`` and a
         ``decoder`` attribute (e.g. ``HeteroCNNClassifier``).
     neighbors : dict[int, set[int]]
-        Unused by the aggregation rule; kept for interface compatibility
-        with the base orchestrator and the experiment pipeline.
+        Adjacency mapping from each agent index to the set of its neighbor
+        indices.  Self-loops are added implicitly during aggregation so that
+        every node always mixes in its own parameters.
     optimizer : hydra config
         Optimizer used for local SGD updates.
     rates : dict[int, float]
-        Per-client width scaling factors in ``(0, 1]``. A factor of
-        ``1.0`` means the client receives the full-width encoder;
-        ``0.5`` means half the output channels per layer.  Keys must
-        match the keys in ``agents``.
+        Per-client width scaling factors in ``(0, 1]``.  A factor of
+        ``1.0`` means the client uses the full-width encoder; ``0.5``
+        means half the output channels per layer.  Keys must match the keys
+        in ``agents``.
     aggregation_interval : int | None, optional
         Number of local epochs or optimizer steps between successive
-        global aggregations.  Defaults to one aggregation per epoch.
+        aggregation rounds.  Defaults to one aggregation per epoch.
     aggregation_unit : str | None, optional
         Unit for ``aggregation_interval``: ``'epoch'`` or ``'step'``.
         Defaults to ``'epoch'``.
     max_global_rounds : int | None, optional
-        Optional cap on scheduled server aggregation rounds.  Training
-        is stopped once the budget is exhausted.  ``None`` means no cap.
+        Optional cap on scheduled aggregation rounds.  Training is stopped
+        once the budget is exhausted.  ``None`` means no cap.
     local_steps : int | None, optional
         Legacy alias: maps to ``aggregation_interval=local_steps`` and
         ``aggregation_unit='step'``.
@@ -74,8 +82,9 @@ class HeteroFL(BaseOrchestrator):
         When omitted the orchestrator tries to infer them from
         ``trainer.datamodule`` and falls back to uniform weights.
     sync_on_train_start : bool, optional
-        If ``True``, distribute global encoder slices to all clients once
-        before the first local update (default: ``True``).
+        If ``True``, run one neighborhood aggregation round before the
+        first local update so that neighbors start from a common basis
+        (default: ``True``).
     """
 
     def __init__(
@@ -121,9 +130,6 @@ class HeteroFL(BaseOrchestrator):
         self._client_sample_counts = self._normalize_sample_counts(
             sample_counts
         )
-
-        # Populated on_train_start from the highest-rate agent's encoder.
-        self._global_encoder_state: dict[str, torch.Tensor] = {}
 
         self._last_aggregated_step = 0
         self._last_aggregated_epoch = 0
@@ -207,7 +213,7 @@ class HeteroFL(BaseOrchestrator):
                 )
 
         # All encoder state dicts must share the same parameter names so that
-        # the global state can be constructed and sliced unambiguously.
+        # the aggregation can be performed unambiguously.
         ref_idx = min(agents.keys())
         ref_names = set(agents[ref_idx].encoder.state_dict().keys())
         for idx, agent in agents.items():
@@ -256,102 +262,116 @@ class HeteroFL(BaseOrchestrator):
         return dict(counts)
 
     # ------------------------------------------------------------------
-    # Global state management
+    # Neighborhood helpers
     # ------------------------------------------------------------------
 
-    def _init_global_encoder_state(self) -> None:
-        """Seed the global encoder from the highest-rate agent's encoder."""
-        max_idx = max(self._rates, key=lambda k: self._rates[k])
-        self._global_encoder_state = {
-            name: tensor.clone().detach().float()
-            for name, tensor in self.agents[str(max_idx)]
-            .encoder.state_dict()
-            .items()
+    def _build_neighbors(self) -> dict[int, set[int]]:
+        """Return the adjacency map with integer keys and node sets."""
+        return {
+            int(k): {int(n) for n in v}
+            for k, v in self.hparams.neighbors.items()
         }
 
     # ------------------------------------------------------------------
-    # Aggregation (upload: clients → server)
+    # Aggregation
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def _aggregate_global_encoder(self) -> None:
-        """Reconstruct the global encoder via nested sample-weighted averaging.
+    def _neighbor_aggregate(self) -> None:
+        """Run one neighborhood-level HeteroFL aggregation round.
 
-        For every named parameter tensor of global shape ``(C_full, ...)``:
-        - Client with rate ``r`` covers positions ``0 … int(r*C_full)-1``
-          along dimension 0 (output channels).
-        - Each position is averaged only over the clients that cover it,
-          using sample counts as unnormalised weights; the normalisation
-          denominator therefore varies per position.
+        For each node i the method:
 
-        This implements the set-difference aggregation described in §3 of
-        the HeteroFL paper without explicitly enumerating rate levels.
+        1. Collects a snapshot of every neighbor's (including i's own)
+           current encoder state — snapshotting before any mutation
+           ensures order-independence.
+        2. For each parameter tensor ``name`` of node i's encoder,
+           accumulates contributions from neighbors using the nested
+           weighted-average rule:
+
+           - The overlap between node i and neighbor j in every tensor
+             dimension d is ``min(shape_i[d], shape_j[d])``.
+           - j's slice within that overlap is added to i's accumulator
+             weighted by j's sample count.
+           - The weight accumulator ``weight_sum`` is tracked per
+             output-channel position (dim 0) so that the normalisation
+             denominator varies with neighborhood coverage.
+
+        3. Loads the normalised result back into node i's encoder.
+
+        Communication cost: one upload per directed edge (j → i),
+        counting j's full encoder sub-model payload.
         """
         agents = {int(k): v for k, v in self.agents.items()}
         counts = self._infer_client_sample_counts()
+        neighbors = self._build_neighbors()
 
-        new_state: dict[str, torch.Tensor] = {}
+        # Parameter names from the highest-rate agent (superset of all names).
+        max_rate_idx = max(self._rates, key=lambda k: self._rates[k])
+        param_names = list(agents[max_rate_idx].encoder.state_dict().keys())
 
-        for name, global_tensor in self._global_encoder_state.items():
-            full_out = global_tensor.shape[0]
-            extra_ndim = global_tensor.ndim - 1
+        # Snapshot all encoder states before any mutation.
+        snapshots: dict[int, dict[str, torch.Tensor]] = {
+            idx: {
+                name: t.clone().detach().float()
+                for name, t in agent.encoder.state_dict().items()
+            }
+            for idx, agent in agents.items()
+        }
 
-            accum = torch.zeros_like(global_tensor, dtype=torch.float32)
-            # One weight accumulator per output-channel position.
-            weight_sum = torch.zeros(full_out, dtype=torch.float32)
+        # Record communication: one payload per directed edge j → i.
+        communicated: set[tuple[int, int]] = set()
+        for idx in agents:
+            neighborhood = neighbors.get(idx, set()) | {idx}
+            for j in neighborhood:
+                if j != idx and j in agents and (idx, j) not in communicated:
+                    self._record_communication(
+                        snapshots[j],
+                        n_transmissions=1,
+                        prefix='train',
+                    )
+                    communicated.add((idx, j))
 
-            for idx, agent in agents.items():
-                local_sd = agent.encoder.state_dict()
-                self._record_communication(
-                    local_sd,
-                    n_transmissions=1,
-                    prefix='train',
+        # Compute and load the new encoder state for each node.
+        for idx, agent in agents.items():
+            neighborhood = neighbors.get(idx, set()) | {idx}
+            snap_i = snapshots[idx]
+
+            new_state: dict[str, torch.Tensor] = {}
+
+            for name in param_names:
+                tensor_i = snap_i[name]  # shape owned by node i
+                accum = torch.zeros_like(tensor_i, dtype=torch.float32)
+                # Per-output-channel weight accumulator (dim 0).
+                weight_sum = torch.zeros(
+                    tensor_i.shape[0], dtype=torch.float32
                 )
 
-                local_tensor = local_sd[name].detach().float()
-                n_out = local_tensor.shape[0]  # int(rate * full_out)
-                raw_w = float(counts.get(idx, 1))
+                for j in neighborhood:
+                    if j not in agents:
+                        continue
+                    tensor_j = snapshots[j][name]
 
-                accum[:n_out] += local_tensor * raw_w
-                weight_sum[:n_out] += raw_w
+                    # Intersection in every dimension: min of the two shapes.
+                    slices = tuple(
+                        slice(min(s_i, s_j))
+                        for s_i, s_j in zip(tensor_i.shape, tensor_j.shape)
+                    )
+                    covered_out = slices[0].stop
+                    if covered_out == 0:
+                        continue
 
-            # Normalise: broadcast weight_sum over the remaining dimensions.
-            norm = weight_sum.view(-1, *([1] * extra_ndim)).clamp(min=1e-8)
-            new_state[name] = (accum / norm).to(dtype=global_tensor.dtype)
+                    raw_w = float(counts.get(j, 1))
+                    accum[slices] += tensor_j[slices] * raw_w
+                    weight_sum[:covered_out] += raw_w
 
-        self._global_encoder_state = new_state
-
-    # ------------------------------------------------------------------
-    # Distribution (download: server → clients)
-    # ------------------------------------------------------------------
-
-    @torch.no_grad()
-    def _distribute_global_encoder(self) -> None:
-        """Send each client the leading-channel slice of the global encoder.
-
-        A client with rate ``r`` receives the first ``int(r * C_full)``
-        output channels of every parameter tensor, which forms a nested
-        sub-model of the full-width global encoder.
-        """
-        for idx_str, agent in self.agents.items():
-            idx = int(idx_str)
-            rate = self._rates[idx]
-
-            local_state: dict[str, torch.Tensor] = {}
-            for name, global_tensor in self._global_encoder_state.items():
-                n_out = int(rate * global_tensor.shape[0])
-                local_state[name] = (
-                    global_tensor[:n_out]
-                    .clone()
-                    .to(dtype=agent.encoder.state_dict()[name].dtype)
+                norm = weight_sum.view(-1, *([1] * (tensor_i.ndim - 1))).clamp(
+                    min=1e-8
                 )
+                dtype = agent.encoder.state_dict()[name].dtype
+                new_state[name] = (accum / norm).to(dtype=dtype)
 
-            agent.encoder.load_state_dict(local_state)
-            self._record_communication(
-                local_state,
-                n_transmissions=1,
-                prefix='train',
-            )
+            agent.encoder.load_state_dict(new_state)
 
     # ------------------------------------------------------------------
     # Synchronisation round
@@ -359,9 +379,8 @@ class HeteroFL(BaseOrchestrator):
 
     @torch.no_grad()
     def _synchronize(self) -> None:
-        """Run one full HeteroFL communication round: aggregate-distribute."""
-        self._aggregate_global_encoder()
-        self._distribute_global_encoder()
+        """Run one full neighborhood aggregation round."""
+        self._neighbor_aggregate()
         self._record_communication_round(prefix='train')
 
     # ------------------------------------------------------------------
@@ -369,16 +388,15 @@ class HeteroFL(BaseOrchestrator):
     # ------------------------------------------------------------------
 
     def on_train_start(self) -> None:
-        """Initialise counters and global state; optionally seed clients."""
+        """Initialise counters; optionally seed from a neighborhood round."""
         super().on_train_start()
         self._infer_client_sample_counts()
-        self._init_global_encoder_state()
         self._last_aggregated_step = 0
         self._last_aggregated_epoch = 0
         self._global_aggregation_count = 0
 
         if self.hparams.sync_on_train_start:
-            self._distribute_global_encoder()
+            self._neighbor_aggregate()
 
     def _maybe_stop_after_global_aggregation(self) -> None:
         """Stop training once the configured aggregation budget is reached."""
@@ -394,7 +412,7 @@ class HeteroFL(BaseOrchestrator):
             trainer.should_stop = True
 
     def on_train_epoch_end(self) -> None:
-        """Aggregate and redistribute encoders on the epoch schedule."""
+        """Aggregate neighborhood encoders on the epoch schedule."""
         if self.hparams.aggregation_unit == 'epoch':
             completed = int(self.current_epoch) + 1
             interval = int(self.hparams.aggregation_interval)
@@ -418,7 +436,7 @@ class HeteroFL(BaseOrchestrator):
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> None:
-        """Run step-scheduled HeteroFL aggregation when configured."""
+        """Run step-scheduled neighborhood aggregation when configured."""
         if self.hparams.aggregation_unit != 'step':
             return
 
