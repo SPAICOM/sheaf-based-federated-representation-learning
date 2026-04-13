@@ -1,13 +1,12 @@
 """
 Mobile Health (MHEALTH) datamodule for sensor-based activity recognition.
 
-This module provides data loading for the MHEALTH dataset from the UCI
-archive (https://archive.ics.uci.edu/dataset/337/mhealth+dataset), which
-contains wearable sensor data (accelerometer, gyroscope, magnetometer, ECG)
-recorded at 50 Hz from three body positions across 10 subjects performing
-12 activities.
+This module provides data loading for the MHEALTH dataset, which contains
+wearable sensor data (accelerometer, gyroscope, magnetometer, ECG) recorded
+at 50 Hz from three body positions across 10 subjects performing 12 activities.
 
 Features:
+- Download from Google Drive via gdown
 - Load from a merged CSV file or a directory of per-subject ``.log`` files
 - Named feature groups: ``'chest'``, ``'left_ankle'``, ``'right_wrist'``
 - Optional sliding-window segmentation for temporal modelling
@@ -18,17 +17,15 @@ Features:
   ``ClassificationDataModule`` and ``SemanticDataModule``
 """
 
-import os
 import shutil
 import zipfile
 from pathlib import Path
-from urllib.request import urlretrieve
 
+import gdown
 import lightning as l
 import numpy as np
 import pandas as pd
 import torch
-from dotenv import load_dotenv
 from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from torch.utils.data import DataLoader, Dataset
 
@@ -41,11 +38,6 @@ from src.utils.data_partitioner import (
     partition_by_agent_classes,
     partition_non_iid,
 )
-
-MHEALTH_UCI_URL = (
-    'https://archive.ics.uci.edu/static/public/337/mhealth+dataset.zip'
-)
-MHEALTH_KAGGLE_SLUG = 'gaurav2022/mobile-health'
 
 MHEALTH_KAGGLE_COLUMNS: dict[str, str] = {
     'alx': 'acc_ankle_x',
@@ -400,6 +392,7 @@ class MHealthDataModule(l.LightningDataModule):
     def __init__(
         self,
         data_path: str | Path,
+        gdrive_file_id: str | None = None,
         n_agents: int | None = None,
         feature_cols: list[str] | None = None,
         feature_groups: list[str] | None = None,
@@ -425,6 +418,7 @@ class MHealthDataModule(l.LightningDataModule):
         super().__init__()
 
         self.data_path = Path(data_path)
+        self.gdrive_file_id = gdrive_file_id
         self.n_agents = n_agents
         self._feature_cols_param = feature_cols
         self.feature_groups = feature_groups
@@ -452,92 +446,37 @@ class MHealthDataModule(l.LightningDataModule):
         self.seed = seed
 
     def prepare_data(self) -> None:
-        """Download and extract MHEALTH dataset if not already present.
+        """Download and extract MHEALTH dataset from Google Drive if not present.
 
-        Attempts download from UCI archive first, then falls back to Kaggle
-        if credentials are configured in .env file (KAGGLE_USERNAME, KAGGLE_KEY).
+        The folder may contain either a zip archive (which is extracted) or
+        the raw .log/.csv files directly; both layouts are handled automatically.
         """
-        if self.data_path.exists() and any(self.data_path.glob('*.log')):
-            return
-
         dest = self.data_path
-        dest.mkdir(parents=True, exist_ok=True)
 
-        log_files = list(dest.glob('*.log'))
-        csv_files = list(dest.glob('*.csv'))
-        if log_files or csv_files:
+        if dest.exists() and (list(dest.glob('*.log')) or list(dest.glob('*.csv'))):
             return
 
+        if not self.gdrive_file_id:
+            raise RuntimeError(
+                'MHEALTH dataset not found. '
+                'Provide gdrive_file_id in your config yaml.'
+            )
+
+        dest.mkdir(parents=True, exist_ok=True)
         zip_path = dest / 'mhealth_dataset.zip'
 
-        if not zip_path.exists():
-            downloaded = False
-
-            print('[prepare_data] Downloading from UCI archive …')
-            try:
-                urlretrieve(MHEALTH_UCI_URL, zip_path)
-                downloaded = True
-            except Exception as exc:
-                print(f'[prepare_data] UCI download failed: {exc}')
-
-            if not downloaded:
-                load_dotenv()
-                username = os.getenv('KAGGLE_USERNAME')
-                api_key = os.getenv('KAGGLE_KEY')
-
-                if username and api_key:
-                    print('[prepare_data] Downloading from Kaggle …')
-                    try:
-                        os.environ['KAGGLE_USERNAME'] = username
-                        os.environ['KAGGLE_KEY'] = api_key
-                        import kaggle
-
-                        kaggle.api.authenticate()
-                        kaggle.api.dataset_download_files(
-                            MHEALTH_KAGGLE_SLUG,
-                            path=dest,
-                            unzip=False,
-                        )
-                        downloaded = True
-                    except Exception as exc:
-                        print(f'[prepare_data] Kaggle download failed: {exc}')
-                else:
-                    print(
-                        '[prepare_data] Kaggle credentials not found in .env. '
-                        'Set KAGGLE_USERNAME and KAGGLE_KEY in .env file.'
-                    )
-
-            if not downloaded:
-                raise RuntimeError(
-                    'Failed to download MHEALTH dataset. Please download manually:\n'
-                    f'  UCI:  {MHEALTH_UCI_URL}\n'
-                    f'  Kaggle: '
-                    f'https://www.kaggle.com/datasets/{MHEALTH_KAGGLE_SLUG}\n'
-                    'Extract to: ' + str(dest)
-                )
-
-        # Find the zip file (Kaggle may download to a different location)
-        if not zip_path.exists():
-            zip_files = list(dest.rglob('*.zip'))
-            if zip_files:
-                actual_zip = zip_files[0]
-                if actual_zip != zip_path:
-                    shutil.move(str(actual_zip), zip_path)
-                    print(f'[prepare_data] Moved {actual_zip} to {zip_path}')
+        print(f'[prepare_data] Downloading mhealth_dataset.zip …')
+        gdown.download(id=self.gdrive_file_id, output=str(zip_path), quiet=False)
 
         if not zip_path.exists():
-            raise RuntimeError(
-                f'Zip file not found after download. Looked in: {dest}'
-            )
+            raise RuntimeError(f'Download failed, zip not found at {zip_path}')
 
         print(f'[prepare_data] Extracting {zip_path} …')
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(dest)
 
-        log_files = list(dest.rglob('*.log'))
-        csv_files = list(dest.rglob('*.csv'))
-        data_files = log_files + csv_files
-
+        # Lift data files up to dest root if they landed in a subdirectory
+        data_files = list(dest.rglob('*.log')) + list(dest.rglob('*.csv'))
         if not data_files:
             raise RuntimeError(
                 f'No .log or .csv files found after extraction in {dest}'
@@ -548,9 +487,6 @@ class MHealthDataModule(l.LightningDataModule):
             for f in data_dir.glob('*'):
                 if f.suffix in ('.log', '.csv'):
                     shutil.copy2(f, dest / f.name)
-            for d in data_dir.iterdir():
-                if d.is_dir() and d != dest:
-                    shutil.rmtree(d, ignore_errors=True)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

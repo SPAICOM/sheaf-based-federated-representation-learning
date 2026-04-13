@@ -15,6 +15,7 @@ All support:
 """
 
 from .classification_datamodule import ClassificationDataModule
+from .deepsense_datamodule import DeepSenseDataModule
 from .mhealth_datamodule import MHealthDataModule
 from .semantic_datamodule import SemanticDataModule
 
@@ -22,4 +23,5 @@ __all__ = [
     'ClassificationDataModule',
     'MHealthDataModule',
     'SemanticDataModule',
+    'DeepSenseDataModule',
 ]

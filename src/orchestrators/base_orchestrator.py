@@ -251,7 +251,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     def _resolve_batch_size(
         self,
-        batch: dict[int, list[torch.Tensor]] | tuple[dict[int, list[torch.Tensor]]],
+        batch: dict[int, list[torch.Tensor]]
+        | tuple[dict[int, list[torch.Tensor]]],
     ) -> int:
         """Infer an explicit batch size from a multi-agent combined batch."""
         if isinstance(batch, tuple):
@@ -273,7 +274,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     def _resolve_agent_sample_counts(
         self,
-        batch: dict[int, list[torch.Tensor]] | tuple[dict[int, list[torch.Tensor]]],
+        batch: dict[int, list[torch.Tensor]]
+        | tuple[dict[int, list[torch.Tensor]]],
     ) -> dict[int, int]:
         """Infer per-agent sample counts from a combined multi-agent batch."""
         if isinstance(batch, tuple):
@@ -400,6 +402,14 @@ class BaseOrchestrator(l.LightningModule, ABC):
             batch=batch,
             batch_idx=batch_idx,
             prefix='train',
+        )
+        self.log(
+            'train/total_loss_step',
+            loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            batch_size=self._resolve_batch_size(batch),
         )
         return loss
 

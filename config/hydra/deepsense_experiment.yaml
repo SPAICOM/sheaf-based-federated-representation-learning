@@ -1,0 +1,49 @@
+defaults:
+  - dataset: deepsense
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: adam
+  - _self_
+
+seed: 42
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.3
+  m: 3
+
+model:
+  encoder_hidden_dims: [32, 64, 128]
+  decoder_hidden_dims: [256]
+  dropout: 0.1
+  use_batchnorm: true
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sheaf-repr-learning__deepsense
+  name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 5
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 10
+
+callbacks:
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: validation/global_task_performance_epoch
+    mode: max
+    save_top_k: 1
+    save_last: true
+
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: validation/global_task_performance_epoch
+    patience: 10
+    mode: max

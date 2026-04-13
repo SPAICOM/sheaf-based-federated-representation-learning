@@ -59,9 +59,13 @@ class DeepSenseDataset(Dataset):
         2: (2, 32, 32),  # LiDAR
     }
 
-    def __init__(self, root: str) -> None:
+    def __init__(
+        self,
+        root: str,
+        scenario: str,
+    ) -> None:
         self.root = Path(root)
-        self.csv_path = self.root / 'scenario30.csv'
+        self.csv_path = self.root / f'scenario{scenario}.csv'
         if not self.csv_path.exists():
             raise FileNotFoundError(
                 f'DeepSense CSV not found at {self.csv_path}'
@@ -94,7 +98,7 @@ class DeepSenseDataset(Dataset):
         x_rgb = self._load_rgb(row['unit1_rgb'])
         x_mmwave = self._load_mmwave(row['unit1_pwr_60ghz'])
         x_lidar = self._load_lidar(row['unit1_lidar'])
-        label = self._load_label(row['unit1_label'])
+        label = self._load_label(row['unit1_blockage'])
 
         return {0: x_rgb, 1: x_mmwave, 2: x_lidar, 'label': label}
 
@@ -170,7 +174,8 @@ class DeepSenseDataset(Dataset):
             label_path = self._resolve_path(path)
             with open(label_path) as f:
                 val = float(f.read().strip())
-            return torch.tensor(int(val), dtype=torch.long)
+            label = 0 if val == 0.0 else 1
+            return torch.tensor(label, dtype=torch.long)
         except Exception:
             return torch.tensor(0, dtype=torch.long)
 
@@ -187,10 +192,12 @@ class DeepSenseModalityDataset(Dataset):
         base_dataset: DeepSenseDataset,
         modality_idx: int,
         sample_ids: list[int] | None = None,
+        return_sample_ids: bool = False,
     ) -> None:
         self.base_dataset = base_dataset
         self.modality_idx = modality_idx
         self.sample_ids = sample_ids
+        self.return_sample_ids = return_sample_ids
 
     def __len__(self) -> int:
         if self.sample_ids is not None:
@@ -212,7 +219,7 @@ class DeepSenseModalityDataset(Dataset):
         x = sample[self.modality_idx]
         label = sample['label']
 
-        if self.sample_ids is not None:
+        if self.return_sample_ids and self.sample_ids is not None:
             sample_id = torch.tensor(self.sample_ids[idx], dtype=torch.long)
             return x, label, sample_id
 
@@ -289,7 +296,8 @@ class DeepSenseDataModule(l.LightningDataModule):
     def __init__(
         self,
         data_path: str = './data/DeepSense',
-        gdrive_folder_id: str | None = None,
+        gdrive_file_id: str | None = None,
+        scenario: str | None = None,
         split_strategy: str = 'full',
         agent_modalities: dict[int, list[int]] | None = None,
         n_agents: int = 3,
@@ -305,7 +313,8 @@ class DeepSenseDataModule(l.LightningDataModule):
         super().__init__()
 
         self.data_path = Path(data_path)
-        self.gdrive_folder_id = gdrive_folder_id
+        self.gdrive_file_id = gdrive_file_id
+        self.scenario = scenario
         self.split_strategy = split_strategy
         self.n_agents = n_agents
         self.batch_size = batch_size
@@ -325,31 +334,25 @@ class DeepSenseDataModule(l.LightningDataModule):
     def prepare_data(self) -> None:
         """Download and extract DeepSense dataset if not present.
 
-        Downloads from Google Drive using gdown if the scenario30.csv
-        file is not found in the data directory.
+        Downloads scenario30.zip directly from Google Drive by file ID.
         """
-        csv_path = self.data_path / 'scenario30.csv'
+        csv_path = self.data_path / f'scenario{self.scenario}.csv'
         if csv_path.exists():
             return
 
+        if not self.gdrive_file_id:
+            raise RuntimeError(
+                'DeepSense dataset not found. '
+                'Provide gdrive_file_id in your config yaml.'
+            )
+
         self.data_path.mkdir(parents=True, exist_ok=True)
-        zip_path = self.data_path / DEEPSENSE_ZIP_NAME
+        zip_path = self.data_path / f'scenario{self.scenario}.zip'
 
         if not zip_path.exists():
-            if not self.gdrive_folder_id:
-                raise RuntimeError(
-                    'DeepSense dataset not found. '
-                    'Provide gdrive_folder_id in your config yaml.'
-                )
-
-            folder_id = self.gdrive_folder_id
-            dl_msg = f'[prepare_data] Downloading from {folder_id} …'
-            print(dl_msg)
+            print(f'[prepare_data] Downloading {DEEPSENSE_ZIP_NAME} …')
             gdown.download(
-                f'https://drive.google.com/drive/folders/{folder_id}',
-                str(zip_path),
-                fuzzy=True,
-                format='zip',
+                id=self.gdrive_file_id, output=str(zip_path), quiet=False
             )
 
         if not zip_path.exists():
@@ -602,12 +605,8 @@ class DeepSenseDataModule(l.LightningDataModule):
 
     def setup(self, stage: str | None = None) -> None:
         if stage == 'test' or stage is None:
-            self._base_dataset = DeepSenseDataset(str(self.data_path))
-            all_labels = np.array(
-                [
-                    self._base_dataset[i]['label'].item()
-                    for i in range(len(self._base_dataset))
-                ]
+            self._base_dataset = DeepSenseDataset(
+                str(self.data_path), self.scenario
             )
 
             split_indices = compute_split_indices(
@@ -624,6 +623,14 @@ class DeepSenseDataModule(l.LightningDataModule):
             self.test_datasets: dict[int, list[DeepSenseModalityDataset]] = {}
             self.pilot_datasets: dict[int, list[DeepSenseModalityDataset]] = {}
             self.num_classes: dict = {}
+
+            num_samples_to_check = min(5000, len(self._base_dataset))
+            sample_labels = set()
+            for i in range(
+                0, num_samples_to_check, max(1, num_samples_to_check // 100)
+            ):
+                sample_labels.add(self._base_dataset[i]['label'].item())
+            self.num_classes['label'] = len(sample_labels)
 
             if self.split_strategy == 'full':
                 self._split_data_full(split_indices)
@@ -645,14 +652,17 @@ class DeepSenseDataModule(l.LightningDataModule):
                             self._base_dataset,
                             mod_idx,
                             sample_ids=split_indices['pilot'],
+                            return_sample_ids=True,
                         )
                         for mod_idx in self.agent_modalities[agent_id]
                     ]
 
-            first_modality = self.agent_modalities[0][0]
-            shape = self.MODALITY_SHAPES[first_modality]
-            self.input_shape = dict.fromkeys(range(self.n_agents), shape)
-            self.input_dims = {str(i): shape[0] for i in range(self.n_agents)}
+            self.input_shape = {}
+            self.input_dims = {}
+            for agent_id, mod_list in self.agent_modalities.items():
+                shape = self.MODALITY_SHAPES[mod_list[0]]
+                self.input_shape[agent_id] = shape
+                self.input_dims[str(agent_id)] = shape[0]
             self.num_classes['label'] = 2
 
     def _make_loader(
@@ -660,8 +670,12 @@ class DeepSenseDataModule(l.LightningDataModule):
         datasets: list[DeepSenseModalityDataset],
         shuffle: bool,
     ) -> DataLoader:
+        if len(datasets) == 1:
+            dataset = datasets[0]
+        else:
+            dataset = torch.utils.data.ConcatDataset(datasets)
         return DataLoader(
-            datasets,
+            dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,

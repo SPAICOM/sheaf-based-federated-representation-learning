@@ -1,6 +1,7 @@
 """Utility modules for building neural network components.
 
 This module provides reusable neural network building blocks including:
+- BaseEncoder: Abstract base class for fixed-output-dim encoders
 - CNN: Convolutional encoder with configurable blocks
 - TimmEncoder: Wrapper for timm models with preprocessing
 - MLP: Fully connected network with flexible configuration
@@ -15,6 +16,28 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
+
+
+class BaseEncoder(nn.Module):
+    """Base class for modality encoders that emit fixed-size node embeddings.
+
+    Subclasses must implement ``forward`` and set ``output_dim`` via
+    ``super().__init__(output_dim)``.  PersonalizedClassifier reads
+    ``encoder.output_dim`` to wire up the decoder automatically.
+
+    Parameters
+    ----------
+    output_dim : int
+        Dimensionality of the flat embedding produced by ``forward``.
+    """
+
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.output_dim = output_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode input tensor ``x`` into a latent vector of size ``output_dim``."""
+        raise NotImplementedError
 
 
 class CNN(nn.Module):
