@@ -423,10 +423,11 @@ class HeteroCNN(nn.Module):
         layers = []
         in_ch = in_features
         for out_ch in hidden_dims:
+            scaled_out_ch = int(out_ch * rate)
             layers.append(
                 HeteroConvLayer(
                     in_ch,
-                    out_ch * rate,
+                    scaled_out_ch,
                     rate,
                     use_batchnorm,
                     kernel_size=3,
@@ -437,9 +438,9 @@ class HeteroCNN(nn.Module):
             layers.append(nn.MaxPool2d(2))
             if dropout > 0:
                 layers.append(nn.Dropout2d(p=dropout))
-            in_ch = out_ch
+            in_ch = scaled_out_ch
 
-        self.out_features: int = hidden_dims[-1] * rate
+        self.out_features: int = int(hidden_dims[-1] * rate)
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -519,14 +520,17 @@ class HeteroMLP(nn.Module):
         # Build hidden layers sequentially
         # Each layer: Linear -> [BatchNorm] -> Activation -> [Dropout]
         for h_dim in hidden_dims:
+            scaled_h_dim = int(rate * h_dim)
             # Linear transformation from previous dimension to hidden dimension
             # with Scaler adapter
-            layers.append(nn.Linear(prev_dim, rate * h_dim))
+            layers.append(nn.Linear(prev_dim, scaled_h_dim))
             layers.append(Scaler(rate))
 
             # Optional batch normalization after linear transformation
             if use_batchnorm:
-                layers.append(nn.BatchNorm1d(h_dim, track_running_stats=False))
+                layers.append(
+                    nn.BatchNorm1d(scaled_h_dim, track_running_stats=False)
+                )
 
             # Activation function (handle both class and instance)
             layers.append(
@@ -538,7 +542,7 @@ class HeteroMLP(nn.Module):
                 layers.append(nn.Dropout(dropout))
 
             # Output of this layer becomes input to next
-            prev_dim = h_dim
+            prev_dim = scaled_h_dim
 
         # Final output layer (no activation, dropout, or batchnorm)
         layers.append(nn.Linear(prev_dim, output_dim))
