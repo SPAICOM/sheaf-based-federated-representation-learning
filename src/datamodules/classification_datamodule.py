@@ -181,9 +181,10 @@ class ClassificationDataModule(l.LightningDataModule):
         Number of classes randomly assigned to each agent. Only used when
         split_strategy='non_iid'. Default: 2.
     alpha : float, optional
-        Dirichlet concentration parameter controlling statistical skew
-        when split_strategy='non_iid'. Lower values produce more skew
-        (one agent gets most samples), higher values approach uniform.
+        Allocation parameter controlling statistical skew when
+        split_strategy='non_iid'. Positive values use a Dirichlet draw:
+        lower values produce more skew and higher values approach uniform.
+        Negative values switch to a bounded-uniform allocation heuristic.
         Default: 0.5.
     batch_size : int, optional
         Batch size for dataloaders (default: 64).
@@ -195,6 +196,15 @@ class ClassificationDataModule(l.LightningDataModule):
         Fraction of data for validation (default: 0.1).
     test_split : float, optional
         Fraction of data for testing (default: 0.1).
+    monitor_test_during_fit : bool, optional
+        If ``True``, include the test loader as an auxiliary validation
+        dataloader during ``fit`` so test metrics are logged periodically
+        under a separate prefix. Default: False.
+    include_pilot_loaders : bool, optional
+        If ``True``, attach auxiliary ``pilot_*`` loaders to the train,
+        validation, and test CombinedLoaders when pilot data is available.
+        This is only required by anchor strategies such as
+        ``semantic_pilots``. Default: True.
     seed : int, optional
         Random seed for reproducibility (default: 42).
 
@@ -236,6 +246,8 @@ class ClassificationDataModule(l.LightningDataModule):
         mode: str = 'min_size',
         val_split: float = 0.1,
         test_split: float = 0.1,
+        monitor_test_during_fit: bool = False,
+        include_pilot_loaders: bool = True,
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
@@ -262,6 +274,8 @@ class ClassificationDataModule(l.LightningDataModule):
 
         self.val_split = val_split
         self.test_split = test_split
+        self.monitor_test_during_fit = monitor_test_during_fit
+        self.include_pilot_loaders = include_pilot_loaders
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
         self.pilot_batch_size = (
@@ -462,8 +476,9 @@ class ClassificationDataModule(l.LightningDataModule):
 
         Each agent is randomly assigned ``classes_per_agent`` classes.
         Samples for each class are distributed among the agents assigned
-        to that class with random Dirichlet-drawn proportions, producing
-        statistical skew (``alpha`` controls the degree of imbalance).
+        to that class with random proportions, producing statistical skew
+        (positive ``alpha`` uses Dirichlet draws; negative ``alpha`` uses a
+        bounded-uniform heuristic).
         No manual ``agent_classes`` needed.
 
         Parameters
@@ -659,7 +674,7 @@ class ClassificationDataModule(l.LightningDataModule):
             i: self._make_loader(self.train_datasets[i], True)
             for i in self.train_datasets
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.train_datasets.values()
@@ -675,12 +690,12 @@ class ClassificationDataModule(l.LightningDataModule):
             )
         return CombinedLoader(loaders, mode=self.mode)
 
-    def val_dataloader(self) -> CombinedLoader:
+    def val_dataloader(self) -> CombinedLoader | list[CombinedLoader]:
         loaders = {
             i: self._make_loader(self.val_datasets[i], False)
             for i in self.val_datasets
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.val_datasets.values()
@@ -694,14 +709,17 @@ class ClassificationDataModule(l.LightningDataModule):
                     for i in self.pilot_datasets
                 }
             )
-        return CombinedLoader(loaders, mode=self.mode)
+        val_loader = CombinedLoader(loaders, mode=self.mode)
+        if not self.monitor_test_during_fit:
+            return val_loader
+        return [val_loader, self.test_dataloader()]
 
     def test_dataloader(self) -> CombinedLoader:
         loaders = {
             i: self._make_loader(self.test_datasets[i], False)
             for i in self.test_datasets
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.test_datasets.values()

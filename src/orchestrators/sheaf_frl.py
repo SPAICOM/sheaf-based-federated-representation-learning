@@ -549,7 +549,7 @@ class SheafFRL(BaseOrchestrator):
                         labels_per_agent[idx].detach().cpu()
                     )
 
-        if prefix in {'train', 'test'} and batch_latents:
+        if prefix in {'train', 'test', 'test_monitor'} and batch_latents:
             self._record_anchor_bundle_communication(
                 batch_latents,
                 batch_anchor_keys,

@@ -41,7 +41,12 @@ class BaseOrchestrator(l.LightningModule, ABC):
     - Subclasses must implement ``_shared_eval`` for evaluation logic.
     """
 
-    _COMMUNICATION_SPLITS = ('train', 'validation', 'test')
+    _COMMUNICATION_SPLITS = (
+        'train',
+        'validation',
+        'test_monitor',
+        'test',
+    )
 
     def __init__(
         self,
@@ -57,6 +62,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self.agents = nn.ModuleDict(
             {str(idx): agent for idx, agent in agents.items()}
         )
+        self._validation_prefixes_seen: set[str] = set()
         self._reset_communication_state()
 
     def _empty_communication_state(self) -> dict[str, float]:
@@ -79,7 +85,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     def on_validation_start(self) -> None:
         """Reset validation communication accounting at validation start."""
+        self._validation_prefixes_seen = set()
         self._reset_split_communication('validation')
+        self._reset_split_communication('test_monitor')
 
     def on_test_start(self) -> None:
         """Reset test communication accounting at test start."""
@@ -169,6 +177,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             on_step=False,
             on_epoch=True,
             prog_bar=False,
+            add_dataloader_idx=False,
         )
 
     def _finalize_stage_communication(self, prefix: str) -> None:
@@ -179,15 +188,21 @@ class BaseOrchestrator(l.LightningModule, ABC):
             on_step=False,
             on_epoch=True,
             prog_bar=False,
+            add_dataloader_idx=False,
         )
 
     def on_validation_epoch_end(self) -> None:
         """Log cumulative validation communication metrics."""
-        self._finalize_stage_communication('validation')
+        for prefix in sorted(self._validation_prefixes_seen):
+            self._finalize_stage_communication(prefix)
 
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
         self._finalize_stage_communication('test')
+
+    def _validation_prefix(self, dataloader_idx: int) -> str:
+        """Map validation dataloader indices to stable logging prefixes."""
+        return 'validation' if int(dataloader_idx) == 0 else 'test_monitor'
 
     def _log_shared_metrics(
         self,
@@ -231,6 +246,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 on_step=False,
                 on_epoch=True,
                 batch_size=batch_size,
+                add_dataloader_idx=False,
             )
 
         if normalized_losses:
@@ -296,6 +312,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             on_epoch=True,
             prog_bar=prog_bar,
             batch_size=batch_size,
+            add_dataloader_idx=False,
         )
         return total_task_loss, avg_performance
 
@@ -477,6 +494,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self,
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
+        dataloader_idx: int = 0,
     ) -> dict[int, torch.Tensor]:
         """Execute a single validation step.
 
@@ -492,10 +510,12 @@ class BaseOrchestrator(l.LightningModule, ABC):
         dict[int, tuple[torch.Tensor, torch.Tensor]]
             Dictionary mapping agent indices to (prediction, label) pairs.
         """
+        prefix = self._validation_prefix(dataloader_idx)
+        self._validation_prefixes_seen.add(prefix)
         output, _ = self._shared_eval(
             batch=batch,
             batch_idx=batch_idx,
-            prefix='validation',
+            prefix=prefix,
         )
         return output
 

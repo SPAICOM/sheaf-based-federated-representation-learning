@@ -31,7 +31,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.nn.utils import parameters_to_vector
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
@@ -100,13 +100,70 @@ class SheafFMTL(BaseOrchestrator):
                 self.projection_matrices[f'{i}_{j}'] = P_ij
 
     def on_train_epoch_end(self) -> None:
-        """No epoch-level aggregation needed for Sheaf-FMTL.
+        """Synchronize agent parameters and restriction maps once per epoch."""
+        agent_vectors = self._collect_agent_vectors()
+        projected_vectors = self._projected_edge_vectors(agent_vectors)
+        self._record_projected_vector_exchange(
+            projected_vectors,
+            prefix='train',
+        )
 
-        Both the Laplacian gradient penalty and the projection-matrix
-        update are applied at finer granularity (per-step and per-batch
-        respectively via ``on_before_optimizer_step`` and
-        ``on_train_batch_end``), so nothing is required here.
-        """
+        lr = self._current_learning_rate()
+
+        with torch.no_grad():
+            updated_agent_vectors = {}
+            for idx_str, agent in self.agents.items():
+                i = int(idx_str)
+                theta_i = agent_vectors[i]
+                sheaf_penalty_i = torch.zeros_like(theta_i)
+
+                for j in self.hparams.neighbors.get(i, set()):
+                    P_ij = self.projection_matrices[f'{i}_{j}']
+                    diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
+                        f'{j}_{i}'
+                    ]
+                    sheaf_penalty_i += self.hparams.lambda_reg * torch.matmul(
+                        P_ij.t(), diff_ij
+                    )
+
+                updated_agent_vectors[i] = theta_i - lr * sheaf_penalty_i
+
+            for idx_str, agent in self.agents.items():
+                i = int(idx_str)
+                trainable_params = [
+                    p for p in agent.parameters() if p.requires_grad
+                ]
+                vector_to_parameters(
+                    updated_agent_vectors[i],
+                    trainable_params,
+                )
+
+            updated_projected_vectors = self._projected_edge_vectors(
+                updated_agent_vectors
+            )
+            self._record_projected_vector_exchange(
+                updated_projected_vectors,
+                prefix='train',
+            )
+
+            projection_updates = {}
+            for edge_key, _P_ij in self.projection_matrices.items():
+                i_str, j_str = edge_key.split('_')
+                i, j = int(i_str), int(j_str)
+                theta_i = updated_agent_vectors[i]
+                diff = (
+                    updated_projected_vectors[edge_key]
+                    - updated_projected_vectors[f'{j}_{i}']
+                )
+                projection_updates[edge_key] = (
+                    self.hparams.eta
+                    * self.hparams.lambda_reg
+                    * torch.outer(diff, theta_i)
+                )
+
+            for edge_key, update_matrix in projection_updates.items():
+                self.projection_matrices[edge_key].data -= update_matrix
+
         self._finalize_train_epoch_communication()
 
     def _collect_agent_vectors(self) -> dict[int, torch.Tensor]:
@@ -149,96 +206,111 @@ class SheafFMTL(BaseOrchestrator):
         for projected_vector in projected_vectors.values():
             self._record_communication(projected_vector, prefix=prefix)
 
-    def on_before_optimizer_step(self, optimizer: Any) -> None:
-        """
-        Calculate the sheaf Laplacian penalty and add it directly to
-        parameter.grad.
+    def _current_learning_rate(self) -> float:
+        """Resolve the optimizer learning rate for epoch-level sheaf updates."""
+        trainer = getattr(self, '_trainer', None)
+        if trainer is not None and getattr(trainer, 'optimizers', None):
+            optimizers = trainer.optimizers
+            if optimizers and optimizers[0].param_groups:
+                return float(optimizers[0].param_groups[0].get('lr', 0.0))
 
-        Penalty on theta_i:
-        lambda * sum(P_ij^T * (P_ij*theta_i - P_ji*theta_j))
-        """
-        agent_vectors = self._collect_agent_vectors()
-        projected_vectors = self._projected_edge_vectors(agent_vectors)
-        self._record_projected_vector_exchange(
-            projected_vectors,
-            prefix='train',
-        )
+        optimizer_cfg = getattr(self.hparams, 'optimizer', None)
+        if isinstance(optimizer_cfg, dict) and 'lr' in optimizer_cfg:
+            return float(optimizer_cfg['lr'])
+        if hasattr(optimizer_cfg, 'lr'):
+            return float(optimizer_cfg.lr)
+        return 0.0
 
-        # Compute gradients manually without autograd to avoid graph issues
-        with torch.no_grad():
-            for idx_str, agent in self.agents.items():
-                i = int(idx_str)
-                theta_i = agent_vectors[i]
+    # def on_before_optimizer_step(self, optimizer: Any) -> None:
+    #     """
+    #     Calculate the sheaf Laplacian penalty and add it directly to
+    #     parameter.grad.
+    #
+    #     Penalty on theta_i:
+    #     lambda * sum(P_ij^T * (P_ij*theta_i - P_ji*theta_j))
+    #     """
+    #     agent_vectors = self._collect_agent_vectors()
+    #     projected_vectors = self._projected_edge_vectors(agent_vectors)
+    #     self._record_projected_vector_exchange(
+    #         projected_vectors,
+    #         prefix='train',
+    #     )
+    #
+    #     # Compute gradients manually without autograd to avoid graph issues
+    #     with torch.no_grad():
+    #         for idx_str, agent in self.agents.items():
+    #             i = int(idx_str)
+    #             theta_i = agent_vectors[i]
+    #
+    #             grad_penalty_i = torch.zeros_like(theta_i)
+    #
+    #             neighbors_i = self.hparams.neighbors.get(i, set())
+    #             for j in neighbors_i:
+    #                 theta_j = agent_vectors[j]
+    #
+    #                 P_ij = self.projection_matrices[f'{i}_{j}']
+    #
+    #                 # diff_ij = P_ij * theta_i - P_ji * theta_j
+    #                 diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
+    #                     f'{j}_{i}'
+    #                 ]
+    #
+    #                 # grad_contribution = lambda * P_ij^T * diff_ij
+    #                 grad_penalty_i += self.hparams.lambda_reg * torch.matmul(
+    #                     P_ij.t(), diff_ij
+    #                 )
+    #
+    #             # Add the penalty directly to the parameters' gradients
+    #             pointer = 0
+    #             for p in agent.parameters():
+    #                 if p.requires_grad:
+    #                     numel = p.numel()
+    #                     # If param unused in forward pass, initialize grad
+    #                     if p.grad is None:
+    #                         p.grad = torch.zeros_like(p)
+    #
+    #                     # Add penalty to existing gradient
+    #                     p.grad += grad_penalty_i[
+    #                         pointer : pointer + numel
+    #                     ].view_as(p)
+    #                     pointer += numel
 
-                grad_penalty_i = torch.zeros_like(theta_i)
-
-                neighbors_i = self.hparams.neighbors.get(i, set())
-                for j in neighbors_i:
-                    theta_j = agent_vectors[j]
-
-                    P_ij = self.projection_matrices[f'{i}_{j}']
-
-                    # diff_ij = P_ij * theta_i - P_ji * theta_j
-                    diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
-                        f'{j}_{i}'
-                    ]
-
-                    # grad_contribution = lambda * P_ij^T * diff_ij
-                    grad_penalty_i += self.hparams.lambda_reg * torch.matmul(
-                        P_ij.t(), diff_ij
-                    )
-
-                # Add the penalty directly to the parameters' gradients
-                pointer = 0
-                for p in agent.parameters():
-                    if p.requires_grad:
-                        numel = p.numel()
-                        # If param unused in forward pass, initialize grad
-                        if p.grad is None:
-                            p.grad = torch.zeros_like(p)
-
-                        # Add penalty to existing gradient
-                        p.grad += grad_penalty_i[
-                            pointer : pointer + numel
-                        ].view_as(p)
-                        pointer += numel
-
-    def on_train_batch_end(
-        self, outputs: Any, batch: Any, batch_idx: int
-    ) -> None:
-        """
-        Execute the matrix update for P_ij.
-
-        P_ij = P_ij - eta * lambda * (P_ij*theta_i - P_ji*theta_j) * theta_i^T
-        """
-        agent_vectors = self._collect_agent_vectors()
-        projected_vectors = self._projected_edge_vectors(agent_vectors)
-        self._record_projected_vector_exchange(
-            projected_vectors,
-            prefix='train',
-        )
-
-        with torch.no_grad():
-            # We must compute all differences synchronously before updating
-            updates = {}
-            for edge_key, P_ij in self.projection_matrices.items():
-                i_str, j_str = edge_key.split('_')
-                i, j = int(i_str), int(j_str)
-
-                theta_i = agent_vectors[i]
-
-                # diff = P_ij * theta_i - P_ji * theta_j  (shape: d_ij)
-                diff = projected_vectors[edge_key] - projected_vectors[f'{j}_{i}']
-
-                # update: outer product diff * theta_i^T (shape: d_ij x d_i)
-                grad_P_ij = torch.outer(diff, theta_i)
-                updates[edge_key] = (
-                    self.hparams.eta * self.hparams.lambda_reg * grad_P_ij
-                )
-
-            # Apply updates
-            for edge_key, update_matrix in updates.items():
-                self.projection_matrices[edge_key].data -= update_matrix
+    # def on_train_batch_end(
+    #     self, outputs: Any, batch: Any, batch_idx: int
+    # ) -> None:
+    #     """
+    #     Execute the matrix update for P_ij.
+    #
+    #     P_ij = P_ij - eta * lambda * (P_ij*theta_i - P_ji*theta_j) * theta_i^T
+    #     """
+    #     agent_vectors = self._collect_agent_vectors()
+    #     projected_vectors = self._projected_edge_vectors(agent_vectors)
+    #     self._record_projected_vector_exchange(
+    #         projected_vectors,
+    #         prefix='train',
+    #     )
+    #
+    #     with torch.no_grad():
+    #         # We must compute all differences synchronously before updating
+    #         updates = {}
+    #         for edge_key, P_ij in self.projection_matrices.items():
+    #             i_str, j_str = edge_key.split('_')
+    #             i, j = int(i_str), int(j_str)
+    #
+    #             theta_i = agent_vectors[i]
+    #
+    #             # diff = P_ij * theta_i - P_ji * theta_j  (shape: d_ij)
+    #             diff = projected_vectors[edge_key] - projected_vectors[f'{j}_{i}']
+    #
+    #             # update: outer product diff * theta_i^T (shape: d_ij x d_i)
+    #             grad_P_ij = torch.outer(diff, theta_i)
+    #             updates[edge_key] = (
+    #                 self.hparams.eta * self.hparams.lambda_reg * grad_P_ij
+    #             )
+    #
+    #         # Apply updates
+    #         for edge_key, update_matrix in updates.items():
+    #             self.projection_matrices[edge_key].data -= update_matrix
 
     def _shared_eval(
         self,

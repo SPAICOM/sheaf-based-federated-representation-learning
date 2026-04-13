@@ -312,6 +312,15 @@ def main(cfg: DictConfig) -> float:
             cfg.agent_classes, resolve=True
         )
 
+    anchor_strategy = str(
+        cfg.get('orchestrator', {}).get('anchor_strategy', '')
+    )
+    requires_pilot_loaders = anchor_strategy == 'semantic_pilots'
+    dataset_cfg['include_pilot_loaders'] = requires_pilot_loaders
+    if not requires_pilot_loaders:
+        dataset_cfg['pilot_split'] = 0.0
+        dataset_cfg['pilot_num_samples'] = None
+
     # Pass 'agents' config to datamodule only for SemanticDataModule
     # SemanticDataModule loads pre-computed embeddings from HuggingFace
     # and needs per-agent model configs (e.g., which embedding model to use).
@@ -453,8 +462,8 @@ def main(cfg: DictConfig) -> float:
 
     # Clean up temporary directories created by Hydra, WandB, and Lightning
     # These directories can accumulate over multiple experiment runs
-    #remove_non_empty_dir('./multirun/')
-    #remove_non_empty_dir('./outputs/')
+    remove_non_empty_dir('./multirun/')
+    remove_non_empty_dir('./outputs/')
     remove_non_empty_dir('~/.cache/wandb/')
     remove_non_empty_dir(cfg.logger.project)
     _finish_active_wandb_run()

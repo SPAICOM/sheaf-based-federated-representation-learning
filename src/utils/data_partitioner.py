@@ -124,7 +124,22 @@ def _draw_dirichlet_proportions(
     alpha: float,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    """Draw symmetric Dirichlet proportions with a deterministic generator."""
+    """Draw class-allocation proportions with a deterministic generator.
+
+    Non-negative ``alpha`` uses a symmetric Dirichlet. Negative ``alpha``
+    switches to the bounded uniform heuristic used by the heterogeneity
+    experiments.
+    """
+
+    # If alpha is negative, use the exact pFedHN logic
+    # to guarantee the tight sample bounds [1325, 2000] 
+    if alpha < 0:
+        probs = torch.rand(n_parts, generator=generator, dtype=torch.float32) * 0.2 + 0.4
+        probs_sum = probs.sum()
+        if probs_sum <= 0:
+            return torch.full((n_parts,), 1 / n_parts, dtype=torch.float32)
+        return probs / probs_sum
+
     concentration = torch.full((n_parts,), float(alpha), dtype=torch.float32)
     gamma_samples = torch._standard_gamma(concentration, generator=generator)
     gamma_sum = gamma_samples.sum()
@@ -213,8 +228,10 @@ def partition_non_iid(
     seed : int, optional
         Random seed for reproducibility.
     alpha : float, optional
-        Symmetric Dirichlet concentration parameter. Lower values increase
-        skew, higher values approach a more even class-wise split.
+        Allocation concentration parameter. Positive values use a symmetric
+        Dirichlet, where lower values increase skew and higher values
+        approach a more even class-wise split. Negative values switch to a
+        bounded-uniform sampling scheme before normalization.
     agent_classes : dict[int, list[int]] | None, optional
         Explicit class assignments to reuse across multiple dataset splits.
         When omitted, assignments are sampled randomly.
@@ -230,8 +247,8 @@ def partition_non_iid(
         raise ValueError('n_agents must be at least 1')
     if classes_per_agent < 1:
         raise ValueError('classes_per_agent must be at least 1')
-    if alpha <= 0:
-        raise ValueError('alpha must be strictly positive')
+    if alpha == 0:
+        raise ValueError('alpha must be non-zero')
 
     labels_tensor = torch.tensor(labels, dtype=torch.long)
     if labels_tensor.numel() == 0:

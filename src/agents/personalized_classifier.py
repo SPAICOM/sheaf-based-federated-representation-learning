@@ -104,6 +104,7 @@ class PersonalizedClassifier(BaseAgent):
         """Forward pass: encode then decode to class logits."""
         return self._decoder(self.encode(x))
 
+    # TODO: add l2 regularization to loss 
     def compute_loss(
         self, y_hat: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:

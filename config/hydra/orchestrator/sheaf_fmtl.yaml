@@ -1,6 +1,6 @@
 _target_: src.orchestrators.sheaf_fmtl.SheafFMTL
 
-gamma: 0.001
+gamma: 0.01
 lambda_reg: 0.001
 eta: 0.01
 

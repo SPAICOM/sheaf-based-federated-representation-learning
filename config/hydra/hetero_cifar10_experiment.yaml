@@ -6,29 +6,21 @@ defaults:
   - _self_
 
 seed: 42
-
-agents:
-  0:
-    encoder_hidden_dims: [32, 64, 128]
-  1:
-    encoder_hidden_dims: [32, 64, 128]
-  2:
-    encoder_hidden_dims: [32, 64, 128]
-  3:
-    encoder_hidden_dims: [32, 64, 128]
+study_name: "H CIFAR10"
 
 graph:
-  neighbors_mode: "fully_connected"
+  neighbors_mode: "erdos_renyi"
   seed: 42
-  p: 0.3
+  #p: 0.3
+  p: 0.15
   m: 3
   neighbors: {}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__hetero-cifar10
+  project: sheaf-repr-learning__30-agents
   group: ${study_name}
-  name: trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -47,46 +39,69 @@ callbacks:
 
   checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    monitor: validation/global_task_performance_epoch
+    monitor: validation/avg_task_performance_epoch
     mode: max
     save_top_k: 1
     save_last: true
 
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: validation/global_task_performance_epoch
+    monitor: validation/avg_task_performance_epoch
     patience: 5
     mode: max
 
+
 dataset:
+  # each client is randomly assigned exactly 5 classes
+  # To introduce sample size heterogeneity, the number of samples per class assigned to each client is drawn
+  # from a Dirichlet distribution (α=15 approx equal n samples), ensuring mutually exclusive, non-IID local datasets while
+  # preserving the global train/test splits
+  # If alpha is negative, unif(a,b) is used for proportions
+  split_strategy: non_iid
+  n_agents: 30
+  classes_per_agent: 5
+  alpha: 15 
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.05
+  pilot_batch_size: 64
+
+
+#dataset:
+  # Simplified 4 agents - 2 overlapping classes dataset
   # Partial label-overlap federated setting with disjoint local datasets.
   # Each client receives unique local samples only: no example is duplicated
   # across clients in train/val/test. Exactly `shared_classes` labels are
   # shared across all clients, while the remaining classes are distributed
   # non-uniformly across clients. For shared labels, clients observe different
   # samples from the same class rather than replicated examples.
-  split_strategy: class_partition
-  n_agents: 4
-  shared_classes: 2
-  batch_size: 128
-  num_workers: 4
-  mode: min_size
-  pilot_split: 0.05
-  pilot_batch_size: 64
+#  split_strategy: class_partition
+#  n_agents: 4
+#  shared_classes: 2
+#  batch_size: 128
+#  num_workers: 4
+#  mode: min_size
+#  pilot_split: 0.05
+#  pilot_batch_size: 64
 
 model:
   encoder_hidden_dims: [32, 64, 128]
   decoder_hidden_dims: [256]
+  #encoder_hidden_dims: [32, 64]
+  #decoder_hidden_dims: [120]
   dropout: 0.1
   use_batchnorm: true
 
 orchestrator:
   lambda_sheaf: 0.05
-  anchor_strategy: semantic_pilots
+  anchor_strategy: prototype
   num_anchors: 64
   parseval_normalization: false
   l2_normalization: false
 
+
 optimization:
-  objective_metric: validation/global_task_performance_epoch
+  objective_metric: validation/avg_task_performance_epoch
   run_test: true

@@ -47,20 +47,21 @@ callbacks:
 
   checkpoint:
     _target_: lightning.pytorch.callbacks.ModelCheckpoint
-    monitor: validation/global_task_performance_epoch
+    monitor: validation/avg_task_performance_epoch
     mode: max
     save_top_k: 1
     save_last: true
 
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
-    monitor: validation/global_task_performance_epoch
+    monitor: validation/avg_task_performance_epoch
     patience: 5
     mode: max
 
 dataset:
   split_strategy: uniform
   n_agents: 4
+  monitor_test_during_fit: true
   batch_size: 128
   num_workers: 4
   mode: min_size
@@ -81,5 +82,5 @@ orchestrator:
   l2_normalization: false
 
 optimization:
-  objective_metric: validation/global_task_performance_epoch
+  objective_metric: validation/avg_task_performance_epoch
   run_test: true

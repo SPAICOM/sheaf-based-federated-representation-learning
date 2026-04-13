@@ -174,6 +174,7 @@ class SemanticDataModule(l.LightningDataModule):
         mode: str = 'min_size',
         val_split: float = 0.1,
         test_split: float = 0.1,
+        include_pilot_loaders: bool = True,
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
@@ -223,6 +224,7 @@ class SemanticDataModule(l.LightningDataModule):
 
         self.val_split = val_split
         self.test_split = test_split
+        self.include_pilot_loaders = include_pilot_loaders
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
         self.pilot_batch_size = (
@@ -487,7 +489,7 @@ class SemanticDataModule(l.LightningDataModule):
             m: self._make_loader(ds, True)
             for m, ds in self.train_datasets.items()
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.train_datasets.values()
@@ -515,7 +517,7 @@ class SemanticDataModule(l.LightningDataModule):
             m: self._make_loader(ds, False)
             for m, ds in self.val_datasets.items()
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.val_datasets.values()
@@ -543,7 +545,7 @@ class SemanticDataModule(l.LightningDataModule):
             m: self._make_loader(ds, False)
             for m, ds in self.test_datasets.items()
         }
-        if self.pilot_datasets:
+        if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.test_datasets.values()
