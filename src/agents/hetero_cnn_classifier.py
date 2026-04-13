@@ -11,7 +11,7 @@ from .utils import HeteroCNN
 
 
 class HeteroCNNClassifier(PersonalizedClassifier):
-    """CNN-based classifier built on top of PersonalizedClassifier.
+    """HeteroCNN-based classifier built on top of PersonalizedClassifier.
 
     Constructs a CNN encoder from the given architecture parameters and
     delegates everything else to PersonalizedClassifier.
@@ -49,12 +49,11 @@ class HeteroCNNClassifier(PersonalizedClassifier):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
 
-        encoder = CNN(
+        encoder = HeteroCNN(
             in_features=in_features,
             hidden_dims=encoder_hidden_dims,
+            rate=rate,
             dropout=dropout,
-            activation=activation,
-            use_batchnorm=use_batchnorm,
         )
 
         super().__init__(

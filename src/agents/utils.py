@@ -293,12 +293,18 @@ class MLP(nn.Module):
             Output tensor of shape (batch_size, output_dim).
         """
         return self.network(x)
-    
+
+
+# --------------------------------------------
+# ----------- MODULES FOR HETEROFL -----------
+# --------------------------------------------
+
+
 class Scaler(nn.Module):
-    """Scaler module from "HeteroFL [...]". 
-    It is required to keep the magnitude of the gradients 
-    comparable across clients according to the model 
-    inherent complexity width-wise. 
+    """Scaler module from "HeteroFL [...]".
+    It is required to keep the magnitude of the gradients
+    comparable across clients according to the model
+    inherent complexity width-wise.
 
     Parameters
     ----------
@@ -306,23 +312,18 @@ class Scaler(nn.Module):
         Determines the scaling factor of the method (r ** p)
     """
 
-    def __init__(
-        self,
-        rate: float
-    ) -> None:
+    def __init__(self, rate: float) -> None:
         super().__init__()
-        assert rate != 0.0, "Rate must be non-zero"
+        assert rate != 0.0, 'Rate must be non-zero'
         self.rate = rate
-    
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> torch.Tensor:
-        
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         return x / self.rate
 
+
 class HeteroConvLayer(nn.Module):
-    """ Convolutional layer for HeteroFL
+    """Convolutional layer for HeteroFL
     Concatenates Conv, Scaler, statBN and ReLU
 
     Parameters
@@ -339,11 +340,11 @@ class HeteroConvLayer(nn.Module):
 
     def __init__(
         self,
-        in_ch: int, 
+        in_ch: int,
         out_ch: int,
         rate: float = 1.0,
         use_batchnorm: bool = True,
-        **conv_kwargs
+        **conv_kwargs,
     ) -> None:
         super().__init__()
 
@@ -354,23 +355,21 @@ class HeteroConvLayer(nn.Module):
         ]
 
         if use_batchnorm:
-            # The static Batch Normalization layer requires 
-            # the statistics not be tracked during training
+            # The static Batch Normalization layer requires
+            # the statistics not to be tracked during training
             layers.append(nn.BatchNorm2d(out_ch, track_running_stats=False))
 
         layers.append(nn.ReLU(inplace=True))
 
         self.layer = nn.Sequential(*layers)
 
-    def forward(
-        self,
-        x: torch.Tensor
-    ) -> torch.Tensor:
-        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
         return self.layer(x)
 
+
 class HeteroCNN(nn.Module):
-    """Hetero Convolutional encoder.
+    """Heterogeneous Convolutional encoder.
 
     This module implements a hetero CNN architecture suitable for feature
     extraction from 2D inputs like images. It returns spatial feature maps
@@ -426,12 +425,12 @@ class HeteroCNN(nn.Module):
         for out_ch in hidden_dims:
             layers.append(
                 HeteroConvLayer(
-                    in_ch, 
-                    out_ch*rate, 
-                    rate, 
-                    use_batchnorm, 
-                    kernel_size=3, 
-                    padding=1
+                    in_ch,
+                    out_ch * rate,
+                    rate,
+                    use_batchnorm,
+                    kernel_size=3,
+                    padding=1,
                 )
             )
 
@@ -440,7 +439,7 @@ class HeteroCNN(nn.Module):
                 layers.append(nn.Dropout2d(p=dropout))
             in_ch = out_ch
 
-        self.out_features: int = hidden_dims[-1]*rate
+        self.out_features: int = hidden_dims[-1] * rate
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -451,3 +450,113 @@ class HeteroCNN(nn.Module):
         spatial dimensions to a flat latent vector.
         """
         return self.layers(x)
+
+
+class HeteroMLP(nn.Module):
+    """Fully connected neural network
+    (multi-layer perceptron) for heterogenous settings.
+
+    Parameters
+    ----------
+    input_dim : int
+        Dimensionality of the input features.
+    output_dim : int
+        Dimensionality of the output features.
+    hidden_dims : list[int] | None, optional
+        List of hidden layer dimensions. If None or empty, the network
+        reduces to a single linear layer.
+    rate : float
+        Width shrinking ratio for channel-level heterogeneity
+    activation : type[nn.Module], optional
+        Activation function class (e.g., nn.ReLU, nn.GELU).
+        Default: nn.ReLU.
+    dropout : float, optional
+        Dropout probability applied after each hidden layer (default: 0.0).
+    use_batchnorm : bool, optional
+        Whether to include BatchNorm1d after each linear layer
+        (default: False).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: list[int] | None = None,
+        rate: float = 1.0,
+        activation: type[nn.Module] = nn.ReLU,
+        dropout: float = 0.0,
+        use_batchnorm: bool = False,
+    ):
+        """Build the MLP network from input to output dimensions.
+
+        Parameters
+        ----------
+        input_dim : int
+            Dimensionality of the input features.
+        output_dim : int
+            Dimensionality of the output features.
+        hidden_dims : list[int] | None, optional
+            List of hidden layer dimensions. If None or empty, the network
+            reduces to a single linear layer.
+        activation : type[nn.Module], optional
+            Activation function class (e.g., nn.ReLU, nn.GELU).
+            Default: nn.ReLU.
+        dropout : float, optional
+            Dropout probability applied after each hidden layer (default: 0.0).
+        use_batchnorm : bool, optional
+            Whether to include BatchNorm1d after each linear layer
+            (default: False).
+        """
+        super().__init__()
+
+        # Default to empty list if no hidden layers specified
+        if hidden_dims is None:
+            hidden_dims = []
+
+        layers = []
+        prev_dim = input_dim
+
+        # Build hidden layers sequentially
+        # Each layer: Linear -> [BatchNorm] -> Activation -> [Dropout]
+        for h_dim in hidden_dims:
+            # Linear transformation from previous dimension to hidden dimension
+            # with Scaler adapter
+            layers.append(nn.Linear(prev_dim, rate * h_dim))
+            layers.append(Scaler(rate))
+
+            # Optional batch normalization after linear transformation
+            if use_batchnorm:
+                layers.append(nn.BatchNorm1d(h_dim, track_running_stats=False))
+
+            # Activation function (handle both class and instance)
+            layers.append(
+                activation() if isinstance(activation, type) else activation
+            )
+
+            # Optional dropout for regularization
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+            # Output of this layer becomes input to next
+            prev_dim = h_dim
+
+        # Final output layer (no activation, dropout, or batchnorm)
+        layers.append(nn.Linear(prev_dim, output_dim))
+
+        # Compose all layers into sequential network
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the MLP.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, input_dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape (batch_size, output_dim).
+        """
+        return self.network(x)
