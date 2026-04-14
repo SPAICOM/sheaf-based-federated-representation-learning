@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from src.datamodules.utils import (
+    PairwiseDataset,
     compute_split_indices,
     repeat_dataset_to_num_samples,
 )
@@ -240,6 +241,7 @@ class ClassificationDataModule(l.LightningDataModule):
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
         pilot_apply_agent_rotations: bool = False,
+        comm_data: str = 'private_pilots',
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -268,6 +270,7 @@ class ClassificationDataModule(l.LightningDataModule):
             batch_size if pilot_batch_size is None else pilot_batch_size
         )
         self.pilot_apply_agent_rotations = pilot_apply_agent_rotations
+        self.comm_data = comm_data
         self.seed = seed
 
     def _build_pilot_datasets(
@@ -664,15 +667,7 @@ class ClassificationDataModule(l.LightningDataModule):
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.train_datasets.values()
             )
-            loaders.update(
-                {
-                    f'pilot_{i}': self._make_pilot_loader(
-                        self.pilot_datasets[i],
-                        target_num_batches,
-                    )
-                    for i in self.pilot_datasets
-                }
-            )
+            self._add_pilot_loaders(loaders, target_num_batches)
         return CombinedLoader(loaders, mode=self.mode)
 
     def val_dataloader(self) -> CombinedLoader:
@@ -685,15 +680,7 @@ class ClassificationDataModule(l.LightningDataModule):
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.val_datasets.values()
             )
-            loaders.update(
-                {
-                    f'pilot_{i}': self._make_pilot_loader(
-                        self.pilot_datasets[i],
-                        target_num_batches,
-                    )
-                    for i in self.pilot_datasets
-                }
-            )
+            self._add_pilot_loaders(loaders, target_num_batches)
         return CombinedLoader(loaders, mode=self.mode)
 
     def test_dataloader(self) -> CombinedLoader:
@@ -706,6 +693,13 @@ class ClassificationDataModule(l.LightningDataModule):
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.test_datasets.values()
             )
+            self._add_pilot_loaders(loaders, target_num_batches)
+        return CombinedLoader(loaders, mode=self.mode)
+
+    def _add_pilot_loaders(
+        self, loaders: dict, target_num_batches: int
+    ) -> None:
+        if self.comm_data == 'private_pilots':
             loaders.update(
                 {
                     f'pilot_{i}': self._make_pilot_loader(
@@ -715,4 +709,18 @@ class ClassificationDataModule(l.LightningDataModule):
                     for i in self.pilot_datasets
                 }
             )
-        return CombinedLoader(loaders, mode=self.mode)
+        elif self.comm_data == 'shared_global_pilots':
+            loaders['global_pilot'] = self._make_pilot_loader(
+                self.pilot_datasets[0],
+                target_num_batches,
+            )
+        elif self.comm_data == 'pairwise_pilots':
+            for i in range(self.n_agents):
+                for j in range(i + 1, self.n_agents):
+                    pairwise_ds = PairwiseDataset(
+                        self.pilot_datasets[i],
+                        self.pilot_datasets[j],
+                    )
+                    loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
+                        pairwise_ds, target_num_batches
+                    )

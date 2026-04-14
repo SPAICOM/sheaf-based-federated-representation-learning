@@ -1,0 +1,11 @@
+_target_: src.orchestrators.FedMuscle
+
+lambda_muscle: 0.1
+temperature: 0.1
+
+E: 4
+T: 1
+
+alignment_mode: contrastive
+
+neighbors: {}

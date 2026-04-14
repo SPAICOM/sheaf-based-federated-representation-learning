@@ -1,7 +1,7 @@
 defaults:
   - dataset: deepsense
   - model: cnn_classifier
-  - orchestrator: non_cooperative
+  - orchestrator: sheaf_frl
   - optimizer: adam
   - _self_
 
@@ -21,7 +21,7 @@ model:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__deepsense
+  project: sheaf-repr-learning__mhealth
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false

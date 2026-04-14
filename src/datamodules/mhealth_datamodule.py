@@ -30,6 +30,7 @@ from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from torch.utils.data import DataLoader, Dataset
 
 from src.datamodules.utils import (
+    PairwiseDataset,
     compute_split_indices,
     repeat_dataset_to_num_samples,
 )
@@ -413,6 +414,7 @@ class MHealthDataModule(l.LightningDataModule):
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
+        comm_data: str = 'private_pilots',
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -443,6 +445,7 @@ class MHealthDataModule(l.LightningDataModule):
         self.pilot_batch_size = (
             batch_size if pilot_batch_size is None else pilot_batch_size
         )
+        self.comm_data = comm_data
         self.seed = seed
 
     def prepare_data(self) -> None:
@@ -453,7 +456,9 @@ class MHealthDataModule(l.LightningDataModule):
         """
         dest = self.data_path
 
-        if dest.exists() and (list(dest.glob('*.log')) or list(dest.glob('*.csv'))):
+        if dest.exists() and (
+            list(dest.glob('*.log')) or list(dest.glob('*.csv'))
+        ):
             return
 
         if not self.gdrive_file_id:
@@ -466,7 +471,9 @@ class MHealthDataModule(l.LightningDataModule):
         zip_path = dest / 'mhealth_dataset.zip'
 
         print(f'[prepare_data] Downloading mhealth_dataset.zip …')
-        gdown.download(id=self.gdrive_file_id, output=str(zip_path), quiet=False)
+        gdown.download(
+            id=self.gdrive_file_id, output=str(zip_path), quiet=False
+        )
 
         if not zip_path.exists():
             raise RuntimeError(f'Download failed, zip not found at {zip_path}')
@@ -801,14 +808,32 @@ class MHealthDataModule(l.LightningDataModule):
                 (len(ds) + self.batch_size - 1) // self.batch_size
                 for ds in datasets.values()
             )
-            loaders.update(
-                {
-                    f'pilot_{i}': self._make_pilot_loader(
-                        ds, target_num_batches
-                    )
-                    for i, ds in self.pilot_datasets.items()
-                }
-            )
+
+            if self.comm_data == 'private_pilots':
+                loaders.update(
+                    {
+                        f'pilot_{i}': self._make_pilot_loader(
+                            ds, target_num_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
+            elif self.comm_data == 'shared_global_pilots':
+                shared_ds = self.pilot_datasets[0]
+                loaders['global_pilot'] = self._make_pilot_loader(
+                    shared_ds, target_num_batches
+                )
+            elif self.comm_data == 'pairwise_pilots':
+                for i in range(self.n_agents):
+                    for j in range(i + 1, self.n_agents):
+                        pairwise_ds = PairwiseDataset(
+                            self.pilot_datasets[i],
+                            self.pilot_datasets[j],
+                        )
+                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
+                            pairwise_ds, target_num_batches
+                        )
+
         return CombinedLoader(loaders, mode=self.mode)
 
     def train_dataloader(self) -> CombinedLoader:

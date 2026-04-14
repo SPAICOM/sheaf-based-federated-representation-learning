@@ -1,13 +1,66 @@
-"""Utility functions for semantic datamodule operations.
+"""Utility functions shared across all datamodules.
 
 This module provides helper functions for dataset splitting and manipulation
-used by the SemanticDataModule class.
+used by all datamodule classes.
 """
 
 from math import ceil
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset
+
+
+class PairwiseDataset(Dataset):
+    """Dataset that pairs two aligned datasets to produce per-edge samples.
+
+    Used for ``comm_data='pairwise_pilots'`` to build one pilot dataloader
+    per agent pair ``(i, j)``.  Both datasets **must** be constructed from
+    the same ordered ``sample_ids`` list so that position *k* in
+    ``dataset_i`` and position *k* in ``dataset_j`` correspond to the same
+    underlying physical sample.
+
+    Parameters
+    ----------
+    dataset_i : Dataset
+        Pilot dataset for agent *i*.  Each item must follow the format
+        ``(x, label)`` or ``(x, label, sample_id)``.
+    dataset_j : Dataset
+        Pilot dataset for agent *j*.  Must have the same length as
+        ``dataset_i``.
+
+    Returns
+    -------
+    tuple
+        ``(x_i, x_j, label)`` when the wrapped datasets do **not** carry
+        sample identifiers, or ``(x_i, x_j, label, sample_id)`` otherwise.
+        ``sample_id`` is taken from ``dataset_i``.
+
+    Raises
+    ------
+    ValueError
+        If ``dataset_i`` and ``dataset_j`` have different lengths.
+    """
+
+    def __init__(self, dataset_i: Dataset, dataset_j: Dataset) -> None:
+        if len(dataset_i) != len(dataset_j):
+            raise ValueError(
+                'PairwiseDataset requires both datasets to have the same '
+                f'length, got {len(dataset_i)} and {len(dataset_j)}.'
+            )
+        self.dataset_i = dataset_i
+        self.dataset_j = dataset_j
+
+    def __len__(self) -> int:
+        return len(self.dataset_i)
+
+    def __getitem__(self, idx: int):
+        item_i = self.dataset_i[idx]
+        item_j = self.dataset_j[idx]
+        x_i, label = item_i[0], item_i[1]
+        x_j = item_j[0]
+        if len(item_i) == 3:
+            return x_i, x_j, label, item_i[2]
+        return x_i, x_j, label
 
 
 def compute_split_indices(

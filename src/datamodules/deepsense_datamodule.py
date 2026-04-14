@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from src.datamodules.utils import (
+    PairwiseDataset,
     compute_split_indices,
     repeat_dataset_to_num_samples,
 )
@@ -265,6 +266,29 @@ class DeepSenseDataModule(l.LightningDataModule):
         Fraction of data for pilot datasets (default: 0.0)
     pilot_num_samples : int, optional
         Fixed number of pilot samples per agent
+    comm_data : str
+        Communication dataset strategy exposed through the CombinedLoader.
+        Applies only when pilots are enabled (``pilot_split > 0`` or
+        ``pilot_num_samples`` is set).  Valid values:
+
+        ``'private_pilots'`` *(default)*
+            One modality-specific dataloader per agent, keyed
+            ``pilot_0``, ``pilot_1``, ….  Each agent owns its own
+            pilot view of the shared sample subset.
+        ``'shared_global_pilots'``
+            Same shared random sample subset for all agents, but each
+            agent still receives its own modality-specific dataloader.
+            Keys become ``global_pilot_0``, ``global_pilot_1``, … so
+            orchestrators can distinguish this mode from private pilots.
+        ``'pairwise_pilots'``
+            One dataloader per agent pair ``(i, j)`` with ``i < j``,
+            keyed ``pilot_i_j``.  Each batch yields
+            ``(x_i, x_j, label, sample_id)`` where ``x_i`` and ``x_j``
+            are the two agents' modality views of the **same** underlying
+            sample (sample intersection of their pilot datasets, which
+            equals the full pilot set under ``split_strategy='full'``).
+            Created for **all** possible pairs; the orchestrator filters
+            to actual graph edges.
     seed : int
         Random seed for reproducibility (default: 42)
 
@@ -308,6 +332,7 @@ class DeepSenseDataModule(l.LightningDataModule):
         test_split: float = 0.1,
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
+        comm_data: str = 'private_pilots',
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -324,6 +349,7 @@ class DeepSenseDataModule(l.LightningDataModule):
         self.test_split = test_split
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
+        self.comm_data = comm_data
         self.seed = seed
 
         if agent_modalities is None:
@@ -624,13 +650,13 @@ class DeepSenseDataModule(l.LightningDataModule):
             self.pilot_datasets: dict[int, list[DeepSenseModalityDataset]] = {}
             self.num_classes: dict = {}
 
-            num_samples_to_check = min(5000, len(self._base_dataset))
-            sample_labels = set()
-            for i in range(
-                0, num_samples_to_check, max(1, num_samples_to_check // 100)
-            ):
-                sample_labels.add(self._base_dataset[i]['label'].item())
-            self.num_classes['label'] = len(sample_labels)
+            all_labels = np.array(
+                [
+                    self._base_dataset[i]['label'].item()
+                    for i in range(len(self._base_dataset))
+                ]
+            )
+            self.num_classes['label'] = len(np.unique(all_labels))
 
             if self.split_strategy == 'full':
                 self._split_data_full(split_indices)
@@ -663,7 +689,6 @@ class DeepSenseDataModule(l.LightningDataModule):
                 shape = self.MODALITY_SHAPES[mod_list[0]]
                 self.input_shape[agent_id] = shape
                 self.input_dims[str(agent_id)] = shape[0]
-            self.num_classes['label'] = 2
 
     def _make_loader(
         self,
@@ -683,12 +708,19 @@ class DeepSenseDataModule(l.LightningDataModule):
 
     def _make_pilot_loader(
         self,
-        datasets: list[DeepSenseModalityDataset],
+        dataset: Dataset | list[DeepSenseModalityDataset],
         target_num_batches: int,
     ) -> DataLoader:
-        combined = torch.utils.data.ConcatDataset(datasets)
+        if isinstance(dataset, list):
+            ds: Dataset = (
+                torch.utils.data.ConcatDataset(dataset)
+                if len(dataset) > 1
+                else dataset[0]
+            )
+        else:
+            ds = dataset
         target_num_samples = target_num_batches * self.batch_size
-        repeated = repeat_dataset_to_num_samples(combined, target_num_samples)
+        repeated = repeat_dataset_to_num_samples(ds, target_num_samples)
         return DataLoader(
             repeated,
             batch_size=self.batch_size,
@@ -706,13 +738,34 @@ class DeepSenseDataModule(l.LightningDataModule):
         if self.pilot_datasets:
             target_batches = max(
                 (len(datasets) + self.batch_size - 1) // self.batch_size
-                for datasets in self.train_datasets.values()
+                for datasets in self.pilot_datasets.values()
             )
-            for agent_id in self.pilot_datasets:
-                loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
-                    self.pilot_datasets[agent_id],
-                    target_batches,
-                )
+
+            if self.comm_data == 'private_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
+                        self.pilot_datasets[agent_id],
+                        target_batches,
+                    )
+            elif self.comm_data == 'shared_global_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'global_pilot_{agent_id}'] = (
+                        self._make_pilot_loader(
+                            self.pilot_datasets[agent_id],
+                            target_batches,
+                        )
+                    )
+            elif self.comm_data == 'pairwise_pilots':
+                for i in range(self.n_agents):
+                    for j in range(i + 1, self.n_agents):
+                        pairwise_ds = PairwiseDataset(
+                            self.pilot_datasets[i],
+                            self.pilot_datasets[j],
+                        )
+                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
+                            pairwise_ds,
+                            target_batches,
+                        )
 
         return loaders
 
