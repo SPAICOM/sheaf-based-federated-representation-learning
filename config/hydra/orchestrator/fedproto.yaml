@@ -1,0 +1,6 @@
+_target_: src.orchestrators.FedProto
+
+lambda_proto: 0.1
+prototype_momentum: 0.9
+
+neighbors: {}

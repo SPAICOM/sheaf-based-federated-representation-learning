@@ -1,0 +1,9 @@
+_target_: src.orchestrators.ComFed
+
+lambda_comfed: 0.01
+
+neighbors: {}
+
+latent_dims:
+  0: 64
+  1: 64

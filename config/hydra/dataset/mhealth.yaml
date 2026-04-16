@@ -1,0 +1,27 @@
+_target_: src.datamodules.MHealthDataModule
+
+data_path: ./data/MHealth
+gdrive_file_id: 1HJnlZq_vVG-CFhfVhQdQsP7fUBocD3un
+
+split_strategy: subject
+n_agents: null
+
+feature_groups:
+  - chest
+  - left_ankle
+  - right_wrist
+
+exclude_null_activity: true
+window_size: null
+stride: 1
+
+batch_size: 64
+num_workers: 4
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.0
+pilot_num_samples: null
+comm_data: private_pilots
+seed: 42

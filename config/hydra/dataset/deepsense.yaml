@@ -1,0 +1,20 @@
+_target_: src.datamodules.DeepSenseDataModule
+
+data_path: ./data/DeepSense
+gdrive_file_id: 129JztALWmYjg-rGK0pC46oMEfiywmkiD
+scenario: 26
+
+split_strategy: full
+agent_modalities: null
+
+n_agents: 3
+batch_size: 32
+num_workers: 0
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.1
+pilot_num_samples: null
+comm_data: shared_global_pilots
+seed: 42
