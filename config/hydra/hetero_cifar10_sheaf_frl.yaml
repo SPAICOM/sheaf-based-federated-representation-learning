@@ -9,13 +9,13 @@ seed: 42
 
 agents:
   0:
-    encoder_hidden_dims: [32, 64, 128]
+    encoder_hidden_dims: [16, 32]
   1:
-    encoder_hidden_dims: [32, 64, 128]
+    encoder_hidden_dims: [32, 64]
   2:
     encoder_hidden_dims: [32, 64, 128]
   3:
-    encoder_hidden_dims: [32, 64, 128]
+    encoder_hidden_dims: [64, 128, 256]
 
 graph:
   neighbors_mode: "fully_connected"
@@ -59,15 +59,8 @@ callbacks:
     mode: max
 
 dataset:
-  # Partial label-overlap federated setting with disjoint local datasets.
-  # Each client receives unique local samples only: no example is duplicated
-  # across clients in train/val/test. Exactly `shared_classes` labels are
-  # shared across all clients, while the remaining classes are distributed
-  # non-uniformly across clients. For shared labels, clients observe different
-  # samples from the same class rather than replicated examples.
-  split_strategy: class_partition
+  split_strategy: uniform
   n_agents: 4
-  shared_classes: 2
   batch_size: 128
   num_workers: 4
   mode: min_size
@@ -82,7 +75,7 @@ model:
 
 orchestrator:
   lambda_sheaf: 0.05
-  anchor_strategy: semantic_pilots
+  anchor_strategy: prototype
   num_anchors: 64
   parseval_normalization: false
   l2_normalization: false

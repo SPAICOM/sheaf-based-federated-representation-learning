@@ -148,6 +148,27 @@ class TestDPSGD:
 
         orchestrator.on_before_optimizer_step(None)
 
+    def test_on_before_optimizer_step_without_neighbors_records_no_rounds(self):
+        """Isolated agents should not accrue communication rounds."""
+        agent = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+        orchestrator = DPSGD(
+            agents={0: agent},
+            neighbors={0: set()},
+            optimizer=MockOptimizer(),
+        )
+
+        for p in agent.parameters():
+            if p.requires_grad:
+                p.grad = torch.randn_like(p)
+
+        orchestrator.on_before_optimizer_step(None)
+
+        metrics = orchestrator._communication_metrics('train')
+        assert metrics['train/communication_rounds'] == 0.0
+        assert metrics['train/communication_kilobytes'] == 0.0
+
     def test_shared_eval(self):
         """Test _shared_eval returns loss."""
         agent = LatentClassifier(

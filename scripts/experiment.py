@@ -102,6 +102,36 @@ def _sanitize_instantiation_config(config: Any) -> Any:
     return OmegaConf.create(sanitized)
 
 
+def _filter_supported_init_kwargs(config: Any, **kwargs: Any) -> dict[str, Any]:
+    """Keep only kwargs accepted by the target constructor."""
+    if not isinstance(config, (dict, DictConfig)):
+        return kwargs
+
+    config_dict = OmegaConf.to_container(config, resolve=True)
+    if not isinstance(config_dict, dict) or '_target_' not in config_dict:
+        return kwargs
+
+    target = get_class(config_dict['_target_'])
+    signature = inspect.signature(target.__init__)
+    accepts_var_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_var_kwargs:
+        return kwargs
+
+    allowed_keys = {
+        name
+        for name in signature.parameters
+        if name != 'self'
+    }
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if key in allowed_keys
+    }
+
+
 def _extract_objective_metric(
     trainer: Trainer,
     *,
@@ -387,12 +417,16 @@ def main(cfg: DictConfig) -> float:
     # - latent_dims: encoder output dims (used for Stiefel matrix shapes)
     # - optimizer: optimizer configuration from Hydra config
     orchestrator_cfg = _sanitize_instantiation_config(cfg.orchestrator)
-    orchestrator = instantiate(
+    orchestrator_kwargs = _filter_supported_init_kwargs(
         orchestrator_cfg,
         agents=agents,
         neighbors=neighbors,
         latent_dims=latent_dims,
         optimizer=cfg.optimizer,
+    )
+    orchestrator = instantiate(
+        orchestrator_cfg,
+        **orchestrator_kwargs,
         _convert_='all',
         _recursive_=False,
     )

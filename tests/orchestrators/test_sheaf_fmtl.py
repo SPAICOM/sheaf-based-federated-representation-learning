@@ -8,6 +8,7 @@ from src.agents.cnn_classifier import CNNClassifier
 from src.agents.latent_classifier import LatentClassifier
 from src.datamodules.classification_datamodule import ClassificationDataModule
 from src.orchestrators.sheaf_fmtl import SheafFMTL
+from src.utils import calculate_communication_cost
 
 
 class MockOptimizer:
@@ -81,7 +82,7 @@ class TestSheafFMTL:
         assert orchestrator.projection_matrices['1_0'].shape == (d_ij, d2)
 
     def test_on_before_optimizer_step(self):
-        """Test gradient penalty is applied to parameters."""
+        """Test gradient penalty uses projected-vector communication only."""
         agent1 = LatentClassifier(
             in_features=128, num_classes=10, latent_dim=64
         )
@@ -106,8 +107,19 @@ class TestSheafFMTL:
 
         orchestrator.on_before_optimizer_step(None)
 
+        projected_dim = orchestrator.projection_matrices['0_1'].shape[0]
+        expected_kilobytes = calculate_communication_cost(
+            projected_dim,
+            n_transmissions=2,
+        )['kilobytes']
+        metrics = orchestrator._communication_metrics('train')
+        assert metrics['train/communication_rounds'] == 1.0
+        assert metrics['train/communication_kilobytes'] == pytest.approx(
+            expected_kilobytes
+        )
+
     def test_on_train_batch_end(self):
-        """Test P_ij matrices are updated on batch end."""
+        """Test P_ij update records only exchanged projected vectors."""
         agent1 = LatentClassifier(
             in_features=128, num_classes=10, latent_dim=64
         )
@@ -133,6 +145,52 @@ class TestSheafFMTL:
         )
         assert not torch.equal(
             orchestrator.projection_matrices['1_0'], orig_P_10
+        )
+        projected_dim = orchestrator.projection_matrices['0_1'].shape[0]
+        expected_kilobytes = calculate_communication_cost(
+            projected_dim,
+            n_transmissions=2,
+        )['kilobytes']
+        metrics = orchestrator._communication_metrics('train')
+        assert metrics['train/communication_rounds'] == 1.0
+        assert metrics['train/communication_kilobytes'] == pytest.approx(
+            expected_kilobytes
+        )
+
+    def test_full_agd_iteration_records_two_projected_vector_rounds(self):
+        """Test both AGD phases each log one projected-vector exchange round."""
+        agent1 = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+        agent2 = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+        orchestrator = SheafFMTL(
+            agents={0: agent1, 1: agent2},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+            gamma=0.01,
+            lambda_reg=0.001,
+            eta=0.01,
+        )
+
+        for agent in (agent1, agent2):
+            for parameter in agent.parameters():
+                if parameter.requires_grad:
+                    parameter.grad = torch.randn_like(parameter)
+
+        orchestrator.on_before_optimizer_step(None)
+        orchestrator.on_train_batch_end(None, None, 0)
+
+        projected_dim = orchestrator.projection_matrices['0_1'].shape[0]
+        expected_kilobytes = calculate_communication_cost(
+            projected_dim,
+            n_transmissions=4,
+        )['kilobytes']
+        metrics = orchestrator._communication_metrics('train')
+        assert metrics['train/communication_rounds'] == 2.0
+        assert metrics['train/communication_kilobytes'] == pytest.approx(
+            expected_kilobytes
         )
 
     def test_shared_eval(self):

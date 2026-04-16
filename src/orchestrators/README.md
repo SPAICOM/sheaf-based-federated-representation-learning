@@ -9,7 +9,7 @@ This module contains orchestrator implementations for federated learning that co
   - **Purpose**: Provides common infrastructure for all federated learning algorithms in the framework
   - **Key Responsibilities**:
     - Agent management: Stores and manages multiple agent models using PyTorch Lightning's ModuleDict
-    - Communication tracking: Monitors and logs communication costs (bits, bytes, kilobytes) and rounds
+    - Communication tracking: Monitors and logs cumulative communication volume in kilobytes together with communication rounds
     - Metric logging: Handles per-agent and aggregate metric collection for training/validation/test
     - Optimization: Configures and manages optimizers for all agent parameters
     - Lightning integration: Implements training_step, validation_step, test_step, and predict_step interfaces
@@ -19,7 +19,7 @@ This module contains orchestrator implementations for federated learning that co
   - **Communication Tracking**: 
     - Automatically tracks payload sizes when agents communicate
     - Supports different transmission patterns (unicast, broadcast)
-    - Logs metrics like communication_bits, communication_bytes, communication_kilobytes, communication_rounds
+    - Logs cumulative `communication_kilobytes` and `communication_rounds` for each stage
 
 ### Specific Orchestrators
 - [`sheaf_frl.py`](sheaf_frl.py): Sheaf-based Federated Representation Learning orchestrator implementing the proposed framework with Sheaf regularization
@@ -53,6 +53,8 @@ This module contains orchestrator implementations for federated learning that co
     - Trainable projection matrices `P_ij` map each agent's parameter vector into edge-specific shared latent subspaces
     - Sheaf Laplacian penalty is applied directly to local parameter gradients before the optimizer step
     - Projection matrices are updated manually after each training batch following the paper's update rule
+    - Communication accounting charges only for exchanged projected vectors `P_ij θ_i`; raw parameter vectors `θ_i` and full matrices `P_ij` are never transmitted
+    - One full alternating-gradient iteration incurs two communication rounds: one for the parameter update phase and one for the projection-matrix update phase
   - **Typical Use**: When you want the earlier sheaf-based multitask learning baseline that couples neighboring agents through parameter-space alignment
 
 - [`federated.py`](federated.py): Standard Federated Learning orchestrator implementing Federated Averaging (FedAvg)

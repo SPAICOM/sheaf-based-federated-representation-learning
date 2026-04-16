@@ -1,6 +1,15 @@
 _target_: src.orchestrators.FedPer
 
-local_steps: 4
-global_steps: 100
+# Fair default: aggregate once per completed local epoch and let the
+# Trainer's max_epochs control total training length.
+aggregation_interval: 1
+aggregation_unit: epoch
+max_global_rounds: null
+
+# Paper-style FedPer schedule can be reproduced with:
+# aggregation_interval: 4
+# aggregation_unit: epoch
+# max_global_rounds: 100
+
 sample_counts: null
 sync_on_train_start: true

@@ -125,6 +125,11 @@ class FederatedLearning(BaseOrchestrator):
         """
         # Convert agent keys from string to int for consistent indexing
         agents = {int(k): v for k, v in self.agents.items()}
+        total_transmissions = sum(
+            len(self.hparams.neighbors[idx_i]) for idx_i in agents
+        )
+        if total_transmissions > 0:
+            self._record_communication_round(prefix='train')
 
         # Store new states before applying (synchronous update)
         new_states = {}
@@ -134,6 +139,7 @@ class FederatedLearning(BaseOrchestrator):
             self._record_communication(
                 agent_i.state_dict(),
                 n_transmissions=len(self.hparams.neighbors[idx_i]),
+                prefix='train',
             )
 
             # Include agent itself in aggregation set (neighbors | {self})
@@ -168,6 +174,8 @@ class FederatedLearning(BaseOrchestrator):
         # This synchronous approach avoids update order bias
         for idx_i, agent in agents.items():
             agent.load_state_dict(new_states[idx_i])
+
+        self._finalize_train_epoch_communication()
 
     def _shared_eval(
         self,

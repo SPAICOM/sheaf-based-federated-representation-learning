@@ -127,7 +127,7 @@ class DPSGD(BaseOrchestrator):
 
         Communication happens every step in `on_before_optimizer_step`.
         """
-        pass
+        self._finalize_train_epoch_communication()
 
     def on_before_optimizer_step(self, optimizer: Any) -> None:
         """Compute the neighbourhood-weighted parameter average (x_{k+1/2}).
@@ -143,6 +143,12 @@ class DPSGD(BaseOrchestrator):
         locally-computed gradients to the already-mixed weights, which
         is the intended decentralised SGD behaviour.
         """
+        total_transmissions = sum(
+            len(self.hparams.neighbors.get(int(idx_str), set()))
+            for idx_str in self.agents
+        )
+        if total_transmissions > 0:
+            self._record_communication_round(prefix='train')
         # Original parameter vectors for each agent before mixing
         agent_vectors = {}
 
@@ -157,6 +163,7 @@ class DPSGD(BaseOrchestrator):
             self._record_communication(
                 vec,
                 n_transmissions=len(self.hparams.neighbors.get(idx, set())),
+                prefix='train',
             )
 
         # Dictionary to store the mixed parameter vectors

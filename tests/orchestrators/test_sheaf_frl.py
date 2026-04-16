@@ -3,6 +3,8 @@
 import pytest
 import torch
 from lightning.pytorch import Trainer
+from lightning.pytorch import LightningDataModule
+from torch.utils.data import DataLoader, TensorDataset
 
 from src.agents.cnn_classifier import CNNClassifier
 from src.agents.latent_classifier import LatentClassifier
@@ -15,6 +17,26 @@ class MockOptimizer:
 
     _target_ = 'torch.optim.Adam'
     lr = 0.001
+
+
+class _ToySheafDataModule(LightningDataModule):
+    def setup(self, stage=None):
+        self.train_datasets = {
+            0: TensorDataset(
+                torch.randn(16, 8),
+                torch.randint(0, 3, (16,)),
+            ),
+            1: TensorDataset(
+                torch.randn(16, 8),
+                torch.randint(0, 3, (16,)),
+            ),
+        }
+
+    def train_dataloader(self):
+        return {
+            agent_idx: DataLoader(dataset, batch_size=4)
+            for agent_idx, dataset in self.train_datasets.items()
+        }
 
 
 class TestSheafFRL:
@@ -93,6 +115,93 @@ class TestSheafFRL:
         # Stiefel should be updated
         for k in orig:
             assert not torch.equal(orchestrator.stiefel_matrices[k], orig[k])
+
+    def test_shared_eval_records_split_specific_anchor_communication(self):
+        """Train and test anchor exchanges should be accounted separately."""
+        agent1 = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+        agent2 = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+        orchestrator = SheafFRL(
+            agents={0: agent1, 1: agent2},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+            lambda_sheaf=0.1,
+            latent_dims={0: 64, 1: 64},
+            anchor_strategy='prototype',
+            num_anchors=4,
+            parseval_normalization=False,
+            l2_normalization=False,
+        )
+
+        batch = {
+            0: [torch.randn(8, 128), torch.randint(0, 10, (8,))],
+            1: [torch.randn(8, 128), torch.randint(0, 10, (8,))],
+        }
+
+        orchestrator.on_train_start()
+        orchestrator.on_train_epoch_start()
+        orchestrator._shared_eval(batch, 0, 'train')
+        train_metrics = orchestrator._communication_metrics('train')
+
+        orchestrator.on_test_start()
+        orchestrator._shared_eval(batch, 0, 'test')
+        test_metrics = orchestrator._communication_metrics('test')
+
+        assert train_metrics['train/communication_rounds'] == 1.0
+        assert train_metrics['train/communication_kilobytes'] > 0.0
+        assert test_metrics['test/communication_rounds'] == 1.0
+        assert test_metrics['test/communication_kilobytes'] > 0.0
+
+    def test_trainer_logs_nonzero_train_communication_metrics(self):
+        """Batch anchor exchanges should emit positive train communication."""
+        orchestrator = SheafFRL(
+            agents={
+                0: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+                1: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+            },
+            neighbors={0: {1}, 1: {0}},
+            optimizer={'_target_': 'torch.optim.SGD', 'lr': 0.1},
+            lambda_sheaf=0.1,
+            latent_dims={0: 4, 1: 4},
+            anchor_strategy='prototype',
+            num_anchors=4,
+            parseval_normalization=False,
+            l2_normalization=False,
+        )
+
+        trainer = Trainer(
+            max_epochs=1,
+            accelerator='cpu',
+            logger=False,
+            enable_checkpointing=False,
+            enable_model_summary=False,
+            num_sanity_val_steps=0,
+            limit_val_batches=0,
+        )
+
+        trainer.fit(orchestrator, datamodule=_ToySheafDataModule())
+
+        assert (
+            float(trainer.callback_metrics['train/communication_kilobytes'])
+            > 0.0
+        )
+        assert (
+            float(trainer.callback_metrics['train/communication_rounds'])
+            > 0.0
+        )
 
     @pytest.mark.slow
     def test_train_one_epoch_with_cnn(self):

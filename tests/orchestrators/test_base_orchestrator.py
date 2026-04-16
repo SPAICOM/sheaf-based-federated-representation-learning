@@ -109,3 +109,38 @@ class TestBaseOrchestrator:
         batch = {'0': (x, y)}
         loss = orchestrator.training_step(batch, batch_idx=0)
         assert isinstance(loss, torch.Tensor)
+
+    def test_communication_accounting_is_split_by_stage(self):
+        """Train/test communication counters should be tracked separately."""
+        agent = DummyAgent()
+        orchestrator = ConcreteOrchestrator(
+            agents={0: agent},
+            neighbors={0: set()},
+            optimizer=MockOptimizer(),
+        )
+
+        orchestrator.on_train_start()
+        orchestrator._record_communication_round(prefix='train')
+        orchestrator._record_communication(
+            torch.ones(4),
+            n_transmissions=2,
+            prefix='train',
+        )
+
+        orchestrator.on_test_start()
+        orchestrator._record_communication_round(prefix='test')
+        orchestrator._record_communication(
+            torch.ones(2),
+            n_transmissions=1,
+            prefix='test',
+        )
+
+        train_metrics = orchestrator._communication_metrics('train')
+        test_metrics = orchestrator._communication_metrics('test')
+
+        assert train_metrics['train/communication_rounds'] == 1.0
+        assert test_metrics['test/communication_rounds'] == 1.0
+        assert (
+            train_metrics['train/communication_kilobytes']
+            > test_metrics['test/communication_kilobytes']
+        )
