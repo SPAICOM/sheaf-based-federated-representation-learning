@@ -113,6 +113,7 @@ def main(cfg: DictConfig) -> None:
     # --- Training ---
     callbacks = [instantiate(cb) for cb in cfg.callbacks.values()]
     logger = instantiate(cfg.logger)
+    logger.name = f'{cfg.logger.name}__{type(orchestrator).__name__}'
     trainer = Trainer(**cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(orchestrator, datamodule=datamodule)
     trainer.test(orchestrator, datamodule=datamodule)
