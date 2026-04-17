@@ -29,11 +29,11 @@ from .deepsense_encoders import (
     DeepSenseRGBEncoder,
 )
 from .fmtl_classifier import FMTLCNNClassifier
-from .fmtl_classifier import FMTLCNNClassifier
+from .hetero_cnn_classifier import HeteroCNNClassifier
 from .latent_classifier import LatentClassifier
 from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
-from .utils import CNN, MLP, BaseEncoder, TimmEncoder
+from .utils import CNN, MLP, BaseEncoder, HeteroCNN, HeteroMLP, TimmEncoder
 
 __all__ = [
     'BaseAgent',
@@ -47,7 +47,9 @@ __all__ = [
     'DeepSenseRGBClassifier',
     'DeepSenseRGBEncoder',
     'FMTLCNNClassifier',
-    'FMTLCNNClassifier',
+    'HeteroCNN',
+    'HeteroCNNClassifier',
+    'HeteroMLP',
     'LatentClassifier',
     'MLP',
     'PersonalizedClassifier',

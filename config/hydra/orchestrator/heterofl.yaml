@@ -1,0 +1,4 @@
+_target_: src.orchestrators.HeteroFL
+aggregation_interval: 1
+aggregation_unit: epoch
+sync_on_train_start: true

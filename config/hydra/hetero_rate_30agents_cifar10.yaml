@@ -1,0 +1,121 @@
+defaults:
+  - dataset: cifar10
+  - model: hetero_cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate CIFAR10 30agents"
+
+# Three complexity tiers, 10 agents each:
+#   rate=1.00  → agents  0-9   (full-width, most complex)
+#   rate=0.50  → agents 10-19  (half-width)
+#   rate=0.25  → agents 20-29  (quarter-width, simplest)
+agents:
+  0:  {rate: 1.0}
+  1:  {rate: 1.0}
+  2:  {rate: 1.0}
+  3:  {rate: 1.0}
+  4:  {rate: 1.0}
+  5:  {rate: 1.0}
+  6:  {rate: 1.0}
+  7:  {rate: 1.0}
+  8:  {rate: 1.0}
+  9:  {rate: 1.0}
+  10: {rate: 0.5}
+  11: {rate: 0.5}
+  12: {rate: 0.5}
+  13: {rate: 0.5}
+  14: {rate: 0.5}
+  15: {rate: 0.5}
+  16: {rate: 0.5}
+  17: {rate: 0.5}
+  18: {rate: 0.5}
+  19: {rate: 0.5}
+  20: {rate: 0.25}
+  21: {rate: 0.25}
+  22: {rate: 0.25}
+  23: {rate: 0.25}
+  24: {rate: 0.25}
+  25: {rate: 0.25}
+  26: {rate: 0.25}
+  27: {rate: 0.25}
+  28: {rate: 0.25}
+  29: {rate: 0.25}
+
+graph:
+  neighbors_mode: "erdos_renyi"
+  seed: 42
+  p: 0.15
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sheaf-repr-learning__hetero-rate-30agents
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 25
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: validation/avg_task_performance_epoch
+    mode: max
+    save_top_k: 1
+    save_last: true
+
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: validation/avg_task_performance_epoch
+    patience: 5
+    mode: max
+
+dataset:
+  split_strategy: non_iid
+  n_agents: 30
+  classes_per_agent: 5
+  alpha: -1
+  monitor_test_during_fit: true
+  batch_size: 256
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.05
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+
+model:
+  encoder_hidden_dims: [32, 64, 128]
+  decoder_hidden_dims: [256]
+  dropout: 0.1
+  use_batchnorm: true
+
+orchestrator:
+  # sheaf_frl defaults (active when orchestrator=sheaf_frl)
+  lambda_sheaf: 0.05
+  parseval_normalization: false
+  l2_normalization: false
+  filter_unseen_classes: true
+  use_prototypes: true
+  # sheaf_fmtl defaults (active when orchestrator=sheaf_fmtl)
+  gamma: 0.001
+  lambda_reg: 0.001
+  eta: 0.01
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
