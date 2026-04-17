@@ -28,6 +28,8 @@ from .deepsense_encoders import (
     DeepSenseMMWaveEncoder,
     DeepSenseRGBEncoder,
 )
+from .fmtl_classifier import FMTLCNNClassifier
+from .fmtl_classifier import FMTLCNNClassifier
 from .latent_classifier import LatentClassifier
 from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
@@ -44,6 +46,8 @@ __all__ = [
     'DeepSenseMMWaveEncoder',
     'DeepSenseRGBClassifier',
     'DeepSenseRGBEncoder',
+    'FMTLCNNClassifier',
+    'FMTLCNNClassifier',
     'LatentClassifier',
     'MLP',
     'PersonalizedClassifier',

@@ -1,17 +1,17 @@
 _target_: src.orchestrators.SheafFRL
 
 lambda_sheaf: 0.01
-anchor_strategy: "prototype"
+#anchor_strategy: "prototype"
 parseval_normalization: False
 l2_normalization: False
 parseval_eps: 0.01
-num_anchors: 128
-dynamic_persistent_ratio: 0.25
-dynamic_candidate_multiplier: 2
-dynamic_refresh_interval: 10
-
+#num_anchors: 128
+#epoch_reencode_batch_size: 256
+local_steps: 1
 neighbors: {}
 
-per_agent_hidden_dims:
-  0: [128, 64]
-  1: [64, 32]
+#per_agent_hidden_dims:
+#  0: [128, 64]
+#  1: [64, 32]
+filter_unseen_classes: False
+use_prototypes: False

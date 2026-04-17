@@ -10,48 +10,38 @@ import torch.nn.functional as F
 AnchorKeys = dict[int, list[tuple[int, int]]]
 AnchorTensors = dict[int, torch.Tensor]
 
+'''
 VALID_ANCHOR_STRATEGIES = {
     'prototype',
     'uniform',
-    'diversity',
+    'geometric',
     'semantic_pilots',
     'clustering',
-    'dynamic',
 }
-
-LEGACY_ANCHOR_STRATEGY_ALIASES = {
-    'random': 'uniform',
-    'balanced': 'diversity',
-    'geometric': 'diversity',
-    'diversity_pilots': 'dynamic',
-    'clustered_pilots': 'clustering',
-}
-
+'''
 
 @dataclass(frozen=True)
 class AnchorConfig:
     """Configuration for anchor construction and normalization."""
-
-    strategy: str
-    num_anchors: int
+    # strategy: str
+    # num_anchors: int
     parseval_normalization: bool
     l2_normalization: bool
     parseval_eps: float = 1e-4
+    filter_unseen_classes: bool = False
+    use_prototypes: bool = False
 
-
+'''
 def supported_anchor_strategy(anchor_strategy: str) -> str:
-    """Validate and normalize the configured anchor strategy name."""
-    strategy = LEGACY_ANCHOR_STRATEGY_ALIASES.get(
-        str(anchor_strategy),
-        str(anchor_strategy),
-    )
+    """Validate the configured anchor strategy name."""
+    strategy = str(anchor_strategy)
     if strategy not in VALID_ANCHOR_STRATEGIES:
         raise ValueError(
             f'Unknown anchor_strategy: {strategy}. Valid options: '
             f'{sorted(VALID_ANCHOR_STRATEGIES)}'
         )
     return strategy
-
+'''
 
 def parseval_normalize(
     anchor_matrix: torch.Tensor,
@@ -101,53 +91,110 @@ def normalize_anchor_matrix(
 ) -> torch.Tensor:
     """Apply the configured anchor normalization to a full anchor matrix."""
     if config.parseval_normalization:
-        return parseval_normalize(
-            anchor_matrix, eps=float(config.parseval_eps)
-        )
+        return parseval_normalize(anchor_matrix, eps=float(config.parseval_eps))
     if config.l2_normalization:
         return l2_normalize(anchor_matrix)
     return anchor_matrix
 
-
-def sorted_global_classes(
-    labels_per_agent: dict[int, torch.Tensor],
-) -> list[int]:
+'''
+def sorted_global_classes(labels_per_agent: dict[int, torch.Tensor]) -> list[int]:
     """Return the sorted union of labels observed across agents."""
     if not labels_per_agent:
         return []
-    all_labels = torch.cat(
-        [labels.detach().cpu() for labels in labels_per_agent.values()]
-    )
+    all_labels = torch.cat([labels.detach().cpu() for labels in labels_per_agent.values()])
     return sorted(int(label) for label in torch.unique(all_labels).tolist())
 
 
-def _global_class_counts(
-    labels_per_agent: dict[int, torch.Tensor],
-) -> dict[int, int]:
+def _global_class_counts(labels_per_agent: dict[int, torch.Tensor]) -> dict[int, int]:
     """Count how often each class appears across all agents."""
     counts: dict[int, int] = {}
     for labels in labels_per_agent.values():
-        unique_labels, class_counts = torch.unique(
-            labels.detach().cpu(),
-            return_counts=True,
-        )
-        for class_label, count in zip(
-            unique_labels.tolist(), class_counts.tolist()
-        ):
+        unique_labels, class_counts = torch.unique(labels.detach().cpu(), return_counts=True)
+        for class_label, count in zip(unique_labels.tolist(), class_counts.tolist()):
             class_idx = int(class_label)
             counts[class_idx] = counts.get(class_idx, 0) + int(count)
     return counts
+'''
+def shared_anchor_rows(
+    A_i: torch.Tensor,
+    A_j: torch.Tensor,
+    labels: torch.Tensor,
+    seen_i: set[int],
+    seen_j: set[int],
+    config: AnchorConfig,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Extract paired anchor rows, either as raw samples or class prototypes."""
+    
+    # Common classes filtering
+    if config.filter_unseen_classes:
+        target_classes = seen_i.intersection(seen_j)
+    else:
+        # If not filtering, we can use every class present in the pilot batch
+        target_classes = set(labels.tolist())
+
+    if not target_classes:
+        return None
+
+    # Class prototypes
+    if config.use_prototypes:
+        proto_i, proto_j = [], []
+        for c in sorted(target_classes):
+            mask = labels == c
+            if mask.any():
+                proto_i.append(A_i[mask].mean(dim=0))
+                proto_j.append(A_j[mask].mean(dim=0))
+                
+        if not proto_i:
+            return None
+            
+        return torch.stack(proto_i), torch.stack(proto_j)
+
+    # Full pilots alignment
+    else:
+        target_tensor = torch.tensor(list(target_classes), device=labels.device)
+        mask = torch.isin(labels, target_tensor)
+        
+        if not mask.any():
+            return None
+            
+        return A_i[mask], A_j[mask]
 
 
-def build_coverage_class_plan(
-    global_classes: list[int],
-    *,
-    num_anchors: int,
-) -> dict[int, int]:
+def communication_anchor_payload(
+    anchor_matrix: torch.Tensor,
+    labels: torch.Tensor,
+    config: AnchorConfig,
+) -> torch.Tensor:
+    """Return the communicated anchor payload for one exchange step.
+
+    Communication cost ignores unseen-class filtering because agents do not
+    know which classes their neighbors have observed before exchanging pilot
+    features. When prototype mode is enabled, each agent sends one prototype
+    per class present in its local pilot batch; otherwise it sends the full
+    pilot embedding matrix.
     """
-    Distribute the anchor budget as evenly as possible across classes, 
-    used by 'diversity' and 'clustering' strategies.
-    """
+    if not config.use_prototypes:
+        return anchor_matrix
+
+    unique_classes = torch.unique(labels, sorted=True)
+    if unique_classes.numel() == 0:
+        return anchor_matrix[:0]
+
+    prototypes = []
+    for class_label in unique_classes.tolist():
+        mask = labels == class_label
+        if mask.any():
+            prototypes.append(anchor_matrix[mask].mean(dim=0))
+
+    if not prototypes:
+        return anchor_matrix[:0]
+
+    return torch.stack(prototypes, dim=0)
+
+
+'''
+def build_coverage_class_plan(global_classes: list[int], *, num_anchors: int) -> dict[int, int]:
+    """Distribute the anchor budget as evenly as possible across classes."""
     if not global_classes:
         return {}
 
@@ -168,15 +215,8 @@ def build_coverage_class_plan(
     return plan
 
 
-def build_proportional_class_plan(
-    labels_per_agent: dict[int, torch.Tensor],
-    *,
-    num_anchors: int,
-) -> dict[int, int]:
-    """
-    Allocate anchor budget proportionally to the empirical class mass within the batch.
-    Used by the 'uniform' strategy to reflect the global class distribution.
-    """
+def build_proportional_class_plan(labels_per_agent: dict[int, torch.Tensor], *, num_anchors: int) -> dict[int, int]:
+    """Allocate anchor budget proportionally to empirical class mass."""
     class_counts = _global_class_counts(labels_per_agent)
     if not class_counts:
         return {}
@@ -186,10 +226,7 @@ def build_proportional_class_plan(
     if budget <= len(ordered_classes):
         selected = sorted(
             ordered_classes,
-            key=lambda class_label: (
-                -class_counts[class_label],
-                class_label,
-            ),
+            key=lambda class_label: (-class_counts[class_label], class_label),
         )[:budget]
         return {class_label: 1 for class_label in sorted(selected)}
 
@@ -198,19 +235,13 @@ def build_proportional_class_plan(
         class_label: budget * class_counts[class_label] / total_count
         for class_label in ordered_classes
     }
-    plan = {
-        class_label: max(1, int(fractional_targets[class_label]))
-        for class_label in ordered_classes
-    }
+    plan = {class_label: max(1, int(fractional_targets[class_label])) for class_label in ordered_classes}
     allocated = sum(plan.values())
 
     if allocated > budget:
         removable = sorted(
             ordered_classes,
-            key=lambda class_label: (
-                fractional_targets[class_label] - plan[class_label],
-                class_label,
-            ),
+            key=lambda class_label: (fractional_targets[class_label] - plan[class_label], class_label),
         )
         for class_label in removable:
             while allocated > budget and plan[class_label] > 1:
@@ -221,10 +252,7 @@ def build_proportional_class_plan(
     elif allocated < budget:
         expandable = sorted(
             ordered_classes,
-            key=lambda class_label: (
-                plan[class_label] - fractional_targets[class_label],
-                class_label,
-            ),
+            key=lambda class_label: (plan[class_label] - fractional_targets[class_label], class_label),
         )
         cursor = 0
         while allocated < budget:
@@ -236,13 +264,8 @@ def build_proportional_class_plan(
     return {class_label: count for class_label, count in plan.items() if count > 0}
 
 
-def build_class_anchor_plan(
-    labels_per_agent: dict[int, torch.Tensor],
-    config: AnchorConfig,
-) -> dict[int, int]:
-    """
-    Build a shared class-to-slot plan for the current anchor strategy.
-    """
+def build_class_anchor_plan(labels_per_agent: dict[int, torch.Tensor], config: AnchorConfig) -> dict[int, int]:
+    """Build a shared class-to-slot plan for the current anchor strategy."""
     strategy = supported_anchor_strategy(config.strategy)
     global_classes = sorted_global_classes(labels_per_agent)
 
@@ -250,97 +273,56 @@ def build_class_anchor_plan(
         case 'prototype':
             return dict.fromkeys(global_classes, 1)
         case 'uniform':
-            return build_proportional_class_plan(
-                labels_per_agent,
-                num_anchors=config.num_anchors,
-            )
-        case 'diversity' | 'clustering' | 'dynamic':
-            return build_coverage_class_plan(
-                global_classes,
-                num_anchors=config.num_anchors,
-            )
+            return build_proportional_class_plan(labels_per_agent, num_anchors=config.num_anchors)
+        case 'geometric' | 'clustering':
+            return build_coverage_class_plan(global_classes, num_anchors=config.num_anchors)
         case _:
             raise ValueError(f'Unsupported anchor strategy: {strategy}')
 
-def farthest_point_indices(
-    anchor_source: torch.Tensor,
-    n_points: int,
-) -> torch.Tensor:
-    """
-    Select a diverse subset with farthest-point sampling to ensure geometric coverage.
-    Used by the 'diversity' and 'dynamic' strategies to cover the latent space.
-    """
+
+def farthest_point_indices(anchor_source: torch.Tensor, n_points: int) -> torch.Tensor:
+    """Select a diverse subset with farthest-point sampling."""
     if n_points < 1 or len(anchor_source) == 0:
         return torch.empty(0, dtype=torch.long, device=anchor_source.device)
 
     valid_points = min(int(n_points), len(anchor_source))
     source = anchor_source.detach()
     center = source.mean(dim=0, keepdim=True)
-    # if using l2_normalization (latents projected to Hypersphere),
-    # l2 dist (euclidean) prop to cosine distance (semantic) 
     distances_to_center = torch.linalg.vector_norm(source - center, dim=1)
     first_idx = int(torch.argmax(distances_to_center).item())
 
     selected = [first_idx]
-    min_distances = torch.cdist(source, source[first_idx : first_idx + 1]).squeeze(
-        1
-    )
+    min_distances = torch.cdist(source, source[first_idx : first_idx + 1]).squeeze(1)
 
     while len(selected) < valid_points:
         candidate_idx = int(torch.argmax(min_distances).item())
         if candidate_idx in selected:
             break
         selected.append(candidate_idx)
-        candidate_distances = torch.cdist(
-            source,
-            source[candidate_idx : candidate_idx + 1],
-        ).squeeze(1)
+        candidate_distances = torch.cdist(source, source[candidate_idx : candidate_idx + 1]).squeeze(1)
         min_distances = torch.minimum(min_distances, candidate_distances)
 
     return torch.tensor(selected, dtype=torch.long, device=anchor_source.device)
 
 
-def random_sample_anchors(
-    class_latents: torch.Tensor,
-    n_slots: int,
-) -> list[torch.Tensor]:
-    """
-    Draw raw class-conditioned sample anchors without replacement.
-    Used by the 'uniform' strategy to reflect the global class distribution without geometric coverage guarantees.
-    """
+def random_sample_anchors(class_latents: torch.Tensor, n_slots: int) -> list[torch.Tensor]:
+    """Draw raw class-conditioned sample anchors without replacement."""
     if n_slots < 1 or len(class_latents) == 0:
         return []
 
     valid_slots = min(int(n_slots), len(class_latents))
-    perm = torch.randperm(
-        len(class_latents),
-        device=class_latents.device,
-    )[:valid_slots]
+    perm = torch.randperm(len(class_latents), device=class_latents.device)[:valid_slots]
     return [class_latents[idx] for idx in perm.tolist()]
 
 
-def diversity_sample_anchors(
-    class_latents: torch.Tensor,
-    n_slots: int,
-) -> list[torch.Tensor]:
-    """
-    Use farthest-point sampling to cover each class with diverse anchors.
-    Used by the 'diversity' strategy to ensure geometric coverage within each class.
-    """
+def geometric_sample_anchors(class_latents: torch.Tensor, n_slots: int) -> list[torch.Tensor]:
+    """Use farthest-point sampling to cover each class with diverse anchors."""
     selected = farthest_point_indices(class_latents, n_slots)
     return [class_latents[idx] for idx in selected.tolist()]
 
 
-def cluster_centroid_anchors(
-    class_latents: torch.Tensor,
-    n_slots: int,
-    *,
-    max_iter: int = 10,
-) -> list[torch.Tensor]:
-    """
-    Approximate K-means centroids for class-conditioned coverage.
-    Used by the 'clustering' strategy to find representative anchors for each class.
-    """
+def cluster_centroid_anchors(class_latents: torch.Tensor, n_slots: int, *, max_iter: int = 10) -> list[torch.Tensor]:
+    """Approximate K-means centroids for class-conditioned coverage."""
     if n_slots < 1 or len(class_latents) == 0:
         return []
 
@@ -383,15 +365,8 @@ def cluster_centroid_anchors(
     return centroids
 
 
-def build_class_anchors(
-    class_latents: torch.Tensor,
-    n_slots: int,
-    *,
-    strategy: str,
-) -> list[torch.Tensor]:
-    """
-    Build semantically keyed anchors for one class according to the specified strategy.
-    """
+def build_class_anchors(class_latents: torch.Tensor, n_slots: int, *, strategy: str) -> list[torch.Tensor]:
+    """Build semantically keyed anchors for one class according to the specified strategy."""
     if len(class_latents) == 0 or n_slots < 1:
         return []
 
@@ -400,8 +375,8 @@ def build_class_anchors(
             return [class_latents.mean(dim=0)]
         case 'uniform':
             return random_sample_anchors(class_latents, n_slots)
-        case 'diversity' | 'dynamic':
-            return diversity_sample_anchors(class_latents, n_slots)
+        case 'geometric':
+            return geometric_sample_anchors(class_latents, n_slots)
         case 'clustering':
             return cluster_centroid_anchors(class_latents, n_slots)
         case _:
@@ -409,17 +384,15 @@ def build_class_anchors(
 
 
 def build_anchor_bundles(
-    latents: AnchorTensors,
-    labels_per_agent: dict[int, torch.Tensor],
-    config: AnchorConfig,
+    latents: AnchorTensors, 
+    labels_per_agent: dict[int, torch.Tensor], 
+    config: AnchorConfig
 ) -> tuple[AnchorTensors, AnchorKeys]:
     """Build per-agent anchors together with explicit semantic keys."""
     strategy = supported_anchor_strategy(config.strategy)
     if strategy == 'semantic_pilots':
-        raise ValueError(
-            'semantic_pilots requires shared pilot batches and cannot be '
-            'built from local class labels.'
-        )
+        raise ValueError('semantic_pilots requires shared pilot batches and cannot be built from local class labels.')
+    
     class_plan = build_class_anchor_plan(labels_per_agent, config)
 
     anchor_tensors: AnchorTensors = {}
@@ -455,9 +428,9 @@ def build_anchor_bundles(
 
 
 def build_semantic_pilot_bundles(
-    latents: AnchorTensors,
-    sample_ids_per_agent: dict[int, torch.Tensor],
-    config: AnchorConfig,
+    latents: AnchorTensors, 
+    sample_ids_per_agent: dict[int, torch.Tensor], 
+    config: AnchorConfig
 ) -> tuple[AnchorTensors, AnchorKeys]:
     """Build anchors keyed by shared pilot sample identifiers."""
     anchor_tensors: AnchorTensors = {}
@@ -465,10 +438,7 @@ def build_semantic_pilot_bundles(
 
     for idx, anchor_source in latents.items():
         sample_ids = sample_ids_per_agent[idx]
-        unique_ids = sorted(
-            int(sample_id)
-            for sample_id in torch.unique(sample_ids.detach().cpu()).tolist()
-        )
+        unique_ids = sorted(int(sample_id) for sample_id in torch.unique(sample_ids.detach().cpu()).tolist())
 
         rows: list[torch.Tensor] = []
         keys: list[tuple[int, int]] = []
@@ -488,32 +458,42 @@ def build_semantic_pilot_bundles(
     return anchor_tensors, anchor_keys
 
 
-def filter_anchor_bundles(
-    anchor_tensors: AnchorTensors,
-    anchor_keys: AnchorKeys,
-    selected_keys: set[tuple[int, int]],
-) -> tuple[AnchorTensors, AnchorKeys]:
-    """Keep only anchor rows whose semantic keys were selected."""
-    filtered_tensors: AnchorTensors = {}
-    filtered_keys: AnchorKeys = {}
+def _group_anchor_positions(keys: list[tuple[int, int]]) -> dict[int, list[int]]:
+    """Group anchor row positions by their primary semantic identifier."""
+    grouped_positions: dict[int, list[int]] = {}
+    for position, key in enumerate(keys):
+        grouped_positions.setdefault(int(key[0]), []).append(position)
+    return grouped_positions
 
-    for idx, anchors in anchor_tensors.items():
-        keys = anchor_keys.get(idx, [])
-        keep_positions = [
-            pos for pos, key in enumerate(keys) if key in selected_keys
-        ]
-        if not keep_positions:
+
+def _greedy_match_positions(distance_matrix: torch.Tensor) -> list[tuple[int, int]]:
+    """Greedily match row indices from the smallest available distances.
+    Used to match anchors that are most similar intraclass and to avoid
+    collaps/distortions trying to match an husky to a bulldog"""
+    if distance_matrix.numel() == 0:
+        return []
+
+    n_rows_i, n_rows_j = distance_matrix.shape
+    flat_order = torch.argsort(distance_matrix.reshape(-1))
+
+    used_i: set[int] = set()
+    used_j: set[int] = set()
+    matches: list[tuple[int, int]] = []
+
+    for flat_idx in flat_order.tolist():
+        row_i = int(flat_idx // n_rows_j)
+        row_j = int(flat_idx % n_rows_j)
+        if row_i in used_i or row_j in used_j:
             continue
 
-        indices = torch.tensor(
-            keep_positions,
-            dtype=torch.long,
-            device=anchors.device,
-        )
-        filtered_tensors[idx] = anchors.index_select(0, indices)
-        filtered_keys[idx] = [keys[pos] for pos in keep_positions]
+        used_i.add(row_i)
+        used_j.add(row_j)
+        matches.append((row_i, row_j))
 
-    return filtered_tensors, filtered_keys
+        if len(matches) == min(n_rows_i, n_rows_j):
+            break
+
+    return sorted(matches)
 
 
 def shared_anchor_rows(
@@ -521,30 +501,78 @@ def shared_anchor_rows(
     keys_i: list[tuple[int, int]],
     A_j: torch.Tensor,
     keys_j: list[tuple[int, int]],
+    *,
+    match_by: str = 'exact',
+    projected_A_j: torch.Tensor | None = None,
+    class_matching: bool = True,
+    intraclass_matching: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Extract anchor rows whose semantic keys are shared across agents."""
+    """Extract anchor rows shared across agents under a chosen matching rule."""
     if not keys_i or not keys_j:
         return None
 
-    key_to_idx_i = {key: pos for pos, key in enumerate(keys_i)}
-    key_to_idx_j = {key: pos for pos, key in enumerate(keys_j)}
-    shared_keys = sorted(set(key_to_idx_i) & set(key_to_idx_j))
-    if not shared_keys:
+    if match_by == 'exact':
+        # using exact keys as for semantic pilots strategy
+        key_to_idx_i = {key: pos for pos, key in enumerate(keys_i)}
+        key_to_idx_j = {key: pos for pos, key in enumerate(keys_j)}
+        shared_keys = sorted(set(key_to_idx_i) & set(key_to_idx_j))
+        if not shared_keys:
+            return None
+
+        idx_i = torch.tensor([key_to_idx_i[key] for key in shared_keys], device=A_i.device, dtype=torch.long)
+        idx_j = torch.tensor([key_to_idx_j[key] for key in shared_keys], device=A_j.device, dtype=torch.long)
+        return A_i.index_select(0, idx_i), A_j.index_select(0, idx_j)
+
+    if match_by != 'class':
+        raise ValueError(f'Unknown match_by strategy: {match_by}')
+
+    matching_rows_j = projected_A_j if projected_A_j is not None else A_j
+
+    if not class_matching:
+        # aligning the unfiltered but same sized anchor set with no class logic
+        min_rows = min(A_i.shape[0], A_j.shape[0])
+        if min_rows == 0:
+            return None
+        return A_i[:min_rows], A_j[:min_rows]
+
+    grouped_i = _group_anchor_positions(keys_i)
+    grouped_j = _group_anchor_positions(keys_j)
+    shared_classes = sorted(set(grouped_i) & set(grouped_j))
+    if not shared_classes:
         return None
 
-    idx_i = torch.tensor(
-        [key_to_idx_i[key] for key in shared_keys],
-        device=A_i.device,
-        dtype=torch.long,
-    )
-    idx_j = torch.tensor(
-        [key_to_idx_j[key] for key in shared_keys],
-        device=A_j.device,
-        dtype=torch.long,
-    )
+    matched_positions_i: list[int] = []
+    matched_positions_j: list[int] = []
 
-    return A_i.index_select(0, idx_i), A_j.index_select(0, idx_j)
+    for class_label in shared_classes:
+        positions_i = grouped_i[class_label]
+        positions_j = grouped_j[class_label]
 
+        if intraclass_matching:
+            # further match within the class to preserve finer-grained semantics and avoid collapses/distortions
+            idx_i = torch.tensor(positions_i, device=A_i.device, dtype=torch.long)
+            idx_j = torch.tensor(positions_j, device=matching_rows_j.device, dtype=torch.long)
+
+            class_rows_i = A_i.index_select(0, idx_i)
+            class_rows_j = matching_rows_j.index_select(0, idx_j)
+            distances = torch.cdist(class_rows_i, class_rows_j)
+
+            for local_i, local_j in _greedy_match_positions(distances):
+                matched_positions_i.append(positions_i[local_i])
+                matched_positions_j.append(positions_j[local_j])
+
+        else:
+            # Just pair them up blindly in the order they were generated
+            min_class_rows = min(len(positions_i), len(positions_j))
+            matched_positions_i.extend(positions_i[:min_class_rows])
+            matched_positions_j.extend(positions_j[:min_class_rows])
+
+    if not matched_positions_i:
+        return None
+
+    gathered_i = torch.tensor(matched_positions_i, device=A_i.device, dtype=torch.long)
+    gathered_j = torch.tensor(matched_positions_j, device=A_j.device, dtype=torch.long)
+    return A_i.index_select(0, gathered_i), A_j.index_select(0, gathered_j)
 
 __all__ = [
     'AnchorConfig',
@@ -554,11 +582,19 @@ __all__ = [
     'build_anchor_bundles',
     'build_class_anchor_plan',
     'build_semantic_pilot_bundles',
-    'filter_anchor_bundles',
     'l2_normalize',
     'normalize_anchor_matrix',
     'parseval_normalize',
     'shared_anchor_rows',
     'sorted_global_classes',
     'supported_anchor_strategy',
+]
+'''
+
+__all__ = [
+    'AnchorConfig',
+    'l2_normalize',
+    'normalize_anchor_matrix',
+    'parseval_normalize',
+    'shared_anchor_rows',
 ]

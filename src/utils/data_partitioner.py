@@ -10,6 +10,9 @@ assigned exactly once and that every agent receives at least one sample.
 from collections import defaultdict
 
 import torch
+import random
+import numpy as np
+import torch
 
 
 def build_shared_class_partition(
@@ -425,3 +428,104 @@ def partition_non_iid(
     if return_agent_classes:
         result = (agent_indices, resolved_agent_classes)
     return result
+
+
+def partition_fmtl_heuristic(
+    labels: list[int],
+    n_agents: int,
+    classes_per_agent: int,
+    seed: int = 42,
+    agent_classes: dict[int, list[int]] | None = None,
+    return_agent_classes: bool = False,
+) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """
+    Exact replication of the Sheaf-FMTL authors' heuristic data partitioning.
+    
+    This replicates the log-normal distribution, the hardcoded randint(300, 600) 
+    sample inflation, and the array overflow skipping behavior present in the 
+    original HeterogeneousCIFAR10 implementation.
+    """
+    if n_agents < 1 or classes_per_agent < 1:
+        raise ValueError("n_agents and classes_per_agent must be >= 1")
+
+    rng_np = np.random.RandomState(seed)
+    rng_py = random.Random(seed)
+
+    labels_array = np.array(labels)
+    unique_classes = sorted(np.unique(labels_array).tolist())
+    num_classes = len(unique_classes)
+    class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+
+    # Separate indices by class and shuffle them to simulate random drawing
+    indices_by_class = {c: np.where(labels_array == c)[0].tolist() for c in unique_classes}
+    for c in unique_classes:
+        rng_py.shuffle(indices_by_class[c])
+
+    # Replicate exact class assignment 
+    if agent_classes is None:
+        resolved_agent_classes = {}
+        for client in range(n_agents):
+            resolved_agent_classes[client] = rng_np.choice(
+                unique_classes, classes_per_agent, replace=False
+            ).tolist()
+    else:
+        resolved_agent_classes = agent_classes
+
+    agent_indices = {i: [] for i in range(n_agents)}
+    idx_tracker = {c: 0 for c in unique_classes}
+
+    # Initial distribution: Exactly 10 samples per assigned class per client
+    for client in range(n_agents):
+        for c in resolved_agent_classes[client]:
+            num_initial = 10
+            start = idx_tracker[c]
+            end = start + num_initial
+            
+            # Safe allocation just in case
+            available = indices_by_class[c][start:end]
+            agent_indices[client].extend(available)
+            idx_tracker[c] += len(available)
+
+    # The Authors' Log-Normal 
+    # Shape: (num_classes, n_agents, classes_per_agent)
+    props = rng_np.lognormal(0, 2.0, (num_classes, n_agents, classes_per_agent))
+    
+    # Scale by remaining available samples 
+    class_totals = np.array([[[len(indices_by_class[c]) - n_agents]] for c in unique_classes])
+    props = class_totals * props / np.sum(props, axis=(1, 2), keepdims=True)
+
+    # Distribute using the Authors' Heuristics
+    # To prevent ZeroDivisionError if n_agents < 10
+    div_factor = max(1, int(n_agents / 10))
+
+    for client in range(n_agents):
+        for j, c in enumerate(resolved_agent_classes[client]):
+            c_idx = class_to_idx[c]
+            
+            # Replicate their weird indexing: client // int(self.num_clients/10)
+            prop_idx = min(client // div_factor, n_agents - 1)
+            
+            num_samples = int(props[c_idx, prop_idx, j])
+            
+            # Hardcoded inflation
+            num_samples += rng_py.randint(300, 600)
+            
+            if n_agents <= 20:
+                num_samples *= 2
+
+            start = idx_tracker[c]
+            end = start + num_samples
+
+            # Replicate their overflow bug: If the requested samples exceed the 
+            # dataset boundaries, they just skipped it
+            if end < len(indices_by_class[c]):
+                agent_indices[client].extend(indices_by_class[c][start:end])
+                idx_tracker[c] += num_samples
+
+    # Sort indices for determinism
+    for client in range(n_agents):
+        agent_indices[client].sort()
+
+    if return_agent_classes:
+        return agent_indices, resolved_agent_classes
+    return agent_indices

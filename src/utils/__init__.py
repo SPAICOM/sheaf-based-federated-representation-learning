@@ -10,10 +10,10 @@ This package provides helper functions for:
 
 from .anchors import (
     AnchorConfig,
-    build_anchor_bundles,
-    build_semantic_pilot_bundles,
+    #build_anchor_bundles,
+    #build_semantic_pilot_bundles,
     shared_anchor_rows,
-    supported_anchor_strategy,
+    #supported_anchor_strategy,
 )
 from .communication import calculate_communication_cost
 from .data_partitioner import (
@@ -26,8 +26,8 @@ from .io import remove_non_empty_dir
 
 __all__ = [
     'AnchorConfig',
-    'build_anchor_bundles',
-    'build_semantic_pilot_bundles',
+    #'build_anchor_bundles',
+    #'build_semantic_pilot_bundles',
     'build_shared_class_partition',
     'calculate_communication_cost',
     'generate_neighbors',
@@ -35,5 +35,5 @@ __all__ = [
     'partition_non_iid',
     'remove_non_empty_dir',
     'shared_anchor_rows',
-    'supported_anchor_strategy',
+    #'supported_anchor_strategy',
 ]

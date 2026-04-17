@@ -29,6 +29,7 @@ from src.utils.data_partitioner import (
     build_shared_class_partition,
     partition_by_agent_classes,
     partition_non_iid,
+    partition_fmtl_heuristic
 )
 
 
@@ -167,10 +168,12 @@ class ClassificationDataModule(l.LightningDataModule):
         Each agent sees images rotated by its specified angle.
         Default: None (no rotation for all agents).
     split_strategy : str, optional
-        How to split data across agents. Options: 'uniform' (default),
+        How to split data across agents. Options:
+        'uniform' (default),
         'class_partition' (each agent sees specific classes),
         'non_iid' (each agent is randomly assigned ``classes_per_agent``
-        classes and samples are distributed among assigned agents).
+        classes and samples are distributed among assigned agents),
+        'fmtl_heuristic' : exact replication of Sheaf-FMTL authors' dataset skew.
     agent_classes : dict[int, list[int]], optional
         Dictionary mapping agent indices to list of class labels they see.
         Only used when split_strategy='class_partition'.
@@ -248,7 +251,7 @@ class ClassificationDataModule(l.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         monitor_test_during_fit: bool = False,
-        include_pilot_loaders: bool = True,
+        #include_pilot_loaders: bool = True,
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
@@ -277,7 +280,6 @@ class ClassificationDataModule(l.LightningDataModule):
         self.val_split = val_split
         self.test_split = test_split
         self.monitor_test_during_fit = monitor_test_during_fit
-        self.include_pilot_loaders = include_pilot_loaders
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
         self.pilot_batch_size = (
@@ -544,6 +546,58 @@ class ClassificationDataModule(l.LightningDataModule):
             agent_labels = self.train_datasets[i].dataset[label_key]
             self.num_classes[i] = len(set(agent_labels))
 
+    def _split_data_fmtl_heuristic(self, train, val, test, label_key: str) -> None:
+        """Split data using the exact Sheaf-FMTL authors' heuristic.
+
+        Replicates the hardcoded Log-Normal and random integer skew used in 
+        the original Sheaf-FMTL paper for scientifically exact baseline replication.
+        """
+        train_partition, sampled_agent_classes = partition_fmtl_heuristic(
+            labels=train[label_key],
+            n_agents=self.n_agents,
+            classes_per_agent=self.classes_per_agent,
+            seed=self.seed,
+            return_agent_classes=True,
+        )
+        self.agent_classes = sampled_agent_classes
+
+        split_partitions = {
+            'train_datasets': train_partition,
+            'val_datasets': partition_fmtl_heuristic(
+                labels=val[label_key],
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                agent_classes=self.agent_classes,
+            ),
+            'test_datasets': partition_fmtl_heuristic(
+                labels=test[label_key],
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                agent_classes=self.agent_classes,
+            ),
+        }
+
+        for split_data, target_dict in [
+            (train, 'train_datasets'),
+            (val, 'val_datasets'),
+            (test, 'test_datasets'),
+        ]:
+            partition = split_partitions[target_dict]
+            for i in range(self.n_agents):
+                rotation = self.agent_rotations.get(i, 0)
+                getattr(self, target_dict)[i] = ClassificationDataset(
+                    split_data.select(partition[i]),
+                    self.data_key,
+                    label_key,
+                    rotation_angle=rotation,
+                )
+
+        for i in range(self.n_agents):
+            agent_labels = self.train_datasets[i].dataset[label_key]
+            self.num_classes[i] = len(set(agent_labels))
+
     def prepare_data(self) -> None:
         """Download dataset from HuggingFace."""
         load_dataset(f'{self.repo}/{self.name}')
@@ -626,8 +680,30 @@ class ClassificationDataModule(l.LightningDataModule):
             # Automatic Non-IID: each agent gets classes_per_agent random
             # classes, samples distributed among assigned agents
             self._split_data_non_iid(train, val, test, label_key)
+        elif self.split_strategy == 'fmtl_heuristic':
+            # Exact replication of Sheaf-FMTL authors' dataset skew
+            self._split_data_fmtl_heuristic(train, val, test, label_key)
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
+        '''
+        if not self.pilot_datasets and self.pilot_batch_size > 0:
+            for i in range(self.n_agents):
+                local_train_ds = self.train_datasets[i].dataset
+                
+                # Grab a deterministic subset of the agent's local data
+                n_samples = min(self.pilot_batch_size, len(local_train_ds))
+                local_anchor_subset = local_train_ds.select(range(n_samples))
+                
+                rotation = self.agent_rotations.get(i, 0)
+                self.pilot_datasets[i] = ClassificationDataset(
+                    local_anchor_subset,
+                    self.data_key,
+                    label_key,
+                    rotation_angle=rotation,
+                    # Provide local dummy IDs to satisfy the dataset __getitem__
+                    sample_ids=list(range(n_samples)) 
+                )
+        '''
 
         # Determine input shape from first sample
         # Handle both PIL Images (need conversion) and pre-converted tensors
@@ -677,7 +753,8 @@ class ClassificationDataModule(l.LightningDataModule):
             i: self._make_loader(self.train_datasets[i], True)
             for i in self.train_datasets
         }
-        if self.include_pilot_loaders and self.pilot_datasets:
+        #if self.include_pilot_loaders and self.pilot_datasets:
+        if self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.train_datasets.values()
@@ -690,7 +767,7 @@ class ClassificationDataModule(l.LightningDataModule):
             i: self._make_loader(self.val_datasets[i], False)
             for i in self.val_datasets
         }
-        if self.include_pilot_loaders and self.pilot_datasets:
+        if self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.val_datasets.values()
@@ -714,7 +791,8 @@ class ClassificationDataModule(l.LightningDataModule):
             i: self._make_loader(self.test_datasets[i], False)
             for i in self.test_datasets
         }
-        if self.include_pilot_loaders and self.pilot_datasets:
+        #if self.include_pilot_loaders and self.pilot_datasets:
+        if self.pilot_datasets:
             target_num_batches = max(
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.test_datasets.values()

@@ -10,17 +10,15 @@ This module contains various utility functions and classes used throughout the f
   - **Key Functions**:
     - `build_anchor_bundles`: Creates anchor bundles for class-keyed strategies
     - `build_semantic_pilot_bundles`: Creates anchor bundles for semantic pilot strategies
-    - `filter_anchor_bundles`: Restricts candidate anchors to a chosen semantic subset
     - `shared_anchor_rows`: Finds shared anchors between agents for alignment computation
     - `supported_anchor_strategy`: Validates and returns normalized anchor strategy names
     - `AnchorConfig`: Configuration class for anchor selection parameters
   - **Strategies**:
     - `prototype`: one prototype per observed class
     - `uniform`: Monte Carlo baseline over raw latent samples, with budget allocated proportionally to class frequency
-    - `diversity`: diversity-aware farthest-point anchors within each class
+    - `geometric`: geometric-aware farthest-point anchors within each class
     - `clustering`: centroid anchors from latent-space clustering within each class
     - `semantic_pilots`: anchors keyed by shared pilot sample ids
-    - `dynamic`: disagreement-driven based on residuals. Fixes some across batches via `dynamic_persistent_ratio` and refreshed the rest
   - **Usage**: Used by orchestrators to select anchors for computing cross-covariance matrices and alignment
 
 ### Communication Tracking

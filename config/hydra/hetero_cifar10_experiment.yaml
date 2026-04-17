@@ -60,13 +60,14 @@ dataset:
   split_strategy: non_iid
   n_agents: 30
   classes_per_agent: 5
-  alpha: 15 
+  alpha: -1
   monitor_test_during_fit: true
-  batch_size: 128
+  batch_size: 256
   num_workers: 0
   mode: min_size
   pilot_split: 0.05
   pilot_batch_size: 64
+  comm_data: shared_global_pilots
 
 
 #dataset:
@@ -96,11 +97,12 @@ model:
 
 orchestrator:
   lambda_sheaf: 0.05
-  anchor_strategy: prototype
-  num_anchors: 64
+  #anchor_strategy: prototype
+  #num_anchors: 64
   parseval_normalization: false
   l2_normalization: false
-
+  filter_unseen_classes: true  
+  use_prototypes: true
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch

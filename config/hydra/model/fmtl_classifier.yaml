@@ -1,0 +1,4 @@
+_target_: src.agents.FMTLCNNClassifier
+
+in_features: 3
+num_classes: 10

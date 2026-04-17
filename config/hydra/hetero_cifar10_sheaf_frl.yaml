@@ -76,8 +76,8 @@ model:
 
 orchestrator:
   lambda_sheaf: 0.05
-  anchor_strategy: prototype
-  num_anchors: 64
+  #anchor_strategy: prototype
+  #num_anchors: 64
   parseval_normalization: false
   l2_normalization: false
 

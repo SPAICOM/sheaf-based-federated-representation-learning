@@ -2,14 +2,13 @@
 Sheaf-based Federated Representation Learning orchestrator.
 
 This module implements the proposed federated learning framework with
-Sheaf regularization
-that maintains aligned latent spaces across agents through Stiefel manifold
-optimization of cross-covariance matrices. Anchor strategies are implemented
-with explicit semantic correspondence keys so neighboring agents are aligned
-only on class-consistent anchors.
+Sheaf regularization that maintains aligned latent spaces across agents
+through Stiefel manifold optimization of cross-covariance matrices. 
+Anchor strategies are implemented with explicit semantic correspondence 
+keys or shared pilot batches so neighboring agents are aligned accurately.
 """
 
-from dataclasses import replace
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -17,11 +16,9 @@ import torch.nn as nn
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 from src.utils.anchors import (
     AnchorConfig,
-    build_anchor_bundles,
-    build_semantic_pilot_bundles,
-    filter_anchor_bundles,
+    communication_anchor_payload,
+    normalize_anchor_matrix,
     shared_anchor_rows,
-    supported_anchor_strategy,
 )
 
 
@@ -44,21 +41,19 @@ class SheafFRL(BaseOrchestrator):
         Weight coefficient for the sheaf regularization penalty.
     latent_dims : dict
         Dictionary mapping agent indices to their latent space dimensions.
-    anchor_strategy : str
-        Strategy for selecting anchors. Supported values:
-        'prototype', 'uniform', 'diversity', 'semantic_pilots',
-        'clustering', and 'dynamic'.
-    num_anchors : int
-        Number of anchors to select per epoch.
     parseval_normalization : bool
         Whether to apply Parseval normalization to anchor features.
+    local_steps : int
+        Number of local training steps between communication rounds.
+    filter_unseen_classes : bool
+        If True, restricts alignment strictly to mutually shared classes.
+    use_prototypes : bool
+        If True, aligns class means instead of raw individual samples.
 
     Notes
     -----
     - The Stiefel matrices are frozen and updated in closed form each epoch.
-    - Anchor selection is performed per epoch using the specified strategy.
     - Parseval normalization applies local whitening to anchor features.
-    - Epoch anchor buffers are stored on CPU to avoid GPU OOM.
     """
 
     def __init__(
@@ -68,14 +63,12 @@ class SheafFRL(BaseOrchestrator):
         optimizer,
         lambda_sheaf: float,
         latent_dims: dict,
-        anchor_strategy: str,
-        num_anchors: int,
         parseval_normalization: bool,
         l2_normalization: bool,
         parseval_eps: float = 1e-4,
-        dynamic_persistent_ratio: float = 0.25,
-        dynamic_candidate_multiplier: int = 2,
-        dynamic_refresh_interval: int = 10,
+        local_steps: int = 1,
+        filter_unseen_classes: bool = True,
+        use_prototypes: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -86,20 +79,17 @@ class SheafFRL(BaseOrchestrator):
 
         self.save_hyperparameters()
         self.anchor_config = AnchorConfig(
-            strategy=str(anchor_strategy),
-            num_anchors=int(num_anchors),
             parseval_normalization=bool(parseval_normalization),
             l2_normalization=bool(l2_normalization),
             parseval_eps=float(parseval_eps),
+            filter_unseen_classes=bool(filter_unseen_classes),
+            use_prototypes=bool(use_prototypes),
         )
 
-        self.stiefel_matrices = nn.ParameterDict()
-        self.epoch_anchors = {}
-        # Per-agent semantic anchor identifiers. For class-based strategies
-        # these are class labels; for semantic pilots: shared sample ids.
-        self.epoch_anchor_ids: dict[int, list[torch.Tensor]] = {}
-        self.dynamic_persistent_keys: set[tuple[int, int]] = set()
+        # Track the classes each agent has seen locally
+        self.seen_classes: dict[int, set[int]] = {int(k): set() for k in agents.keys()}
 
+        self.stiefel_matrices = nn.ParameterDict()
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
         # Create Stiefel matrices for each edge in the neighbor graph
@@ -127,264 +117,62 @@ class SheafFRL(BaseOrchestrator):
                     d_j = latent_dims_int[node_j]
 
                     # Initialize as identity mapping
-                    # requires_grad=False because we use closed-form SVD
-                    # updates, TODO: ablation about initialization later
+                    # requires_grad=False because we use closed-form SVD updates
                     stiefel_matrix = torch.eye(d_i, d_j)
 
                     self.stiefel_matrices[edge_key] = nn.Parameter(
                         stiefel_matrix, requires_grad=False
                     )
 
-    def _dynamic_candidate_config(self) -> AnchorConfig:
-        """Build the larger candidate budget used by dynamic anchors."""
-        candidate_budget = max(
-            int(self.hparams.num_anchors),
-            int(self.hparams.num_anchors)
-            * max(1, int(self.hparams.dynamic_candidate_multiplier)),
-        )
-        return replace(
-            self.anchor_config,
-            strategy='clustering',
-            num_anchors=candidate_budget,
-        )
-
-    def _anchor_key_scalar_count(
-        self,
-        anchor_keys: list[int] | list[tuple[int, int]],
-    ) -> int:
-        """Count transmitted anchor-key scalars without using key values."""
-        scalar_count = 0
-        for key in anchor_keys:
-            if isinstance(key, tuple):
-                scalar_count += len(key)
-            else:
-                scalar_count += 1
-        return scalar_count
-
-    def _record_anchor_bundle_communication(
-        self,
-        anchor_tensors: dict[int, torch.Tensor],
-        anchor_keys: dict[int, list[int] | list[tuple[int, int]]],
-        *,
-        prefix: str,
-    ) -> None:
-        """Record one anchor-exchange round for all participating agents."""
-        total_transmissions = sum(
-            len(self.hparams.neighbors.get(idx, set())) for idx in anchor_tensors
-        )
-        if total_transmissions < 1:
-            return
-
-        self._record_communication_round(prefix=prefix)
-        for idx, anchors in anchor_tensors.items():
-            self._record_communication(
-                {
-                    'anchors': anchors,
-                    'anchor_key_scalar_count': self._anchor_key_scalar_count(
-                        anchor_keys.get(idx, [])
-                    ),
-                },
-                n_transmissions=len(self.hparams.neighbors.get(idx, set())),
-                prefix=prefix,
-            )
-
-    def _dynamic_key_scores(
-        self,
-        candidate_tensors: dict[int, torch.Tensor],
-        candidate_keys: dict[int, list[tuple[int, int]]],
-    ) -> dict[tuple[int, int], float]:
-        """Score semantic anchor keys by current cross-client disagreement."""
-        scores: dict[tuple[int, int], float] = {}
-
-        for edge_key, V in self.stiefel_matrices.items():
-            node_i, node_j = map(int, edge_key.split('_'))
-            if node_i not in candidate_tensors or node_j not in candidate_tensors:
-                continue
-
-            keys_i = candidate_keys.get(node_i, [])
-            keys_j = candidate_keys.get(node_j, [])
-            if not keys_i or not keys_j:
-                continue
-
-            key_to_idx_i = {key: pos for pos, key in enumerate(keys_i)}
-            key_to_idx_j = {key: pos for pos, key in enumerate(keys_j)}
-            shared_keys = sorted(set(key_to_idx_i) & set(key_to_idx_j))
-
-            for key in shared_keys:
-                row_i = candidate_tensors[node_i][key_to_idx_i[key]]
-                row_j = candidate_tensors[node_j][key_to_idx_j[key]]
-                residual = row_i - torch.matmul(row_j, V.T)
-                score = float(residual.pow(2).sum().detach().cpu().item())
-                scores[key] = scores.get(key, 0.0) + score
-
-        return scores
-
-    def _select_dynamic_keys(
-        self,
-        candidate_keys: dict[int, list[tuple[int, int]]],
-        scores: dict[tuple[int, int], float],
-        *,
-        update_persistent: bool,
-        batch_idx: int,
-    ) -> set[tuple[int, int]]:
-        """Combine a persistent subset with refreshed disagreement anchors."""
-        available_keys = set()
-        for keys in candidate_keys.values():
-            available_keys.update(keys)
-        if not available_keys:
-            return set()
-
-        ranked_keys = sorted(
-            available_keys,
-            key=lambda key: (-scores.get(key, 0.0), key),
-        )
-
-        total_budget = max(1, int(self.hparams.num_anchors))
-        persistent_budget = min(
-            total_budget,
-            max(
-                1,
-                int(
-                    round(
-                        total_budget
-                        * float(self.hparams.dynamic_persistent_ratio)
-                    )
-                ),
-            ),
-        )
-        refresh_budget = max(0, total_budget - persistent_budget)
-
-        persistent_keys = [
-            key
-            for key in ranked_keys
-            if key in self.dynamic_persistent_keys
-        ][:persistent_budget]
-
-        refreshed_keys = [
-            key for key in ranked_keys if key not in set(persistent_keys)
-        ][:refresh_budget]
-
-        selected_keys = list(dict.fromkeys(persistent_keys + refreshed_keys))
-        if len(selected_keys) < total_budget:
-            for key in ranked_keys:
-                if key not in selected_keys:
-                    selected_keys.append(key)
-                if len(selected_keys) == total_budget:
-                    break
-
-        if (
-            update_persistent
-            and batch_idx % max(1, int(self.hparams.dynamic_refresh_interval))
-            == 0
-        ):
-            self.dynamic_persistent_keys = set(ranked_keys[:persistent_budget])
-
-        return set(selected_keys)
-
-    def _build_dynamic_anchor_bundles(
-        self,
-        latents: dict[int, torch.Tensor],
-        anchor_ids_per_agent: dict[int, torch.Tensor],
-        *,
-        update_persistent: bool,
-        batch_idx: int,
-    ) -> tuple[dict[int, torch.Tensor], dict[int, list[tuple[int, int]]]]:
-        """Build dynamic anchors from a persistent plus refreshed subset."""
-        candidate_tensors, candidate_keys = build_anchor_bundles(
-            latents,
-            anchor_ids_per_agent,
-            self._dynamic_candidate_config(),
-        )
-        if not candidate_tensors:
-            return candidate_tensors, candidate_keys
-
-        scores = self._dynamic_key_scores(candidate_tensors, candidate_keys)
-        selected_keys = self._select_dynamic_keys(
-            candidate_keys,
-            scores,
-            update_persistent=update_persistent,
-            batch_idx=batch_idx,
-        )
-        return filter_anchor_bundles(
-            candidate_tensors,
-            candidate_keys,
-            selected_keys,
-        )
-
-    def on_train_epoch_start(self) -> None:
-        """Initialize/reset per-agent anchor and label buffers."""
-        super().on_train_epoch_start()
-        for idx_str in self.agents:
-            idx = int(idx_str)
-            self.epoch_anchors[idx] = []
-            self.epoch_anchor_ids[idx] = []
+    def _resolve_key(self, batch: dict, idx: int) -> int | str:
+        str_key = str(idx)
+        return str_key if str_key in batch else idx
+    
+    def _extract_pilot_batch(self, batch: dict, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Extract pilot data for an agent, handling global, private, or pairwise keys."""
+        if 'global_pilot' in batch:
+            return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
+            
+        if f'pilot_{idx}' in batch:
+            return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
+            
+        for key, value in batch.items():
+            if isinstance(key, str) and key.startswith('pilot_'):
+                parts = key.split('_')
+                if len(parts) == 3:
+                    i, j = int(parts[1]), int(parts[2])
+                    if i == idx:
+                        return value[0], value[1], value[2]
+                    elif j == idx:
+                        return value[3], value[4], value[5]
+                        
+        raise ValueError(f"Pilot batch missing for agent {idx}.")
 
     @torch.no_grad()
-    def on_train_epoch_end(self) -> None:
-        """Update Stiefel matrices using semantically shared anchors only."""
-        if not self.epoch_anchors or not any(self.epoch_anchors.values()):
-            self._finalize_train_epoch_communication()
+    def _update_stiefel_matrices(
+        self,
+        latents_per_agent: dict[int, torch.Tensor],
+        labels_per_agent: dict[int, torch.Tensor]
+    ) -> None:
+        """Exact minimization of the V-block (Stiefel Matrices) via SVD."""
+        if not self.stiefel_matrices:
             return
-
-        A_dict_raw: dict[int, torch.Tensor] = {}
-        anchor_ids_per_agent: dict[int, torch.Tensor] = {}
-
-        for idx_str in self.agents:
-            idx = int(idx_str)
-            if self.epoch_anchors[idx]:
-                A_dict_raw[idx] = torch.cat(self.epoch_anchors[idx], dim=0)
-            if self.epoch_anchor_ids[idx]:
-                anchor_ids_per_agent[idx] = torch.cat(
-                    self.epoch_anchor_ids[idx], dim=0
-                )
-
-        if not A_dict_raw:
-            return
-
-        strategy = supported_anchor_strategy(self.anchor_config.strategy)
-
-        if strategy == 'semantic_pilots':
-            A_dict, anchor_keys = build_semantic_pilot_bundles(
-                A_dict_raw,
-                anchor_ids_per_agent,
-                self.anchor_config,
-            )
-        elif strategy == 'dynamic':
-            A_dict, anchor_keys = self._build_dynamic_anchor_bundles(
-                A_dict_raw,
-                anchor_ids_per_agent,
-                update_persistent=False,
-                batch_idx=0,
-            )
-        else:
-            A_dict, anchor_keys = build_anchor_bundles(
-                A_dict_raw,
-                anchor_ids_per_agent,
-                self.anchor_config,
-            )
-        if not A_dict:
-            self._finalize_train_epoch_communication()
-            return
-
-        self._record_anchor_bundle_communication(
-            A_dict,
-            anchor_keys,
-            prefix='train',
-        )
 
         param_device = next(iter(self.stiefel_matrices.values())).device
 
         for edge_key, V_param in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
 
-            if node_i not in A_dict or node_j not in A_dict:
+            if node_i not in latents_per_agent or node_j not in latents_per_agent:
                 continue
 
             shared_rows = shared_anchor_rows(
-                A_i=A_dict[node_i],
-                keys_i=anchor_keys.get(node_i, []),
-                A_j=A_dict[node_j],
-                keys_j=anchor_keys.get(node_j, []),
+                A_i=latents_per_agent[node_i],
+                A_j=latents_per_agent[node_j],
+                labels=labels_per_agent[node_i], 
+                seen_i=self.seen_classes[node_i],
+                seen_j=self.seen_classes[node_j],
+                config=self.anchor_config
             )
             if shared_rows is None:
                 continue
@@ -414,12 +202,16 @@ class SheafFRL(BaseOrchestrator):
             )
             V_param.copy_(V_new)
 
-        # Clear epoch buffers
-        for idx in self.epoch_anchors:
-            self.epoch_anchors[idx].clear()
-        for idx in self.epoch_anchor_ids:
-            self.epoch_anchor_ids[idx].clear()
+    def on_train_start(self) -> None:
+        """Initialize/reset per-agent anchor and label buffers."""
+        super().on_train_start()
+        self._train_local_step_count = 0
+        for idx in self.seen_classes:
+            self.seen_classes[idx].clear()
 
+    @torch.no_grad()
+    def on_train_epoch_end(self) -> None:
+        """Communication is logged per step; finalize the totals here."""
         self._finalize_train_epoch_communication()
 
     def _shared_eval(
@@ -431,145 +223,106 @@ class SheafFRL(BaseOrchestrator):
         """Compute losses and metrics for validation/test steps.
 
         Task loss is evaluated on the full mini-batch; the sheaf regularization
-        penalty is evaluated strictly on the Anchor Set A, defined dynamically
-        per mini-batch according to self.hparams.anchor_strategy.
-
-        Parameters
-        ----------
-        batch : dict[int, list[torch.Tensor]]
-            Dictionary mapping agent indices to (input, label) pairs.
-        batch_idx : int
-            Index of the current batch.
-        prefix : str
-            Prefix for logging (e.g., 'train', 'validation', 'test').
-
-        Returns
-        -------
-        tuple[dict, torch.Tensor]
-            Tuple of (outputs, total_loss) where outputs maps agent indices to
-            (prediction, label) pairs and total_loss includes both task and
-            sheaf regularization terms.
+        penalty is evaluated strictly on the Pilot Set.
         """
         if isinstance(batch, tuple):
             batch = batch[0]
 
         outputs = {}
-
         agent_losses = {}
         agent_performances = {}
 
-        def _resolve_key(i: int):
-            """Return the key used for agent i in the batch dict.
-
-            CombinedLoader key type depends on the datamodule:
-            - ClassificationDataModule  -> int keys  (0, 1, …)
-            - SemanticDataModule        -> str keys ('0', '1', …)
-            """
-            str_key = str(i)
-            return str_key if str_key in batch else i
-
-        def _resolve_pilot_key(i: int) -> str:
-            return f'pilot_{i}'
-
-        strategy = supported_anchor_strategy(self.anchor_config.strategy)
-        raw_latents: dict[int, torch.Tensor] = {}
+        latents_per_agent: dict[int, torch.Tensor] = {}
         labels_per_agent: dict[int, torch.Tensor] = {}
 
+        # Task loss and performance (full batch)
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            x, y = batch[_resolve_key(idx)]
+            x_task, y_task = batch[self._resolve_key(batch, idx)]
 
-            # Single encoder forward pass reused for both the task loss and
-            # the sheaf penalty.
-            A_batch_raw = agent.encode(x)
-            y_hat = agent.decoder(A_batch_raw)
-
-            outputs[idx] = (y_hat.detach(), y)
-            raw_latents[idx] = A_batch_raw
-            labels_per_agent[idx] = y
-
-            # Task-specific loss and performance on the mini-batch
-            task_loss = agent.compute_loss(y_hat, y)
-            task_performance = agent.task_performance(y_hat, y)
-
-            agent_losses[idx] = task_loss
-            agent_performances[idx] = task_performance
-
-        if strategy == 'semantic_pilots':
-            pilot_latents: dict[int, torch.Tensor] = {}
-            pilot_ids_per_agent: dict[int, torch.Tensor] = {}
-
-            for idx_str, agent in self.agents.items():
-                idx = int(idx_str)
-                pilot_key = _resolve_pilot_key(idx)
-                if pilot_key not in batch:
-                    raise ValueError(
-                        'semantic_pilots requires datamodule pilot loaders. '
-                        'Configure pilot_split or pilot_num_samples.'
-                    )
-
-                x_pilot, _unused_y, sample_ids = batch[pilot_key]
-                pilot_latents[idx] = agent.encode(x_pilot)
-                pilot_ids_per_agent[idx] = sample_ids
-
-            batch_latents, batch_anchor_keys = build_semantic_pilot_bundles(
-                pilot_latents,
-                pilot_ids_per_agent,
-                self.anchor_config,
-            )
+            # track seen classes dynamically
             if prefix == 'train':
-                for idx, A_pilot in pilot_latents.items():
-                    self.epoch_anchors[idx].append(A_pilot.detach().cpu())
-                    self.epoch_anchor_ids[idx].append(
-                        pilot_ids_per_agent[idx].detach().cpu()
-                    )
-        elif strategy == 'dynamic':
-            batch_latents, batch_anchor_keys = self._build_dynamic_anchor_bundles(
-                raw_latents,
-                labels_per_agent,
-                update_persistent=(prefix == 'train'),
-                batch_idx=batch_idx,
-            )
-            if prefix == 'train':
-                for idx, A_batch_raw in raw_latents.items():
-                    self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
-                    self.epoch_anchor_ids[idx].append(
-                        labels_per_agent[idx].detach().cpu()
-                    )
-        else:
-            batch_latents, batch_anchor_keys = build_anchor_bundles(
-                raw_latents,
-                labels_per_agent,
-                self.anchor_config,
-            )
-            if prefix == 'train':
-                for idx, A_batch_raw in raw_latents.items():
-                    self.epoch_anchors[idx].append(A_batch_raw.detach().cpu())
-                    self.epoch_anchor_ids[idx].append(
-                        labels_per_agent[idx].detach().cpu()
-                    )
+                self.seen_classes[idx].update(y_task.detach().cpu().tolist())
 
-        if prefix in {'train', 'test', 'test_monitor'} and batch_latents:
-            self._record_anchor_bundle_communication(
-                batch_latents,
-                batch_anchor_keys,
+            latent_task = agent.encode(x_task)
+            y_hat = agent.decoder(latent_task)
+
+            outputs[idx_str] = (y_hat.detach(), y_task)
+            agent_losses[idx] = agent.compute_loss(y_hat, y_task)
+            agent_performances[idx] = agent.task_performance(y_hat, y_task)
+
+        total_task_loss = torch.stack(list(agent_losses.values())).sum()
+
+        is_communication_step = True
+        if prefix == 'train':
+            self._train_local_step_count += 1
+            is_communication_step = (
+                self._train_local_step_count % int(self.hparams.local_steps) == 0
+            )
+
+        if prefix == 'train' and not is_communication_step:
+            sheaf_penalty = torch.tensor(0.0, device=self.device)
+            total_loss = total_task_loss
+
+            self._log_shared_metrics(
                 prefix=prefix,
+                agent_losses=agent_losses,
+                agent_performances=agent_performances,
+                batch_size=self._resolve_batch_size(batch),
+                agent_sample_counts=self._resolve_agent_sample_counts(batch),
+                total_loss=total_loss,
+                extra_metrics={f'{prefix}/sheaf_penalty': sheaf_penalty},
+                prog_bar=False,
+                per_agent_loss_name='task_loss',
             )
+            return outputs, total_loss
 
+        # Pilot batch
+        for idx_str, agent in self.agents.items():
+            idx = int(idx_str)
+            x_pilot, y_pilot, _ = self._extract_pilot_batch(batch, idx)
+            
+            raw_latents = agent.encode(x_pilot)
+            latents_per_agent[idx] = normalize_anchor_matrix(raw_latents, self.anchor_config)
+            labels_per_agent[idx] = y_pilot
+
+        if prefix in {'train', 'test', 'test_monitor'} or (prefix == 'train' and is_communication_step):
+            self._record_communication_round(n_rounds=1, prefix=prefix)
+            
+            for idx, latents in latents_per_agent.items():
+                n_neighbors = len(self.hparams.neighbors.get(idx, self.hparams.neighbors.get(str(idx), set())))
+                if n_neighbors > 0:
+                    payload = communication_anchor_payload(
+                        anchor_matrix=latents,
+                        labels=labels_per_agent[idx],
+                        config=self.anchor_config,
+                    )
+                    self._record_communication(
+                        payload,
+                        n_transmissions=n_neighbors,
+                        prefix=prefix,
+                    )
+
+        # Exact Minimization of V (Stiefel Matrices)
+        if prefix == 'train':
+            self._update_stiefel_matrices(latents_per_agent, labels_per_agent)
+        
         # Sheaf regularization penalty (evaluated on anchor set)
-        sheaf_penalty = 0.0
+        sheaf_penalty = torch.tensor(0.0, device=self.device)
 
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
 
-            if node_i not in batch_latents or node_j not in batch_latents:
+            if node_i not in latents_per_agent or node_j not in latents_per_agent:
                 continue
 
             shared_rows = shared_anchor_rows(
-                A_i=batch_latents[node_i],
-                keys_i=batch_anchor_keys.get(node_i, []),
-                A_j=batch_latents[node_j],
-                keys_j=batch_anchor_keys.get(node_j, []),
+                A_i=latents_per_agent[node_i],
+                A_j=latents_per_agent[node_j],
+                labels=labels_per_agent[node_i],
+                seen_i=self.seen_classes[node_i],
+                seen_j=self.seen_classes[node_j],
+                config=self.anchor_config
             )
             if shared_rows is None:
                 continue
@@ -581,7 +334,6 @@ class SheafFRL(BaseOrchestrator):
             sheaf_penalty += frob_dist
 
         # Total loss: task loss (full batch) + sheaf penalty (anchor set)
-        total_task_loss = torch.stack(list(agent_losses.values())).sum()
         total_loss = (
             total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
         )

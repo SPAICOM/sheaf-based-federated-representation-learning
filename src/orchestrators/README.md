@@ -32,13 +32,12 @@ This module contains orchestrator implementations for federated learning that co
     - Multiple anchor strategies:
       - `prototype`: one class prototype per observed class
       - `uniform`: Monte Carlo baseline using raw latent samples, with the global budget allocated proportionally to observed class mass
-      - `diversity`: diversity-aware supervised anchors using farthest-point sampling within each class
+      - `geometric`: geometric-aware supervised anchors using farthest-point sampling within each class
       - `semantic_pilots`: anchors keyed by shared pilot sample ids from auxiliary `pilot_*` loaders
       - `clustering`: cluster-centroid anchors that maximize latent-space coverage within each class
-      - `dynamic`: disagreement-driven anchors that score candidate keys by current cross-client residuals and mix a small persistent subset with refreshed anchors
     - Parseval normalization option for anchor features
-    - Dynamic-anchor controls: `dynamic_persistent_ratio`, `dynamic_candidate_multiplier`, and `dynamic_refresh_interval`
     - Per-agent latent space dimension handling
+    - Local SGD stays fully local within the epoch; train communication is charged only at epoch end when anchors are shared once for the Stiefel SVD update and the subsequent local sheaf-penalty gradient step
     - Stiefel matrices (orthogonal constraints) updated via closed-form SVD solutions
   - **Mathematical Foundation**:
     - Solves orthogonal Procrustes problem: min ||A_i - A_j * V||_F subject to V^T * V = I
@@ -136,9 +135,6 @@ orchestrator = SheafFRL(
     num_anchors=10,             # Number of anchors per epoch
     parseval_normalization=True, # Whether to normalize anchor features
     l2_normalization=False,
-    dynamic_persistent_ratio=0.25,
-    dynamic_candidate_multiplier=2,
-    dynamic_refresh_interval=10,
 )
 
 # Standard PyTorch Lightning training loop

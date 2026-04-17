@@ -312,14 +312,15 @@ def main(cfg: DictConfig) -> float:
             cfg.agent_classes, resolve=True
         )
 
-    anchor_strategy = str(
+    #anchor_strategy = str(
         cfg.get('orchestrator', {}).get('anchor_strategy', '')
-    )
-    requires_pilot_loaders = anchor_strategy == 'semantic_pilots'
-    dataset_cfg['include_pilot_loaders'] = requires_pilot_loaders
-    if not requires_pilot_loaders:
-        dataset_cfg['pilot_split'] = 0.0
-        dataset_cfg['pilot_num_samples'] = None
+    #)
+    #requires_pilot_loaders = anchor_strategy == 'semantic_pilots'
+    #dataset_cfg['include_pilot_loaders'] = requires_pilot_loaders
+    #if not requires_pilot_loaders:
+    #    dataset_cfg['pilot_split'] = 0.0
+    #    dataset_cfg['pilot_num_samples'] = None
+
 
     # Pass 'agents' config to datamodule only for SemanticDataModule
     # SemanticDataModule loads pre-computed embeddings from HuggingFace

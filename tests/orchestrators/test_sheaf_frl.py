@@ -53,13 +53,32 @@ class TestSheafFRL:
             optimizer=MockOptimizer(),
             lambda_sheaf=0.1,
             latent_dims={0: 64},
-            anchor_strategy='prototype',
-            num_anchors=10,
+            #anchor_strategy='prototype',
+            #num_anchors=10,
             parseval_normalization=False,
             l2_normalization=False,
         )
         assert orchestrator is not None
         assert orchestrator.hparams.lambda_sheaf == 0.1
+
+    def test_dynamic_anchor_strategy_is_not_supported(self):
+        """Dynamic anchors should fail fast at construction time."""
+        agent = LatentClassifier(
+            in_features=128, num_classes=10, latent_dim=64
+        )
+
+        with pytest.raises(ValueError, match='Unknown anchor_strategy'):
+            SheafFRL(
+                agents={0: agent},
+                neighbors={0: set()},
+                optimizer=MockOptimizer(),
+                lambda_sheaf=0.1,
+                latent_dims={0: 64},
+                anchor_strategy='dynamic',
+                num_anchors=10,
+                parseval_normalization=False,
+                l2_normalization=False,
+            )
 
     def test_stiefel_matrices_created(self):
         """Test Stiefel matrices are created for edges."""
@@ -106,8 +125,11 @@ class TestSheafFRL:
         orchestrator.on_train_epoch_start()
         orchestrator.epoch_anchors[0].append(torch.randn(16, 64))
         orchestrator.epoch_anchors[1].append(torch.randn(16, 64))
-        orchestrator.epoch_anchor_ids[0].append(torch.randint(0, 10, (16,)))
-        orchestrator.epoch_anchor_ids[1].append(torch.randint(0, 10, (16,)))
+        shared_labels = torch.tensor(
+            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+        )
+        orchestrator.epoch_anchor_ids[0].append(shared_labels.clone())
+        orchestrator.epoch_anchor_ids[1].append(shared_labels.clone())
 
         orig = {k: v.clone() for k, v in orchestrator.stiefel_matrices.items()}
         orchestrator.on_train_epoch_end()
@@ -116,8 +138,55 @@ class TestSheafFRL:
         for k in orig:
             assert not torch.equal(orchestrator.stiefel_matrices[k], orig[k])
 
+    def test_training_step_is_local_task_loss_only(self):
+        """Train batches should optimize task loss only, without communication."""
+        orchestrator = SheafFRL(
+            agents={
+                0: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+                1: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+            },
+            neighbors={0: {1}, 1: {0}},
+            optimizer={'_target_': 'torch.optim.SGD', 'lr': 0.1},
+            lambda_sheaf=0.1,
+            latent_dims={0: 4, 1: 4},
+            anchor_strategy='prototype',
+            num_anchors=4,
+            parseval_normalization=False,
+            l2_normalization=False,
+        )
+
+        batch = {
+            0: [torch.randn(8, 8), torch.tensor([0, 0, 1, 1, 2, 2, 0, 1])],
+            1: [torch.randn(8, 8), torch.tensor([0, 0, 1, 1, 2, 2, 0, 1])],
+        }
+
+        expected_loss = 0.0
+        for idx, agent in orchestrator.agents.items():
+            x, y = batch[int(idx)]
+            y_hat = agent(x)
+            expected_loss += agent.compute_loss(y_hat, y)
+
+        orchestrator.on_train_start()
+        orchestrator.on_train_epoch_start()
+        actual_loss = orchestrator.training_step(batch, 0)
+        train_metrics = orchestrator._communication_metrics('train')
+
+        assert torch.allclose(actual_loss, expected_loss)
+        assert train_metrics['train/communication_rounds'] == 0.0
+        assert train_metrics['train/communication_kilobytes'] == 0.0
+
     def test_shared_eval_records_split_specific_anchor_communication(self):
-        """Train and test anchor exchanges should be accounted separately."""
+        """Only evaluation-time anchor exchanges should be accounted per batch."""
         agent1 = LatentClassifier(
             in_features=128, num_classes=10, latent_dim=64
         )
@@ -150,13 +219,13 @@ class TestSheafFRL:
         orchestrator._shared_eval(batch, 0, 'test')
         test_metrics = orchestrator._communication_metrics('test')
 
-        assert train_metrics['train/communication_rounds'] == 1.0
-        assert train_metrics['train/communication_kilobytes'] > 0.0
+        assert train_metrics['train/communication_rounds'] == 0.0
+        assert train_metrics['train/communication_kilobytes'] == 0.0
         assert test_metrics['test/communication_rounds'] == 1.0
         assert test_metrics['test/communication_kilobytes'] > 0.0
 
     def test_trainer_logs_nonzero_train_communication_metrics(self):
-        """Batch anchor exchanges should emit positive train communication."""
+        """Epoch-end anchor exchanges should emit positive train communication."""
         orchestrator = SheafFRL(
             agents={
                 0: LatentClassifier(
@@ -201,6 +270,70 @@ class TestSheafFRL:
         assert (
             float(trainer.callback_metrics['train/communication_rounds'])
             > 0.0
+        )
+
+    def test_train_communication_is_deferred_to_epoch_end(self):
+        """Train communication should be accounted only at epoch end."""
+        orchestrator = SheafFRL(
+            agents={
+                0: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+                1: LatentClassifier(
+                    in_features=8,
+                    num_classes=3,
+                    latent_dim=4,
+                    encoder_hidden_dims=[6],
+                ),
+            },
+            neighbors={0: {1}, 1: {0}},
+            optimizer={'_target_': 'torch.optim.SGD', 'lr': 0.1},
+            lambda_sheaf=0.1,
+            latent_dims={0: 4, 1: 4},
+            anchor_strategy='prototype',
+            num_anchors=4,
+            parseval_normalization=False,
+            l2_normalization=False,
+        )
+        orchestrator.log = lambda *args, **kwargs: None
+
+        batch = {
+            0: [torch.randn(8, 8), torch.tensor([0, 0, 1, 1, 2, 2, 0, 1])],
+            1: [torch.randn(8, 8), torch.tensor([0, 0, 1, 1, 2, 2, 0, 1])],
+        }
+
+        orchestrator.on_train_start()
+        orchestrator.on_train_epoch_start()
+        encoder_before = {
+            name: param.detach().clone()
+            for name, param in orchestrator.agents['0'].encoder.named_parameters()
+        }
+        decoder_before = {
+            name: param.detach().clone()
+            for name, param in orchestrator.agents['0'].decoder.named_parameters()
+        }
+
+        orchestrator.training_step(batch, 0)
+        train_metrics = orchestrator._communication_metrics('train')
+
+        assert train_metrics['train/communication_rounds'] == 0.0
+        assert train_metrics['train/communication_kilobytes'] == 0.0
+
+        orchestrator.on_train_epoch_end()
+        epoch_metrics = orchestrator._communication_metrics('train')
+
+        assert epoch_metrics['train/communication_rounds'] == 1.0
+        assert epoch_metrics['train/communication_kilobytes'] > 0.0
+        assert any(
+            not torch.allclose(param.detach(), encoder_before[name])
+            for name, param in orchestrator.agents['0'].encoder.named_parameters()
+        )
+        assert all(
+            torch.allclose(param.detach(), decoder_before[name])
+            for name, param in orchestrator.agents['0'].decoder.named_parameters()
         )
 
     @pytest.mark.slow

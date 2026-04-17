@@ -1,11 +1,11 @@
 """
 Sheaf-FMTL Orchestrator.
 
-Implements Algorithm 1 from the Sheaf-FMTL paper using PyTorch Lightning hooks.
-This orchestrator utilizes trainable projection matrices P_ij to map
-agent local parameters into a shared latent space where a Laplacian
-penalty enforces alignment among neighboring agents in a communication
-graph.
+Implements the Sheaf-FMTL training logic with epoch-end synchronization in
+PyTorch Lightning. This orchestrator uses trainable projection matrices
+P_ij to map agent-local parameters into a shared latent space where a
+Sheaf Laplacian penalty enforces alignment among neighboring agents in the
+communication graph.
 
 Implementation Details:
 -----------------------
@@ -13,18 +13,22 @@ Implementation Details:
    - d_i = the total number of trainable parameters for agent i
    - d_ij = max(1, int(gamma * min(d_i, d_j))) shared latent space dim
 
-2. Local Parameter Regularization (`on_before_optimizer_step` hook):
-   - Modifies the local gradients before the optimizer steps with the
-     Sheaf Laplacian penalty
-   - Communication is accounted only for the exchanged projected vectors
-     `P_ij * theta_i`, not for raw parameters or full matrices
+2. Epoch-End Local Parameter Regularization (`on_train_epoch_end` hook):
+    - At the end of each training epoch, the orchestrator collects the
+      current flattened parameter vector theta_i for every agent
+    - It computes the Sheaf Laplacian penalty
+      lambda * sum_j P_ij^T * (P_ij * theta_i - P_ji * theta_j)
+    - and applies one manual parameter update
+      theta_i <- theta_i - lr * penalty_i
 
-3. Projection Matrix Update (`on_train_batch_end` hook):
-   - P_ij matrices are updated manually as
-     P_ij = P_ij - eta * lambda_reg
-          * (P_ij * theta_i - P_ji * theta_j) * theta_i^T
-   - A full AGD iteration therefore incurs two projected-vector exchange
-     rounds: one before the optimizer step and one after it
+3. Epoch-End Projection Matrix Update:
+    - After the epoch-end parameter update, the orchestrator recomputes the
+      projected edge vectors using the updated theta_i values
+    - Each restriction map is then updated manually as
+     P_ij <- P_ij - eta * lambda_reg * (P_ij * theta_i - P_ji * theta_j) * theta_i^T
+    - One epoch-end synchronization therefore incurs two projected-vector
+      exchange rounds: one before the agent update and one before the
+      restriction-map update
 """
 
 from typing import Any
@@ -95,7 +99,7 @@ class SheafFMTL(BaseOrchestrator):
 
                 # Rectangular projection matrix P_ij (d_ij x d_i)
                 P_ij = nn.Parameter(torch.empty(d_ij, d_i), requires_grad=True)
-                nn.init.uniform_(P_ij, a=-0.01, b=0.01)
+                nn.init.normal_(P_ij, mean=0.0, std=0.01)
 
                 self.projection_matrices[f'{i}_{j}'] = P_ij
 

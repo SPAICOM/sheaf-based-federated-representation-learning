@@ -327,7 +327,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         batch_sizes = []
         for key, values in batch.items():
-            if isinstance(key, str) and key.startswith('pilot_'):
+            if isinstance(key, str) and 'pilot' in key:
                 continue
             if not isinstance(values, (list, tuple)) or not values:
                 continue
