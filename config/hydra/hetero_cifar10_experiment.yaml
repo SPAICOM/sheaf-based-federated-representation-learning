@@ -12,7 +12,7 @@ graph:
   neighbors_mode: "erdos_renyi"
   seed: 42
   #p: 0.3
-  p: 0.15
+  p: 0.3
   m: 3
   neighbors: {}
 
@@ -20,7 +20,7 @@ logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: starved_clients
   group: ${study_name}
-  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.orchestrator}_p0.3_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 

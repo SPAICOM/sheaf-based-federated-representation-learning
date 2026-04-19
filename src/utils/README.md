@@ -5,21 +5,14 @@ This module contains various utility functions and classes used throughout the f
 ## Components
 
 ### Anchor Management
-- [`anchors.py`](anchors.py): Functions for building anchor bundles, managing anchor strategies, and handling semantic pilot anchors for federated learning alignment.
-  - **Purpose**: Implements mathematically distinct anchor selection strategies for computing alignment in sheaf-based federated learning
+- [`anchors.py`](anchors.py): Utilities for normalizing, matching, and accounting for communicated anchor tensors in sheaf-based federated learning.
+  - **Purpose**: Implements the current anchor-processing path used by `SheafFRL`
   - **Key Functions**:
-    - `build_anchor_bundles`: Creates anchor bundles for class-keyed strategies
-    - `build_semantic_pilot_bundles`: Creates anchor bundles for semantic pilot strategies
-    - `shared_anchor_rows`: Finds shared anchors between agents for alignment computation
-    - `supported_anchor_strategy`: Validates and returns normalized anchor strategy names
-    - `AnchorConfig`: Configuration class for anchor selection parameters
-  - **Strategies**:
-    - `prototype`: one prototype per observed class
-    - `uniform`: Monte Carlo baseline over raw latent samples, with budget allocated proportionally to class frequency
-    - `geometric`: geometric-aware farthest-point anchors within each class
-    - `clustering`: centroid anchors from latent-space clustering within each class
-    - `semantic_pilots`: anchors keyed by shared pilot sample ids
-  - **Usage**: Used by orchestrators to select anchors for computing cross-covariance matrices and alignment
+    - `AnchorConfig`: Controls normalization, prototype compression, and unseen-class filtering
+    - `normalize_anchor_matrix`: Applies Parseval or row-wise L2 normalization
+    - `shared_anchor_rows`: Aligns two anchor matrices using both agents' class labels, optionally compressing each side to per-class prototypes first
+    - `communication_anchor_payload`: Computes the actual transmitted anchor payload after any prototype compression
+  - **Usage**: Used by `SheafFRL` to construct communication payloads, compute the per-step sheaf penalty, and align cached anchors for the epoch-end Stiefel update
 
 ### Communication Tracking
 - [`communication.py`](communication.py): Utilities for calculating and tracking communication costs in federated learning systems.
@@ -31,12 +24,13 @@ This module contains various utility functions and classes used throughout the f
   - **Usage**: Integrated into BaseOrchestrator to track cumulative communication rounds and exchanged kilobytes
 
 ### Data Partitioning
-- [`data_partitioner.py`](data_partitioner.py): Functions for partitioning data across agents in federated learning scenarios, including label-based and Dirichlet partitioning.
+- [`data_partitioner.py`](data_partitioner.py): Functions for partitioning data across agents in federated learning scenarios, including class-partition, standard non-IID, and safety-margin non-IID splits.
   - **Purpose**: Creates non-IID data distributions for realistic federated learning evaluation
   - **Key Functions**:
-    - `partition_by_labels`: Splits data by label classes for class-based partitioning
-    - `dirichlet_partition`: Creates non-IID splits using Dirichlet distribution
-    - `balance_partition`: Attempts to balance partition sizes
+    - `build_shared_class_partition`: Assigns a controlled number of globally shared classes across agents
+    - `partition_by_agent_classes`: Builds disjoint per-agent splits from an explicit agent-to-class mapping
+    - `partition_non_iid`: Standard non-IID splitter with reused or sampled class assignments and skew controlled by `alpha`
+    - `partition_non_iid_with_margin`: Exact-`K` class assignment with full class coverage and a per-class safety margin reserved for every assigned agent before the skewed allocation
   - **Usage**: Used in experiment setups to create heterogeneous data distributions across agents
 
 ### Graph Generation
@@ -88,51 +82,52 @@ cost = calculate_communication_cost(tensor, n_transmissions=3)
 # Returns: {'bits': 4915200.0, 'bytes': 614400.0, 'kilobytes': 600.0}
 # (2,048,000 bytes * 3 transmissions = 6,144,000 bytes = 49,152,000 bits)
 
-# Example: Creating anchor bundles for sheaf alignment
-from src.utils.anchors import build_anchor_bundles, AnchorConfig
+# Example: Matching anchors for sheaf alignment
+from src.utils.anchors import AnchorConfig, shared_anchor_rows
 import torch
 
 # Create anchor configuration
 anchor_config = AnchorConfig(
-    strategy='prototype',
-    num_anchors=5,
     parseval_normalization=True,
     l2_normalization=False,
+    filter_unseen_classes=True,
+    use_prototypes=True,
 )
 
-# Simulate agent features and labels
-agent_features = {
-    0: torch.randn(100, 128),  # 100 samples, 128 features
-    1: torch.randn(100, 128)
-}
-agent_labels = {
-    0: torch.randint(0, 10, (100,)),
-    1: torch.randint(0, 10, (100,))
-}
+# Simulate agent anchor matrices and labels
+A_i = torch.randn(32, 128)
+A_j = torch.randn(24, 128)
+labels_i = torch.randint(0, 10, (32,))
+labels_j = torch.randint(0, 10, (24,))
 
-# Build anchor bundles
-A_dict, anchor_keys = build_anchor_bundles(
-    agent_features,
-    agent_labels,
-    anchor_config
+# Match anchors shared across both agents
+matched = shared_anchor_rows(
+    A_i=A_i,
+    A_j=A_j,
+    labels_i=labels_i,
+    labels_j=labels_j,
+    seen_i=set(labels_i.tolist()),
+    seen_j=set(labels_j.tolist()),
+    config=anchor_config,
 )
-# Returns selected anchor matrices plus semantic keys for each row
+# Returns aligned anchor tensors or None if the two agents share no classes
 
-# Example: Partitioning data for non-IID federated learning
-from src.utils.data_partitioner import dirichlet_partition
-import numpy as np
+# Example: Partitioning data for non-IID federated learning with a safety margin
+from src.utils.data_partitioner import partition_non_iid_with_margin
 
 # Simulate dataset labels
-labels = np.array([0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3])
+labels = [idx % 10 for idx in range(500)]
 
-# Create non-IID distribution with alpha=0.5 (lower = more heterogeneous)
-partition = dirichlet_partition(
+# Create an exact-K non-IID split with per-class safety margins
+partition = partition_non_iid_with_margin(
     labels=labels,
-    n_parties=3,
-    alpha=0.5
+    n_agents=5,
+    classes_per_agent=3,
+    alpha=-1.0,
+    safety_margin=10,
 )
-# Returns: [[indices for party 0], [indices for party 1], [indices for party 2]]
-# Each party gets a different distribution of classes
+# Returns: {0: [...], 1: [...], ...}
+# Each agent gets exactly 3 classes and at least 10 reserved samples per assigned class
 
 # Example: Saving and loading model checkpoints
 from src.utils.io import save_checkpoint, load_checkpoint

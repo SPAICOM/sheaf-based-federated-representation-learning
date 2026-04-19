@@ -599,11 +599,13 @@ class ClassificationDataModule(l.LightningDataModule):
     def _split_data_non_iid_with_margin(
         self, train, val, test, label_key: str
     ) -> None:
-        """Split train with a safety margin and reuse classes on eval splits.
+        """Split every partition with the same safety-margin partitioner.
 
-        Uses ``partition_non_iid_with_margin`` so each
-        assigned class gets a guaranteed per-agent reserve before the skewed
-        allocation. 
+        Uses ``partition_non_iid_with_margin`` on train/val/test. The train
+        split samples the exact-K ``agent_classes`` assignment once, and the
+        validation/test splits reuse that same class map so the non-IID
+        partitioning logic is consistent across all partitions before the
+        optional train-only starvation step.
         """
         train_partition, sampled_agent_classes = (
             partition_non_iid_with_margin(
@@ -619,7 +621,7 @@ class ClassificationDataModule(l.LightningDataModule):
 
         split_partitions = {
             'train_datasets': train_partition,
-            'val_datasets': partition_non_iid(
+            'val_datasets': partition_non_iid_with_margin(
                 labels=val[label_key],
                 n_agents=self.n_agents,
                 classes_per_agent=self.classes_per_agent,
@@ -627,7 +629,7 @@ class ClassificationDataModule(l.LightningDataModule):
                 alpha=self.alpha,
                 agent_classes=self.agent_classes,
             ),
-            'test_datasets': partition_non_iid(
+            'test_datasets': partition_non_iid_with_margin(
                 labels=test[label_key],
                 n_agents=self.n_agents,
                 classes_per_agent=self.classes_per_agent,
