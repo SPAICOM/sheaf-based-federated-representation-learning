@@ -118,46 +118,60 @@ def _global_class_counts(labels_per_agent: dict[int, torch.Tensor]) -> dict[int,
 def shared_anchor_rows(
     A_i: torch.Tensor,
     A_j: torch.Tensor,
-    labels: torch.Tensor,
+    labels_i: torch.Tensor,
+    labels_j: torch.Tensor,
     seen_i: set[int],
     seen_j: set[int],
     config: AnchorConfig,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Extract paired anchor rows, either as raw samples or class prototypes."""
-    
-    # Common classes filtering
+    """Extract paired anchor rows, matching classes across both agents."""
+    present_i = set(labels_i.tolist())
+    present_j = set(labels_j.tolist())
+    target_classes = present_i.intersection(present_j)
     if config.filter_unseen_classes:
-        target_classes = seen_i.intersection(seen_j)
-    else:
-        # If not filtering, we can use every class present in the pilot batch
-        target_classes = set(labels.tolist())
+        target_classes = target_classes.intersection(seen_i, seen_j)
 
     if not target_classes:
         return None
 
-    # Class prototypes
     if config.use_prototypes:
         proto_i, proto_j = [], []
         for c in sorted(target_classes):
-            mask = labels == c
-            if mask.any():
-                proto_i.append(A_i[mask].mean(dim=0))
-                proto_j.append(A_j[mask].mean(dim=0))
-                
+            mask_i = labels_i == c
+            mask_j = labels_j == c
+            if mask_i.any() and mask_j.any():
+                proto_i.append(A_i[mask_i].mean(dim=0))
+                proto_j.append(A_j[mask_j].mean(dim=0))
+
         if not proto_i:
             return None
-            
+
         return torch.stack(proto_i), torch.stack(proto_j)
 
-    # Full pilots alignment
-    else:
-        target_tensor = torch.tensor(list(target_classes), device=labels.device)
-        mask = torch.isin(labels, target_tensor)
-        
-        if not mask.any():
-            return None
-            
-        return A_i[mask], A_j[mask]
+    target_tensor_i = torch.tensor(
+        sorted(target_classes),
+        device=labels_i.device,
+        dtype=labels_i.dtype,
+    )
+    target_tensor_j = torch.tensor(
+        sorted(target_classes),
+        device=labels_j.device,
+        dtype=labels_j.dtype,
+    )
+    mask_i = torch.isin(labels_i, target_tensor_i)
+    mask_j = torch.isin(labels_j, target_tensor_j)
+    if not mask_i.any() or not mask_j.any():
+        return None
+
+    selected_labels_i = labels_i[mask_i]
+    selected_labels_j = labels_j[mask_j]
+    if (
+        selected_labels_i.shape != selected_labels_j.shape
+        or not torch.equal(selected_labels_i, selected_labels_j)
+    ):
+        return None
+
+    return A_i[mask_i], A_j[mask_j]
 
 
 def communication_anchor_payload(

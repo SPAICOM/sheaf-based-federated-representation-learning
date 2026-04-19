@@ -207,6 +207,103 @@ def _sample_class_assignments(
     }
 
 
+def _sample_exact_k_class_assignments(
+    unique_classes: list[int],
+    n_agents: int,
+    classes_per_agent: int,
+    generator: torch.Generator,
+) -> dict[int, list[int]]:
+    """Assign exactly ``classes_per_agent`` classes to every agent.
+
+    The assignment is deterministic under ``generator`` and guarantees that
+    every dataset class is assigned to at least one agent.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if classes_per_agent < 1:
+        raise ValueError('classes_per_agent must be at least 1')
+
+    resolved_classes = sorted(set(unique_classes))
+    num_classes = len(resolved_classes)
+    if num_classes == 0:
+        return {agent_id: [] for agent_id in range(n_agents)}
+
+    if classes_per_agent > num_classes:
+        raise ValueError(
+            f'classes_per_agent={classes_per_agent} must be in '
+            f'[1, {num_classes}] (number of unique classes in the dataset)'
+        )
+    if n_agents * classes_per_agent < num_classes:
+        raise ValueError(
+            'Cannot assign every class at least once while giving each agent '
+            f'exactly {classes_per_agent} classes: need at least '
+            f'{num_classes} total class slots, got '
+            f'{n_agents * classes_per_agent}.'
+        )
+
+    shuffled_classes = [
+        resolved_classes[idx]
+        for idx in torch.randperm(
+            num_classes, generator=generator
+        ).tolist()
+    ]
+    shuffled_agents = torch.randperm(n_agents, generator=generator).tolist()
+
+    assignments = {agent_id: set() for agent_id in range(n_agents)}
+
+    # Coverage pass: place every class at least once using a deterministic
+    # round-robin over a shuffled agent order.
+    for offset, class_label in enumerate(shuffled_classes):
+        agent_id = shuffled_agents[offset % n_agents]
+        assignments[agent_id].add(class_label)
+
+    # Top-up pass: give every agent exactly K classes without duplicates.
+    for rank, agent_id in enumerate(shuffled_agents):
+        cursor = rank % num_classes
+        while len(assignments[agent_id]) < classes_per_agent:
+            class_label = shuffled_classes[cursor % num_classes]
+            assignments[agent_id].add(class_label)
+            cursor += 1
+
+    return {
+        agent_id: sorted(class_labels)
+        for agent_id, class_labels in assignments.items()
+    }
+
+
+def _generate_skewed_proportions(
+    n_parts: int,
+    alpha: float,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Route to Dirichlet or extreme Log-Normal class proportions."""
+    if n_parts < 1:
+        raise ValueError('n_parts must be at least 1')
+    if alpha == 0:
+        raise ValueError('alpha must be non-zero')
+    if n_parts == 1:
+        return torch.ones(1, dtype=torch.float32)
+
+    if alpha > 0:
+        concentration = torch.full(
+            (n_parts,),
+            float(alpha),
+            dtype=torch.float32,
+        )
+        weights = torch._standard_gamma(concentration, generator=generator)
+    else:
+        # Match the aggressive skew regime with a high-variance Log-Normal.
+        weights = torch.exp(
+            torch.randn(n_parts, generator=generator, dtype=torch.float32)
+            * 2.0
+        )
+
+    total_weight = weights.sum()
+    if total_weight <= 0:
+        return torch.full((n_parts,), 1 / n_parts, dtype=torch.float32)
+    return weights / total_weight
+
+
 def partition_non_iid(
     labels: list[int],
     n_agents: int,
@@ -430,101 +527,141 @@ def partition_non_iid(
     return result
 
 
-def partition_fmtl_heuristic(
+def partition_non_iid_with_margin(
     labels: list[int],
     n_agents: int,
     classes_per_agent: int,
     seed: int = 42,
+    alpha: float = 0.5,
     agent_classes: dict[int, list[int]] | None = None,
     return_agent_classes: bool = False,
+    safety_margin: int = 10,
 ) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Partition with exact-K class assignment and per-class safety_margin samples.
+
+    For every class assigned to an agent, ``safety_margin`` examples are
+    reserved first to guarantee survival under later 80% starvation. The
+    remaining class pool is then distributed with a skew controlled by
+    ``alpha``:
+    positive values use Dirichlet draws and negative values use an extreme
+    Log-Normal router.
     """
-    Exact replication of the Sheaf-FMTL authors' heuristic data partitioning.
-    
-    This replicates the log-normal distribution, the hardcoded randint(300, 600) 
-    sample inflation, and the array overflow skipping behavior present in the 
-    original HeterogeneousCIFAR10 implementation.
-    """
-    if n_agents < 1 or classes_per_agent < 1:
-        raise ValueError("n_agents and classes_per_agent must be >= 1")
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if classes_per_agent < 1:
+        raise ValueError('classes_per_agent must be at least 1')
+    if safety_margin < 0:
+        raise ValueError('safety_margin must be non-negative')
+    if alpha == 0:
+        raise ValueError('alpha must be non-zero')
 
-    rng_np = np.random.RandomState(seed)
-    rng_py = random.Random(seed)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    if labels_tensor.numel() == 0:
+        empty_partition = {agent_id: [] for agent_id in range(n_agents)}
+        if return_agent_classes:
+            resolved_classes = agent_classes or {
+                agent_id: [] for agent_id in range(n_agents)
+            }
+            return empty_partition, resolved_classes
+        return empty_partition
 
-    labels_array = np.array(labels)
-    unique_classes = sorted(np.unique(labels_array).tolist())
-    num_classes = len(unique_classes)
-    class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+    unique_classes = sorted(torch.unique(labels_tensor).tolist())
+    unique_class_set = set(unique_classes)
+    generator = torch.Generator().manual_seed(seed)
 
-    # Separate indices by class and shuffle them to simulate random drawing
-    indices_by_class = {c: np.where(labels_array == c)[0].tolist() for c in unique_classes}
-    for c in unique_classes:
-        rng_py.shuffle(indices_by_class[c])
-
-    # Replicate exact class assignment 
     if agent_classes is None:
-        resolved_agent_classes = {}
-        for client in range(n_agents):
-            resolved_agent_classes[client] = rng_np.choice(
-                unique_classes, classes_per_agent, replace=False
-            ).tolist()
+        resolved_agent_classes = _sample_exact_k_class_assignments(
+            unique_classes=unique_classes,
+            n_agents=n_agents,
+            classes_per_agent=classes_per_agent,
+            generator=generator,
+        )
     else:
-        resolved_agent_classes = agent_classes
+        resolved_agent_classes = {}
+        for agent_id in range(n_agents):
+            assigned_classes = sorted(set(agent_classes.get(agent_id, [])))
+            if len(assigned_classes) != classes_per_agent:
+                raise ValueError(
+                    f'agent {agent_id} must have exactly '
+                    f'{classes_per_agent} classes, got '
+                    f'{len(assigned_classes)}'
+                )
+            unknown_classes = set(assigned_classes) - unique_class_set
+            if unknown_classes:
+                raise ValueError(
+                    f'agent {agent_id} was assigned classes not present in '
+                    f'the dataset split: {sorted(unknown_classes)}'
+                )
+            resolved_agent_classes[agent_id] = assigned_classes
 
-    agent_indices = {i: [] for i in range(n_agents)}
-    idx_tracker = {c: 0 for c in unique_classes}
+        covered_classes = set().union(*resolved_agent_classes.values())
+        uncovered_classes = sorted(unique_class_set - covered_classes)
+        if uncovered_classes:
+            raise ValueError(
+                'Every class in the split must be assigned to at least one '
+                f'agent. Uncovered classes: {uncovered_classes}'
+            )
 
-    # Initial distribution: Exactly 10 samples per assigned class per client
-    for client in range(n_agents):
-        for c in resolved_agent_classes[client]:
-            num_initial = 10
-            start = idx_tracker[c]
-            end = start + num_initial
-            
-            # Safe allocation just in case
-            available = indices_by_class[c][start:end]
-            agent_indices[client].extend(available)
-            idx_tracker[c] += len(available)
+    class_to_agents: dict[int, list[int]] = defaultdict(list)
+    for agent_id in range(n_agents):
+        for class_label in resolved_agent_classes[agent_id]:
+            class_to_agents[int(class_label)].append(agent_id)
 
-    # The Authors' Log-Normal 
-    # Shape: (num_classes, n_agents, classes_per_agent)
-    props = rng_np.lognormal(0, 2.0, (num_classes, n_agents, classes_per_agent))
-    
-    # Scale by remaining available samples 
-    class_totals = np.array([[[len(indices_by_class[c]) - n_agents]] for c in unique_classes])
-    props = class_totals * props / np.sum(props, axis=(1, 2), keepdims=True)
+    agent_indices: dict[int, list[int]] = {
+        agent_id: [] for agent_id in range(n_agents)
+    }
 
-    # Distribute using the Authors' Heuristics
-    # To prevent ZeroDivisionError if n_agents < 10
-    div_factor = max(1, int(n_agents / 10))
+    # Index the global data once, class by class, using shuffled global row ids.
+    for class_label in unique_classes:
+        class_indices = torch.where(labels_tensor == int(class_label))[0]
+        shuffled_indices = class_indices[
+            torch.randperm(len(class_indices), generator=generator)
+        ].tolist()
+        assigned_agents = class_to_agents[int(class_label)]
 
-    for client in range(n_agents):
-        for j, c in enumerate(resolved_agent_classes[client]):
-            c_idx = class_to_idx[c]
-            
-            # Replicate their weird indexing: client // int(self.num_clients/10)
-            prop_idx = min(client // div_factor, n_agents - 1)
-            
-            num_samples = int(props[c_idx, prop_idx, j])
-            
-            # Hardcoded inflation
-            num_samples += rng_py.randint(300, 600)
-            
-            if n_agents <= 20:
-                num_samples *= 2
+        required_safety_margin = safety_margin * len(assigned_agents)
+        if len(shuffled_indices) < required_safety_margin:
+            raise ValueError(
+                f'class {class_label} has {len(shuffled_indices)} samples, '
+                f'but needs at least {required_safety_margin} to allocate '
+                f'{safety_margin} safety margin samples to each of the '
+                f'{len(assigned_agents)} assigned agents.'
+            )
 
-            start = idx_tracker[c]
-            end = start + num_samples
+        cursor = 0
+        for agent_id in assigned_agents:
+            safety_indices = shuffled_indices[
+                cursor : cursor + safety_margin
+            ]
+            agent_indices[agent_id].extend(safety_indices)
+            cursor += safety_margin
 
-            # Replicate their overflow bug: If the requested samples exceed the 
-            # dataset boundaries, they just skipped it
-            if end < len(indices_by_class[c]):
-                agent_indices[client].extend(indices_by_class[c][start:end])
-                idx_tracker[c] += num_samples
+        remaining_indices = shuffled_indices[cursor:]
+        if not remaining_indices:
+            continue
 
-    # Sort indices for determinism
-    for client in range(n_agents):
-        agent_indices[client].sort()
+        proportions = _generate_skewed_proportions(
+            n_parts=len(assigned_agents),
+            alpha=alpha,
+            generator=generator,
+        )
+        draws = torch.multinomial(
+            proportions,
+            num_samples=len(remaining_indices),
+            replacement=True,
+            generator=generator,
+        )
+        counts = torch.bincount(draws, minlength=len(assigned_agents))
+
+        offset = 0
+        for position, agent_id in enumerate(assigned_agents):
+            count = int(counts[position].item())
+            skewed_indices = remaining_indices[offset : offset + count]
+            agent_indices[agent_id].extend(skewed_indices)
+            offset += count
+
+    for agent_id in range(n_agents):
+        agent_indices[agent_id].sort()
 
     if return_agent_classes:
         return agent_indices, resolved_agent_classes

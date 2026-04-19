@@ -20,6 +20,7 @@ from .data_partitioner import (
     build_shared_class_partition,
     partition_by_agent_classes,
     partition_non_iid,
+    partition_non_iid_with_margin,
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
@@ -33,6 +34,7 @@ __all__ = [
     'generate_neighbors',
     'partition_by_agent_classes',
     'partition_non_iid',
+    'partition_non_iid_with_margin',
     'remove_non_empty_dir',
     'shared_anchor_rows',
     #'supported_anchor_strategy',
