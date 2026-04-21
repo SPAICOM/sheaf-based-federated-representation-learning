@@ -44,8 +44,6 @@ from src.datamodules.utils import (
 )
 from src.utils.data_partitioner import partition_non_iid
 
-DEEPSENSE_ZIP_NAME = 'scenario30.zip'
-
 
 class DeepSenseDataset(Dataset):
     """Base dataset for DeepSense Scenario 30.
@@ -171,14 +169,11 @@ class DeepSenseDataset(Dataset):
             return torch.randn(2, 32, 32) * 1e-5
 
     def _load_label(self, path: str) -> torch.Tensor:
-        try:
-            label_path = self._resolve_path(path)
-            with open(label_path) as f:
-                val = float(f.read().strip())
-            label = 0 if val == 0.0 else 1
-            return torch.tensor(label, dtype=torch.long)
-        except Exception:
-            return torch.tensor(0, dtype=torch.long)
+        label_path = self._resolve_path(path)
+        with open(label_path) as f:
+            val = float(f.read().strip())
+        label = 0 if val == 0.0 else 1
+        return torch.tensor(label, dtype=torch.long)
 
 
 class DeepSenseModalityDataset(Dataset):
@@ -363,7 +358,8 @@ class DeepSenseDataModule(l.LightningDataModule):
         Downloads scenario30.zip directly from Google Drive by file ID.
         """
         csv_path = self.data_path / f'scenario{self.scenario}.csv'
-        if csv_path.exists():
+        data_dir = self.data_path / 'unit1'
+        if csv_path.exists() and data_dir.exists():
             return
 
         if not self.gdrive_file_id:
@@ -376,7 +372,7 @@ class DeepSenseDataModule(l.LightningDataModule):
         zip_path = self.data_path / f'scenario{self.scenario}.zip'
 
         if not zip_path.exists():
-            print(f'[prepare_data] Downloading {DEEPSENSE_ZIP_NAME} …')
+            print(f'[prepare_data] Downloading {self.scenario}.zip …')
             gdown.download(
                 id=self.gdrive_file_id, output=str(zip_path), quiet=False
             )
@@ -656,7 +652,7 @@ class DeepSenseDataModule(l.LightningDataModule):
                     for i in range(len(self._base_dataset))
                 ]
             )
-            self.num_classes['label'] = len(np.unique(all_labels))
+            self.num_classes['label'] = 2  # DeepSense is binary: LOS (0) / NLOS (1)
 
             if self.split_strategy == 'full':
                 self._split_data_full(split_indices)
@@ -780,6 +776,32 @@ class DeepSenseDataModule(l.LightningDataModule):
             loaders[agent_id] = self._make_loader(
                 self.val_datasets[agent_id], shuffle=False
             )
+
+        if self.pilot_datasets:
+            target_batches = max(
+                (len(datasets) + self.batch_size - 1) // self.batch_size
+                for datasets in self.pilot_datasets.values()
+            )
+            if self.comm_data == 'private_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
+                        self.pilot_datasets[agent_id], target_batches
+                    )
+            elif self.comm_data == 'shared_global_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'global_pilot_{agent_id}'] = self._make_pilot_loader(
+                        self.pilot_datasets[agent_id], target_batches
+                    )
+            elif self.comm_data == 'pairwise_pilots':
+                for i in range(self.n_agents):
+                    for j in range(i + 1, self.n_agents):
+                        pairwise_ds = PairwiseDataset(
+                            self.pilot_datasets[i], self.pilot_datasets[j]
+                        )
+                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
+                            pairwise_ds, target_batches
+                        )
+
         return CombinedLoader(loaders, mode=self.mode)
 
     def test_dataloader(self) -> CombinedLoader:
@@ -788,4 +810,30 @@ class DeepSenseDataModule(l.LightningDataModule):
             loaders[agent_id] = self._make_loader(
                 self.test_datasets[agent_id], shuffle=False
             )
+
+        if self.pilot_datasets:
+            target_batches = max(
+                (len(datasets) + self.batch_size - 1) // self.batch_size
+                for datasets in self.pilot_datasets.values()
+            )
+            if self.comm_data == 'private_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
+                        self.pilot_datasets[agent_id], target_batches
+                    )
+            elif self.comm_data == 'shared_global_pilots':
+                for agent_id in self.pilot_datasets:
+                    loaders[f'global_pilot_{agent_id}'] = self._make_pilot_loader(
+                        self.pilot_datasets[agent_id], target_batches
+                    )
+            elif self.comm_data == 'pairwise_pilots':
+                for i in range(self.n_agents):
+                    for j in range(i + 1, self.n_agents):
+                        pairwise_ds = PairwiseDataset(
+                            self.pilot_datasets[i], self.pilot_datasets[j]
+                        )
+                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
+                            pairwise_ds, target_batches
+                        )
+
         return CombinedLoader(loaders, mode=self.mode)

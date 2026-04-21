@@ -101,8 +101,9 @@ class ComFed(BaseOrchestrator):
                     )
 
     def on_train_epoch_end(self) -> None:
-        """No-op: projection matrices are updated via autodiff each step."""
-        pass
+        """Flush accumulated communication metrics; no parameter aggregation needed."""
+        self._record_communication_round(prefix='train')
+        self._finalize_train_epoch_communication()
 
     def _compute_class_means(
         self,

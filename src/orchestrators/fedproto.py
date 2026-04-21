@@ -11,7 +11,6 @@ representation alignment without weight sharing or a public dataset.
 """
 
 from typing import Any
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -70,9 +69,6 @@ class FedProto(BaseOrchestrator):
 
         self._validate_agents()
         self._global_prototypes: dict[int, torch.Tensor] = {}
-        self._epoch_prototypes: dict[int, list[torch.Tensor]] = defaultdict(
-            list
-        )
 
     def _validate_agents(self) -> None:
         """Validate that all agents have encode/decoder interface."""
@@ -115,32 +111,34 @@ class FedProto(BaseOrchestrator):
 
         return prototypes
 
-    def _aggregate_prototypes(
+    def _update_global_prototypes(
         self,
-        all_prototypes: dict[int, list[torch.Tensor]],
-    ) -> dict[int, torch.Tensor]:
-        """Aggregate prototypes into global prototypes via averaging.
+        local_prototypes: dict[int, dict[int, torch.Tensor]],
+    ) -> None:
+        """Update global prototypes via EMA using local per-batch prototypes.
+
+        For each class seen in this batch across all agents, the global prototype
+        is updated as a momentum-weighted average. This mirrors the per-step
+        aggregation described in the FedProto paper, where the server integrates
+        client prototypes after every local update.
 
         Parameters
         ----------
-        all_prototypes : dict[int, list[torch.Tensor]]
-            Dictionary mapping class indices to list of prototype tensors.
-
-        Returns
-        -------
-        dict[int, torch.Tensor]
-            Dictionary mapping class indices to aggregated global prototype tensors.
+        local_prototypes : dict[int, dict[int, torch.Tensor]]
+            Mapping from agent index to per-class prototype tensors for this batch.
         """
-        if not all_prototypes:
-            return {}
+        momentum = float(self.hparams.prototype_momentum)
 
-        global_prototypes = {}
-        for class_idx, proto_list in all_prototypes.items():
-            if proto_list:
-                stacked = torch.stack(proto_list)
-                global_prototypes[class_idx] = stacked.mean(dim=0)
-
-        return global_prototypes
+        for local_proto in local_prototypes.values():
+            for class_idx, proto in local_proto.items():
+                p = proto.detach()
+                if class_idx in self._global_prototypes:
+                    self._global_prototypes[class_idx] = (
+                        momentum * self._global_prototypes[class_idx]
+                        + (1.0 - momentum) * p
+                    )
+                else:
+                    self._global_prototypes[class_idx] = p
 
     def _compute_proto_regularization(
         self,
@@ -212,18 +210,7 @@ class FedProto(BaseOrchestrator):
         return inputs, labels
 
     def on_train_epoch_end(self) -> None:
-        """Aggregate prototypes at epoch end.
-
-        Collects per-class prototypes from all clients during the epoch,
-        aggregates them into global prototypes.
-        """
-        if not self._epoch_prototypes:
-            return
-
-        self._global_prototypes = self._aggregate_prototypes(
-            self._epoch_prototypes
-        )
-        self._epoch_prototypes.clear()
+        self._finalize_train_epoch_communication()
 
     def _shared_eval(
         self,
@@ -255,10 +242,7 @@ class FedProto(BaseOrchestrator):
         outputs = {}
         agent_losses = {}
         agent_performances = {}
-
-        def _resolve_key(i: int):
-            str_key = str(i)
-            return str_key if str_key in batch else i
+        latents_per_agent: dict[int, torch.Tensor] = {}
 
         inputs, labels = self._extract_local_batch(batch)
 
@@ -274,33 +258,34 @@ class FedProto(BaseOrchestrator):
             y_hat = agent.decoder(z)
 
             outputs[idx] = (y_hat.detach(), y)
+            latents_per_agent[idx] = z
 
-            task_loss = agent.compute_loss(y_hat, y)
-            task_performance = agent.task_performance(y_hat, y)
-
-            agent_losses[idx] = task_loss
-            agent_performances[idx] = task_performance
+            agent_losses[idx] = agent.compute_loss(y_hat, y)
+            agent_performances[idx] = agent.task_performance(y_hat, y)
 
         proto_loss: torch.Tensor = torch.tensor(0.0, device=self.device)
 
         if prefix == 'train':
-            local_prototypes = {}
+            local_prototypes = {
+                idx: self._compute_class_prototypes(z, labels[idx])
+                for idx, z in latents_per_agent.items()
+                if labels.get(idx) is not None
+            }
 
-            for idx_str, agent in self.agents.items():
-                idx = int(idx_str)
-                x = inputs.get(idx)
-                y = labels.get(idx)
+            # Per the FedProto paper: after each local update clients upload their
+            # prototypes, the server aggregates and broadcasts global prototypes.
+            # We model this as one communication round per batch.
+            if local_prototypes:
+                # Each agent sends its local class prototypes to the server (1 hop).
+                for idx, local_proto in local_prototypes.items():
+                    if local_proto:
+                        proto_tensor = torch.stack(list(local_proto.values())).detach()
+                        self._record_communication(proto_tensor, n_transmissions=1)
 
-                if x is not None and y is not None:
-                    z = agent.encode(x)
-                    local_prototypes[idx] = self._compute_class_prototypes(
-                        z, y
-                    )
+                self._record_communication_round(n_rounds=1, prefix='train')
 
-                    for class_idx, proto in local_prototypes[idx].items():
-                        self._epoch_prototypes[class_idx].append(
-                            proto.detach()
-                        )
+                # EMA update of global prototypes with the current batch's locals.
+                self._update_global_prototypes(local_prototypes)
 
             if self._global_prototypes:
                 client_proto_losses = {}

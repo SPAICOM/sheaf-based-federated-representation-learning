@@ -130,8 +130,8 @@ class SheafFRL(BaseOrchestrator):
     
     def _extract_pilot_batch(self, batch: dict, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract pilot data for an agent, handling global, private, or pairwise keys."""
-        if 'global_pilot' in batch:
-            return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
+        if f'global_pilot_{idx}' in batch:
+            return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
             
         if f'pilot_{idx}' in batch:
             return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
@@ -281,7 +281,7 @@ class SheafFRL(BaseOrchestrator):
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             x_pilot, y_pilot, _ = self._extract_pilot_batch(batch, idx)
-            
+
             raw_latents = agent.encode(x_pilot)
             latents_per_agent[idx] = normalize_anchor_matrix(raw_latents, self.anchor_config)
             labels_per_agent[idx] = y_pilot

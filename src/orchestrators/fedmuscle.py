@@ -317,17 +317,10 @@ class FedMuscle(BaseOrchestrator):
         self._in_cl_epoch = False
 
     def on_train_epoch_end(self) -> None:
-        """Handle epoch-level operations for FedMuscle.
-
-        Tracks local and CL epochs within each communication round.
-        After E + T epochs (one full round), counters are reset for the next round.
-        """
-        E = self.hparams.E
-        T = self.hparams.T
+        E = int(self.hparams.E)
+        T = int(self.hparams.T)
         round_length = E + T
-
-        current_epoch = int(self.current_epoch)
-        epoch_in_round = current_epoch % round_length
+        epoch_in_round = int(self.current_epoch) % round_length
 
         if epoch_in_round < E:
             self._local_epoch_count += 1
@@ -340,6 +333,8 @@ class FedMuscle(BaseOrchestrator):
             self._round_complete = True
             self._local_epoch_count = 0
             self._cl_epoch_count = 0
+
+        self._finalize_train_epoch_communication()
 
     def _shared_eval(
         self,
@@ -396,7 +391,14 @@ class FedMuscle(BaseOrchestrator):
 
         effective_lambda = 0.0
 
-        if pilot_data and prefix == 'train':
+        # Compute whether the current epoch is a CL epoch inline, so the check
+        # is correct for all batches in the epoch (on_train_epoch_end runs too
+        # late to set a flag that is accurate within the same epoch).
+        E = int(self.hparams.E)
+        T = int(self.hparams.T)
+        in_cl_epoch = (int(self.current_epoch) % (E + T)) >= E
+
+        if pilot_data and prefix == 'train' and in_cl_epoch:
             pilot_representations = {}
             for idx_str, agent in self.agents.items():
                 idx = int(idx_str)
@@ -406,17 +408,14 @@ class FedMuscle(BaseOrchestrator):
 
             if pilot_representations:
                 muscle_loss = self._compute_muscle_loss(pilot_representations)
-
-                if self._in_cl_epoch:
-                    effective_lambda = self.hparams.lambda_muscle
-                else:
-                    effective_lambda = self.hparams.lambda_muscle * 0.1
+                effective_lambda = self.hparams.lambda_muscle
 
                 for idx in pilot_representations:
                     self._record_communication(
                         pilot_representations[idx],
                         n_transmissions=len(self.agents) - 1,
                     )
+                self._record_communication_round(n_rounds=1, prefix='train')
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
         total_loss = total_task_loss + effective_lambda * muscle_loss

@@ -23,7 +23,9 @@ from .comfed import ComFed
 from .dfedu import DFedU
 from .dpsgd import DPSGD
 from .federated import FederatedLearning
+from .fedmuscle import FedMuscle
 from .fedper import FedPer
+from .fedproto import FedProto
 from .heterofl import HeteroFL
 from .non_cooperative import NonCooperativeLearning
 from .sheaf_fmtl import SheafFMTL
