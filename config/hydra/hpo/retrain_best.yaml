@@ -1,0 +1,12 @@
+# @package _global_
+
+trainer:
+  max_epochs: 150
+
+callbacks:
+  early_stopping: null
+
+optimization:
+  best_params_path: ???
+  run_test: true
+  cleanup_artifacts: false

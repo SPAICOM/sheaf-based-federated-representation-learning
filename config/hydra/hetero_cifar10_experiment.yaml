@@ -4,6 +4,7 @@ defaults:
   - orchestrator: sheaf_frl
   - optimizer: sgd
   - _self_
+  - optional hpo: null
 
 seed: 42
 study_name: "H CIFAR10"
@@ -11,21 +12,20 @@ study_name: "H CIFAR10"
 graph:
   neighbors_mode: "erdos_renyi"
   seed: 42
-  #p: 0.3
   p: 0.3
   m: 3
   neighbors: {}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: starved_clients
+  project: hetero_cifar10
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_p0.3_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 25
+  max_epochs: 20
   accelerator: auto
   devices: 1
   deterministic: true
@@ -47,7 +47,7 @@ callbacks:
   early_stopping:
     _target_: lightning.pytorch.callbacks.EarlyStopping
     monitor: validation/avg_task_performance_epoch
-    patience: 5
+    patience: 50
     mode: max
 
 
@@ -59,17 +59,17 @@ dataset:
   # If alpha is negative, unif(a,b) is used for proportions
   split_strategy: non_iid_with_margin
   n_agents: 30
-  classes_per_agent: 5
+  classes_per_agent: 10
   alpha: -1
-  monitor_test_during_fit: true
-  batch_size: 256
+  monitor_test_during_fit: false
+  batch_size: 124
   num_workers: 0
-  mode: min_size
-  starve_clients: true
+  mode: max_size_cycle
+  starve_clients: false
   pilot_split: 0.05
   pilot_batch_size: 64
   comm_data: shared_global_pilots
-
+  pilot_apply_agent_rotations: false
 
 #dataset:
   # Simplified 4 agents - 2 overlapping classes dataset
@@ -91,18 +91,16 @@ dataset:
 model:
   encoder_hidden_dims: [32, 64, 128]
   decoder_hidden_dims: [256]
-  #encoder_hidden_dims: [32, 64]
-  #decoder_hidden_dims: [120]
   dropout: 0.1
-  use_batchnorm: true
+  use_batchnorm: false
 
 orchestrator:
   lambda_sheaf: 0.05
   anchor_strategy: pilots
-  #num_anchors: 64
+  num_anchors: 64
   parseval_normalization: false
   l2_normalization: false
-  filter_unseen_classes: false  
+  #filter_unseen_classes: false  
   use_prototypes: false
 
 optimization:
