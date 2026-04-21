@@ -29,7 +29,7 @@ from src.utils.data_partitioner import (
     build_shared_class_partition,
     partition_by_agent_classes,
     partition_non_iid,
-    partition_fmtl_heuristic
+    partition_non_iid_with_margin,
 )
 
 
@@ -173,7 +173,9 @@ class ClassificationDataModule(l.LightningDataModule):
         'class_partition' (each agent sees specific classes),
         'non_iid' (each agent is randomly assigned ``classes_per_agent``
         classes and samples are distributed among assigned agents),
-        'fmtl_heuristic' : exact replication of Sheaf-FMTL authors' dataset skew.
+        'non_iid_with_margin' (same as ``non_iid``,
+        but first reserves a per-class safety margin for
+        each assigned agent before applying the skewed allocation),
     agent_classes : dict[int, list[int]], optional
         Dictionary mapping agent indices to list of class labels they see.
         Only used when split_strategy='class_partition'.
@@ -183,12 +185,13 @@ class ClassificationDataModule(l.LightningDataModule):
         provided. The remaining classes are distributed across agents.
     classes_per_agent : int, optional
         Number of classes randomly assigned to each agent. Only used when
-        split_strategy='non_iid'. Default: 2.
+        split_strategy is 'non_iid' or 'non_iid_with_margin'. Default: 2.
     alpha : float, optional
         Allocation parameter controlling statistical skew when
-        split_strategy='non_iid'. Positive values use a Dirichlet draw:
-        lower values produce more skew and higher values approach uniform.
-        Negative values switch to a bounded-uniform allocation heuristic.
+        split_strategy is 'non_iid' or 'non_iid_with_margin'. Positive
+        values use a Dirichlet draw: lower values produce more skew and
+        higher values approach uniform. Negative values switch to a
+        bounded-uniform allocation heuristic.
         Default: 0.5.
     batch_size : int, optional
         Batch size for dataloaders (default: 64).
@@ -209,6 +212,9 @@ class ClassificationDataModule(l.LightningDataModule):
         validation, and test CombinedLoaders when pilot data is available.
         This is only required by anchor strategies such as
         ``semantic_pilots``. Default: True.
+    starve_clients : bool, optional
+        If ``True``, reduce the training data by 80% for a deterministic
+        half of the clients after the configured split strategy is applied.
     seed : int, optional
         Random seed for reproducibility (default: 42).
 
@@ -257,6 +263,7 @@ class ClassificationDataModule(l.LightningDataModule):
         pilot_batch_size: int | None = None,
         pilot_apply_agent_rotations: bool = False,
         comm_data: str = 'private_pilots',
+        starve_clients: bool = False,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -287,7 +294,50 @@ class ClassificationDataModule(l.LightningDataModule):
         )
         self.pilot_apply_agent_rotations = pilot_apply_agent_rotations
         self.comm_data = comm_data
+        self.starve_clients = starve_clients
         self.seed = seed
+
+    def _starve_training_datasets(self, label_key: str) -> None:
+        """Reduce train data by 80% for a deterministic half of clients."""
+        starved_client_count = self.n_agents // 2
+        if starved_client_count == 0:
+            return
+
+        client_indices = torch.randperm(
+            self.n_agents,
+            generator=torch.Generator().manual_seed(self.seed),
+        ).tolist()
+        for client_idx in client_indices[:starved_client_count]:
+            train_dataset = self.train_datasets[client_idx]
+            if len(train_dataset) <= 1:
+                continue
+
+            keep_count = max(1, int(round(len(train_dataset) * 0.2)))
+            selected_indices = torch.randperm(
+                len(train_dataset),
+                generator=torch.Generator().manual_seed(
+                    self.seed + client_idx
+                ),
+            ).tolist()[:keep_count]
+            selected_indices.sort()
+
+            sample_ids = None
+            if train_dataset.sample_ids is not None:
+                sample_ids = [
+                    train_dataset.sample_ids[idx]
+                    for idx in selected_indices
+                ]
+
+            self.train_datasets[client_idx] = ClassificationDataset(
+                train_dataset.dataset.select(selected_indices),
+                train_dataset.data_key,
+                train_dataset.label_key,
+                rotation_angle=train_dataset.rotation_angle,
+                sample_ids=sample_ids,
+            )
+            self.num_classes[client_idx] = len(
+                set(self.train_datasets[client_idx].dataset[label_key])
+            )
 
     def _build_pilot_datasets(
         self,
@@ -546,35 +596,45 @@ class ClassificationDataModule(l.LightningDataModule):
             agent_labels = self.train_datasets[i].dataset[label_key]
             self.num_classes[i] = len(set(agent_labels))
 
-    def _split_data_fmtl_heuristic(self, train, val, test, label_key: str) -> None:
-        """Split data using the exact Sheaf-FMTL authors' heuristic.
+    def _split_data_non_iid_with_margin(
+        self, train, val, test, label_key: str
+    ) -> None:
+        """Split every partition with the same safety-margin partitioner.
 
-        Replicates the hardcoded Log-Normal and random integer skew used in 
-        the original Sheaf-FMTL paper for scientifically exact baseline replication.
+        Uses ``partition_non_iid_with_margin`` on train/val/test. The train
+        split samples the exact-K ``agent_classes`` assignment once, and the
+        validation/test splits reuse that same class map so the non-IID
+        partitioning logic is consistent across all partitions before the
+        optional train-only starvation step.
         """
-        train_partition, sampled_agent_classes = partition_fmtl_heuristic(
-            labels=train[label_key],
-            n_agents=self.n_agents,
-            classes_per_agent=self.classes_per_agent,
-            seed=self.seed,
-            return_agent_classes=True,
+        train_partition, sampled_agent_classes = (
+            partition_non_iid_with_margin(
+                labels=train[label_key],
+                n_agents=self.n_agents,
+                classes_per_agent=self.classes_per_agent,
+                seed=self.seed,
+                alpha=self.alpha,
+                return_agent_classes=True,
+            )
         )
         self.agent_classes = sampled_agent_classes
 
         split_partitions = {
             'train_datasets': train_partition,
-            'val_datasets': partition_fmtl_heuristic(
+            'val_datasets': partition_non_iid_with_margin(
                 labels=val[label_key],
                 n_agents=self.n_agents,
                 classes_per_agent=self.classes_per_agent,
                 seed=self.seed,
+                alpha=self.alpha,
                 agent_classes=self.agent_classes,
             ),
-            'test_datasets': partition_fmtl_heuristic(
+            'test_datasets': partition_non_iid_with_margin(
                 labels=test[label_key],
                 n_agents=self.n_agents,
                 classes_per_agent=self.classes_per_agent,
                 seed=self.seed,
+                alpha=self.alpha,
                 agent_classes=self.agent_classes,
             ),
         }
@@ -680,11 +740,15 @@ class ClassificationDataModule(l.LightningDataModule):
             # Automatic Non-IID: each agent gets classes_per_agent random
             # classes, samples distributed among assigned agents
             self._split_data_non_iid(train, val, test, label_key)
-        elif self.split_strategy == 'fmtl_heuristic':
-            # Exact replication of Sheaf-FMTL authors' dataset skew
-            self._split_data_fmtl_heuristic(train, val, test, label_key)
+        elif self.split_strategy == 'non_iid_with_margin':
+            # Training split gets a per-class safety margin before the
+            # skewed allocation; evaluation reuses the same class mapping.
+            self._split_data_non_iid_with_margin(train, val, test, label_key)
         else:
             raise ValueError(f'Unknown split_strategy: {self.split_strategy}')
+
+        if self.starve_clients:
+            self._starve_training_datasets(label_key)
         '''
         if not self.pilot_datasets and self.pilot_batch_size > 0:
             for i in range(self.n_agents):

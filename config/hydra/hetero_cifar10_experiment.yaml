@@ -12,15 +12,15 @@ graph:
   neighbors_mode: "erdos_renyi"
   seed: 42
   #p: 0.3
-  p: 0.15
+  p: 0.3
   m: 3
   neighbors: {}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__30-agents
+  project: starved_clients
   group: ${study_name}
-  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.orchestrator}_p0.3_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -57,7 +57,7 @@ dataset:
   # from a Dirichlet distribution (α=15 approx equal n samples), ensuring mutually exclusive, non-IID local datasets while
   # preserving the global train/test splits
   # If alpha is negative, unif(a,b) is used for proportions
-  split_strategy: non_iid
+  split_strategy: non_iid_with_margin
   n_agents: 30
   classes_per_agent: 5
   alpha: -1
@@ -65,6 +65,7 @@ dataset:
   batch_size: 256
   num_workers: 0
   mode: min_size
+  starve_clients: true
   pilot_split: 0.05
   pilot_batch_size: 64
   comm_data: shared_global_pilots
@@ -97,12 +98,12 @@ model:
 
 orchestrator:
   lambda_sheaf: 0.05
-  #anchor_strategy: prototype
+  anchor_strategy: pilots
   #num_anchors: 64
   parseval_normalization: false
   l2_normalization: false
-  filter_unseen_classes: true  
-  use_prototypes: true
+  filter_unseen_classes: false  
+  use_prototypes: false
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch

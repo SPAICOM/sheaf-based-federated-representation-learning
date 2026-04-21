@@ -28,21 +28,18 @@ This module contains orchestrator implementations for federated learning that co
     - Uses orthogonal Procrustes problem solution to compute optimal alignment matrices
     - Applies sheaf regularization penalty to encourage latent space alignment
   - **Key Features**:
-    - Anchor-based alignment: Selects semantically meaningful anchors for alignment computation
-    - Multiple anchor strategies:
-      - `prototype`: one class prototype per observed class
-      - `uniform`: Monte Carlo baseline using raw latent samples, with the global budget allocated proportionally to observed class mass
-      - `geometric`: geometric-aware supervised anchors using farthest-point sampling within each class
-      - `semantic_pilots`: anchors keyed by shared pilot sample ids from auxiliary `pilot_*` loaders
-      - `clustering`: cluster-centroid anchors that maximize latent-space coverage within each class
-    - Parseval normalization option for anchor features
-    - Per-agent latent space dimension handling
-    - Local SGD stays fully local within the epoch; train communication is charged only at epoch end when anchors are shared once for the Stiefel SVD update and the subsequent local sheaf-penalty gradient step
-    - Stiefel matrices (orthogonal constraints) updated via closed-form SVD solutions
+    - Anchor-based alignment with two public routing modes:
+      - `pilots`: extracts anchors from the shared pilot loaders. Pilot rows are already aligned by shared sample ids, and `use_prototypes=true` compresses them to one prototype per class before alignment.
+      - `batch_anchors`: reuses the current local task-batch latents, compresses them immediately to one prototype per class, and aligns neighbors by class labels across independent local batches.
+    - `filter_unseen_classes` can restrict alignment to classes present in both current anchor sets and already observed by both neighbors during training.
+    - Parseval or row-wise L2 normalization can be applied to the anchor matrices before communication and penalty evaluation.
+    - Per-step task losses are computed from the current batch; the sheaf penalty uses the current frozen Stiefel matrices `V` on communication steps.
+    - Normalized training anchors are cached on CPU throughout the epoch, and the Stiefel matrices are updated only in `on_train_epoch_end()` via the closed-form SVD solution to the orthogonal Procrustes problem.
+    - Communication accounting is charged on the actual exchanged anchor payloads after any prototype compression, so `batch_anchors` records prototype-sized payloads rather than full local batches.
   - **Mathematical Foundation**:
     - Solves orthogonal Procrustes problem: min ||A_i - A_j * V||_F subject to V^T * V = I
     - Solution: V = U * W^T where U*Σ*W^T = SVD(A_i^T * A_j)
-    - Sheaf penalty: Sum of Frobenius norms of aligned feature differences across edges
+    - Sheaf penalty: Sum of Frobenius norms of aligned feature differences across edges, evaluated with the current fixed `V` during the epoch and refreshed after the epoch-end SVD update
   - **Typical Use**: When you want to learn representations that are both task-relevant and aligned across agents
 
 - [`sheaf_fmtl.py`](sheaf_fmtl.py): Sheaf-based Federated Multi-Task Learning orchestrator
@@ -131,10 +128,11 @@ orchestrator = SheafFRL(
     optimizer=optimizer_config,
     lambda_sheaf=0.1,           # Sheaf regularization weight
     latent_dims={0: 128, 1: 128, 2: 128},  # Latent dimensions per agent
-    anchor_strategy="semantic_pilots",     # Anchor selection strategy
-    num_anchors=10,             # Number of anchors per epoch
+    anchor_strategy="pilots",   # Or "batch_anchors"
     parseval_normalization=True, # Whether to normalize anchor features
     l2_normalization=False,
+    filter_unseen_classes=False,
+    use_prototypes=False,
 )
 
 # Standard PyTorch Lightning training loop
@@ -150,7 +148,7 @@ Each orchestrator implements a specific federated learning algorithm while shari
 - PyTorch Lightning integration
 
 The choice of orchestrator depends on your specific federated learning requirements:
-- Use `sheaf_frl` for learning aligned representations
+- Use `sheaf_frl` for learning aligned representations with frozen-within-epoch, epoch-end-updated Stiefel matrices and either pilot-based or local-batch prototype anchors
 - Use `sheaf_fmtl` for the prior sheaf-based multitask learning method with parameter-space alignment
 - Use `federated` for standard FedAvg baseline
 - Use `dpsgd` for decentralized parallel SGD with per-step neighbor mixing

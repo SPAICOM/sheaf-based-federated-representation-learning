@@ -169,6 +169,31 @@ class BaseOrchestrator(l.LightningModule, ABC):
             f'{prefix}/communication_rounds': stage_state['rounds'],
         }
 
+    def _paired_communication_metrics(
+        self,
+        prefix: str,
+        *,
+        source_prefix: str = 'train',
+    ) -> dict[str, float]:
+        """Return one stage's cumulative communication under another prefix.
+
+        This pairs evaluation metrics with the cumulative communication budget
+        spent to obtain the evaluated model, making W&B accuracy-vs-budget
+        plots possible even when the evaluation stage itself performs no
+        communication.
+        """
+        source_state = self._communication_by_split[source_prefix]
+        return {
+            (
+                f'{prefix}/'
+                f'{source_prefix}_communication_kilobytes_cumulative'
+            ): source_state['kilobytes'],
+            (
+                f'{prefix}/'
+                f'{source_prefix}_communication_rounds_cumulative'
+            ): source_state['rounds'],
+        }
+
     def _finalize_train_epoch_communication(self) -> None:
         """Log cumulative train communication metrics once per epoch."""
         communication_logs = self._communication_metrics('train')
@@ -191,14 +216,39 @@ class BaseOrchestrator(l.LightningModule, ABC):
             add_dataloader_idx=False,
         )
 
+    def _finalize_paired_communication(
+        self,
+        prefix: str,
+        *,
+        source_prefix: str = 'train',
+    ) -> None:
+        """Log cumulative communication from one stage under another prefix."""
+        communication_logs = self._paired_communication_metrics(
+            prefix,
+            source_prefix=source_prefix,
+        )
+        self.log_dict(
+            communication_logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            add_dataloader_idx=False,
+        )
+
     def on_validation_epoch_end(self) -> None:
         """Log cumulative validation communication metrics."""
         for prefix in sorted(self._validation_prefixes_seen):
             self._finalize_stage_communication(prefix)
+            if prefix == 'test_monitor':
+                self._finalize_paired_communication(
+                    prefix,
+                    source_prefix='train',
+                )
 
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
         self._finalize_stage_communication('test')
+        self._finalize_paired_communication('test', source_prefix='train')
 
     def _validation_prefix(self, dataloader_idx: int) -> str:
         """Map validation dataloader indices to stable logging prefixes."""

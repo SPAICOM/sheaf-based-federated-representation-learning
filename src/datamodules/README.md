@@ -1,6 +1,6 @@
 # Datamodules Module
 
-This module contains data loading utilities for federated learning scenarios, particularly focused on semantic embedding datasets.
+This module contains data loading utilities for federated learning scenarios, covering both standard classification datasets and semantic embedding datasets.
 
 ## Components
 
@@ -52,10 +52,18 @@ from src.datamodules.classification_datamodule import ClassificationDataModule
 
 # Create a datamodule for image classification
 datamodule = ClassificationDataModule(
-    dataset_name="cifar10",
-    data_dir="./data",
+    repo="uoft-cs",
+    name="cifar10",
+    data_key="img",
+    attributes=["label"],
+    n_agents=30,
+    split_strategy="non_iid_with_margin",
+    classes_per_agent=5,
+    alpha=-1,
+    starve_clients=True,
     val_split=0.1,
     test_split=0.1,
+    pilot_split=0.05,
     batch_size=32,
     num_workers=4
 )
@@ -71,6 +79,13 @@ Supported `split_strategy` values include:
 - `uniform`: splits each dataset partition evenly across agents.
 - `class_partition`: creates a partial label-overlap federated setting with disjoint local datasets. Each sample belongs to exactly one agent, so no example is duplicated across clients in train/val/test. When `shared_classes = k`, exactly `k` class labels are assigned to every agent, while the remaining labels are distributed across agents. For shared labels, agents see different local samples from the same class rather than replicated examples.
 - `non_iid`: assigns each agent a subset of classes and distributes samples with Dirichlet-drawn proportions to create label and quantity skew.
+- `non_iid_with_margin`: assigns every agent exactly `classes_per_agent` classes while guaranteeing that every global class is assigned to at least one agent. For each assigned class, the partitioner reserves a fixed safety margin of samples per agent before allocating the remaining pool with the skew controlled by `alpha`. The same partitioner is applied to train, validation, and test using the train-sampled `agent_classes`, so the split logic remains consistent across all dataset partitions before any training-only starvation.
+
+Additional classification-specific notes:
+
+- `alpha > 0` uses a Dirichlet allocation; `alpha < 0` switches the margin partitioner to an extreme Log-Normal skew regime.
+- `starve_clients=True` is applied only after the split strategy is fully constructed, and it only subsamples the training datasets. Validation and test datasets remain untouched.
+- Shared pilot datasets are extracted before the agent-wise train/val/test partitioning and can be exposed through `pilot_*` loaders depending on `comm_data`.
 
 ### Utility Functions
 

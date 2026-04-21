@@ -144,3 +144,49 @@ class TestBaseOrchestrator:
             train_metrics['train/communication_kilobytes']
             > test_metrics['test/communication_kilobytes']
         )
+
+    def test_eval_logs_include_cumulative_train_communication(self):
+        """Test-monitor/test logs should include cumulative train budget."""
+        agent = DummyAgent()
+        orchestrator = ConcreteOrchestrator(
+            agents={0: agent},
+            neighbors={0: set()},
+            optimizer=MockOptimizer(),
+        )
+
+        logged_metrics = []
+
+        def capture_log_dict(metrics, **kwargs):
+            logged_metrics.append(dict(metrics))
+
+        orchestrator.log_dict = capture_log_dict
+
+        orchestrator.on_train_start()
+        orchestrator._record_communication_round(prefix='train')
+        orchestrator._record_communication(
+            torch.ones(4),
+            n_transmissions=2,
+            prefix='train',
+        )
+
+        train_metrics = orchestrator._communication_metrics('train')
+
+        orchestrator.on_validation_start()
+        orchestrator._validation_prefixes_seen.add('test_monitor')
+        orchestrator.on_validation_epoch_end()
+
+        orchestrator.on_test_start()
+        orchestrator.on_test_epoch_end()
+
+        assert {
+            'test_monitor/train_communication_kilobytes_cumulative': (
+                train_metrics['train/communication_kilobytes']
+            ),
+            'test_monitor/train_communication_rounds_cumulative': 1.0,
+        } in logged_metrics
+        assert {
+            'test/train_communication_kilobytes_cumulative': (
+                train_metrics['train/communication_kilobytes']
+            ),
+            'test/train_communication_rounds_cumulative': 1.0,
+        } in logged_metrics

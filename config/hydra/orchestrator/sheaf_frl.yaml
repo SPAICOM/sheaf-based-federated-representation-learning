@@ -1,7 +1,7 @@
 _target_: src.orchestrators.SheafFRL
 
 lambda_sheaf: 0.01
-#anchor_strategy: "prototype"
+anchor_strategy: pilots
 parseval_normalization: False
 l2_normalization: False
 parseval_eps: 0.01
