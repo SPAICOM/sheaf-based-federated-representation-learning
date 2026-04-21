@@ -1,0 +1,49 @@
+# @package _global_
+defaults:
+  - override /hydra/sweeper: optuna
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    direction: maximize
+    study_name: ${study_name}_FedPer
+    n_trials: 20
+    n_jobs: 1
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: ${seed}
+    params:
+      orchestrator.aggregation_unit: choice(epoch, step)
+      orchestrator.aggregation_interval: choice(1, 2, 3, 5)
+      optimizer.lr: tag(log, interval(5e-4, 5e-2))
+      optimizer.weight_decay: choice(0.0, 1e-5, 1e-4, 1e-3)
+      optimizer.momentum: choice(0.85, 0.9, 0.95)
+
+graph:
+  neighbors_mode: erdos_renyi
+
+trainer:
+  deterministic: false
+  num_sanity_val_steps: 0
+
+callbacks:
+  checkpoint:
+    save_top_k: 0
+    save_last: false
+
+model:
+  use_batchnorm: false
+
+dataset:
+  split_strategy: non_iid_fair
+  classes_per_agent: 10
+  alpha: -1
+  starve_clients: false
+  pilot_split: 0.0
+
+orchestrator:
+  sync_on_train_start: true
+
+optimization:
+  run_test: false
+  cleanup_artifacts: false
