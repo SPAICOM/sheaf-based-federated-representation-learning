@@ -19,8 +19,9 @@ import hydra
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_class, instantiate
 from lightning import Trainer, seed_everything
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
+from src.datamodules.utils import assign_agents_to_random_groups
 from src.utils import remove_non_empty_dir
 from src.utils.graph_generator import generate_neighbors
 
@@ -68,6 +69,90 @@ def _resolve_agent_overrides(
             {} if values is None else OmegaConf.to_container(values, resolve=True)
         )
     return overrides
+
+
+def _resolve_agent_rotations(
+    cfg: DictConfig,
+    *,
+    n_agents: int | None,
+) -> dict[int, float] | None:
+    """Resolve per-agent rotations from explicit config or grouped spec."""
+    if 'agent_rotations' in cfg and cfg.agent_rotations is not None:
+        return {
+            int(agent_idx): float(rotation)
+            for agent_idx, rotation in OmegaConf.to_container(
+                cfg.agent_rotations, resolve=True
+            ).items()
+        }
+
+    if 'agent_rotation_groups' not in cfg:
+        return None
+    if n_agents is None:
+        raise ValueError(
+            'agent_rotation_groups requires dataset.n_agents to be set.'
+        )
+
+    group_cfg = cfg.agent_rotation_groups
+    group_values = list(
+        OmegaConf.to_container(group_cfg.group_values, resolve=True)
+    )
+    seed = int(group_cfg.get('seed', cfg.seed))
+    return {
+        agent_idx: float(rotation)
+        for agent_idx, rotation in assign_agents_to_random_groups(
+            n_agents=n_agents,
+            group_values=group_values,
+            seed=seed,
+        ).items()
+    }
+
+
+def _set_dotted_config_value(
+    cfg: DictConfig,
+    dotted_key: str,
+    value: Any,
+) -> None:
+    """Assign a nested config value addressed by a dotted key."""
+    keys = dotted_key.split('.')
+    cursor: Any = cfg
+    for key in keys[:-1]:
+        if key not in cursor or cursor[key] is None:
+            cursor[key] = {}
+        cursor = cursor[key]
+    cursor[keys[-1]] = value
+
+
+def _maybe_apply_best_params(cfg: DictConfig) -> dict[str, Any] | None:
+    """Load and apply Optuna best params before instantiation."""
+    optimization_cfg = cfg.get('optimization', {})
+    best_params_path = optimization_cfg.get('best_params_path')
+    if not best_params_path:
+        return None
+
+    results_path = Path(str(best_params_path)).expanduser().resolve()
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f'Optuna results file not found: {results_path}'
+        )
+
+    results_cfg = OmegaConf.load(results_path)
+    best_params = OmegaConf.to_container(
+        results_cfg.get('best_params', {}),
+        resolve=True,
+    )
+    if not isinstance(best_params, dict) or not best_params:
+        raise ValueError(
+            f'No best_params found in Optuna results file: {results_path}'
+        )
+
+    with open_dict(cfg):
+        for dotted_key, value in best_params.items():
+            _set_dotted_config_value(cfg, str(dotted_key), value)
+
+    return {
+        'best_params_path': str(results_path),
+        'best_params': best_params,
+    }
 
 
 def _sanitize_instantiation_config(config: Any) -> Any:
@@ -257,7 +342,7 @@ def main(cfg: DictConfig) -> float:
     5. Create agent models for each data modality.
     6. Generate neighbor graph and instantiate the orchestrator.
     7. Execute training with the orchestrator.
-    8. Clean up temporary directories.
+    8. Optionally clean up temporary directories.
 
     Parameters
     ----------
@@ -269,6 +354,7 @@ def main(cfg: DictConfig) -> float:
     ValueError
         If the 'label' attribute is not categorical in the dataset.
     """
+    best_params_metadata = _maybe_apply_best_params(cfg)
     seed_everything(cfg.seed, workers=True)
 
     objective_metric_name = str(
@@ -284,12 +370,15 @@ def main(cfg: DictConfig) -> float:
 
     _finish_active_wandb_run()
     logger = instantiate(cfg.logger)
-    _update_logger_config(
-        logger,
-        OmegaConf.to_container(cfg, resolve=True),
-    )
+    _update_logger_config(logger, OmegaConf.to_container(cfg, resolve=True))
+    if best_params_metadata is not None:
+        _update_logger_config(logger, best_params_metadata)
 
-    callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
+    callbacks = [
+        instantiate(cb_conf)
+        for cb_conf in cfg.callbacks.values()
+        if cb_conf is not None
+    ]
 
     trainer = Trainer(
         **cfg.trainer,
@@ -299,12 +388,14 @@ def main(cfg: DictConfig) -> float:
 
     # Convert Hydra config to plain dict for instantiation
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
+    resolved_agent_rotations = _resolve_agent_rotations(
+        cfg,
+        n_agents=dataset_cfg.get('n_agents'),
+    )
 
     # Pass agent_rotations to datamodule for data augmentation (e.g., rotation)
-    if 'agent_rotations' in cfg:
-        dataset_cfg['agent_rotations'] = OmegaConf.to_container(
-            cfg.agent_rotations, resolve=True
-        )
+    if resolved_agent_rotations is not None:
+        dataset_cfg['agent_rotations'] = resolved_agent_rotations
 
     # Pass agent_classes to datamodule for class-partitioned data splits
     if 'agent_classes' in cfg:
@@ -344,6 +435,7 @@ def main(cfg: DictConfig) -> float:
     _update_logger_config(
         logger,
         {
+            'resolved_agent_rotations': resolved_agent_rotations or {},
             'resolved_agent_classes': resolved_agent_classes,
             'resolved_num_classes_per_agent': resolved_num_classes_per_agent,
         },
@@ -461,12 +553,13 @@ def main(cfg: DictConfig) -> float:
     )
     _update_logger_config(logger, {'results_file': str(result_file)})
 
-    # Clean up temporary directories created by Hydra, WandB, and Lightning
-    # These directories can accumulate over multiple experiment runs
-    remove_non_empty_dir('./multirun/')
-    remove_non_empty_dir('./outputs/')
-    remove_non_empty_dir('~/.cache/wandb/')
-    remove_non_empty_dir(cfg.logger.project)
+    cleanup_artifacts = bool(
+        cfg.get('optimization', {}).get('cleanup_artifacts', False)
+    )
+    if cleanup_artifacts:
+        remove_non_empty_dir('./outputs/')
+        remove_non_empty_dir('~/.cache/wandb/')
+        remove_non_empty_dir(cfg.logger.project)
     _finish_active_wandb_run()
     return objective_value
 

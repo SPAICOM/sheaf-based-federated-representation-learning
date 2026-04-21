@@ -19,7 +19,6 @@ from src.utils.anchors import (
     AnchorConfig,
     communication_anchor_payload,
     normalize_anchor_matrix,
-    shared_anchor_rows,
 )
 
 
@@ -38,7 +37,7 @@ class SheafFRL(BaseOrchestrator):
         parseval_eps: float = 1e-4,
         local_steps: int = 1,
         anchor_strategy: str = 'pilots',
-        filter_unseen_classes: bool = True,
+        num_anchors: int = 64,
         use_prototypes: bool = False,
         **kwargs,
     ):
@@ -59,11 +58,8 @@ class SheafFRL(BaseOrchestrator):
             parseval_normalization=bool(parseval_normalization),
             l2_normalization=bool(l2_normalization),
             parseval_eps=float(parseval_eps),
-            filter_unseen_classes=bool(filter_unseen_classes),
             use_prototypes=bool(use_prototypes),
         )
-
-        self.seen_classes: dict[int, set[int]] = {int(k): set() for k in agents.keys()}
 
         self.epoch_latents_cache: dict[int, list[torch.Tensor]] = {int(k): [] for k in agents.keys()}
         self.epoch_labels_cache: dict[int, list[torch.Tensor]] = {int(k): [] for k in agents.keys()}
@@ -97,10 +93,12 @@ class SheafFRL(BaseOrchestrator):
         return str_key if str_key in batch else idx
     
     def _extract_pilot_batch(self, batch: dict, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if 'global_pilot' in batch:
-            return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
         if f'pilot_{idx}' in batch:
             return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
+        if f'global_pilot_{idx}' in batch:
+            return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
+        if 'global_pilot' in batch:
+            return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
             
         for key, value in batch.items():
             if isinstance(key, str) and key.startswith('pilot_'):
@@ -115,13 +113,7 @@ class SheafFRL(BaseOrchestrator):
         raise ValueError(f"Pilot batch missing for agent {idx}.")
 
     def _effective_anchor_config(self) -> AnchorConfig:
-        return replace(
-            self.anchor_config,
-            use_prototypes=bool(
-                self.anchor_config.use_prototypes
-                or self.hparams.anchor_strategy == 'batch_anchors'
-            ),
-        )
+        return replace(self.anchor_config)
 
     def _compute_class_prototypes(
         self,
@@ -145,26 +137,27 @@ class SheafFRL(BaseOrchestrator):
             prototype_labels, device=labels.device, dtype=labels.dtype,
         )
 
-    def _match_cached_anchors(
-        self, A_i: torch.Tensor, A_j: torch.Tensor, y_i: torch.Tensor, y_j: torch.Tensor, seen_i: set[int], seen_j: set[int]
+    def _match_keys(
+        self,
+        A_i: torch.Tensor,
+        A_j: torch.Tensor,
+        keys_i: torch.Tensor,
+        keys_j: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Safely pairs up accumulated epoch rows chronologically without re-averaging them."""
-        target_classes = set(y_i.tolist()) & set(y_j.tolist())
-        if self.anchor_config.filter_unseen_classes:
-            target_classes &= seen_i & seen_j
+        """Universal geometric matcher: pairs up matrices via Sample IDs or Classes."""
+        target_keys = set(keys_i.tolist()) & set(keys_j.tolist())
 
-        if not target_classes:
+        if not target_keys:
             return None
 
-        # Chronological matching perfectly aligns step trajectories for BOTH pilots and batch_anchors
         matched_i, matched_j = [], []
-        for c in sorted(target_classes):
-            idx_i = torch.where(y_i == c)[0]
-            idx_j = torch.where(y_j == c)[0]
-            k = min(len(idx_i), len(idx_j))
-            if k > 0:
-                matched_i.append(A_i[idx_i[:k]])
-                matched_j.append(A_j[idx_j[:k]])
+        for k in sorted(target_keys):
+            idx_i = torch.where(keys_i == k)[0]
+            idx_j = torch.where(keys_j == k)[0]
+            matched_count = min(len(idx_i), len(idx_j))
+            if matched_count > 0:
+                matched_i.append(A_i[idx_i[:matched_count]])
+                matched_j.append(A_j[idx_j[:matched_count]])
 
         if not matched_i:
             return None
@@ -174,7 +167,7 @@ class SheafFRL(BaseOrchestrator):
     def _update_stiefel_matrices(
         self,
         latents_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor]
+        keys_per_agent: dict[int, torch.Tensor]
     ) -> None:
         if not self.stiefel_matrices:
             return
@@ -187,23 +180,28 @@ class SheafFRL(BaseOrchestrator):
             if node_i not in latents_per_agent or node_j not in latents_per_agent:
                 continue
 
-            shared_rows = self._match_cached_anchors(
+            shared_rows = self._match_keys(
                 A_i=latents_per_agent[node_i],
                 A_j=latents_per_agent[node_j],
-                y_i=labels_per_agent[node_i],
-                y_j=labels_per_agent[node_j],
-                seen_i=self.seen_classes[node_i],
-                seen_j=self.seen_classes[node_j],
+                keys_i=keys_per_agent[node_i],
+                keys_j=keys_per_agent[node_j],
             )
             if shared_rows is None:
                 continue
 
             A_i, A_j = shared_rows
-            A_i = A_i - A_i.mean(dim=0, keepdim=True)
-            A_j = A_j - A_j.mean(dim=0, keepdim=True)
+            #A_i = A_i - A_i.mean(dim=0, keepdim=True)
+            #A_j = A_j - A_j.mean(dim=0, keepdim=True)
 
             C = torch.matmul(A_i.T, A_j)
-            U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+            C = C + torch.randn_like(C) * 1e-6
+
+            try:
+                U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+            except RuntimeError:
+                C_cpu = C.cpu()
+                U_cpu, _, W_T_cpu = torch.linalg.svd(C_cpu, full_matrices=False)
+                U, W_T = U_cpu.to(param_device), W_T_cpu.to(param_device)
             
             V_new = torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
             V_param.copy_(V_new)
@@ -211,8 +209,6 @@ class SheafFRL(BaseOrchestrator):
     def on_train_start(self) -> None:
         super().on_train_start()
         self._train_local_step_count = 0
-        for idx in self.seen_classes:
-            self.seen_classes[idx].clear()
         for idx in self.epoch_latents_cache:
             self.epoch_latents_cache[idx].clear()
             self.epoch_labels_cache[idx].clear()
@@ -220,16 +216,34 @@ class SheafFRL(BaseOrchestrator):
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
         epoch_latents: dict[int, torch.Tensor] = {}
-        epoch_labels: dict[int, torch.Tensor] = {}
+        epoch_keys: dict[int, torch.Tensor] = {}
 
         for idx_str in self.agents.keys():
             idx = int(idx_str)
             if self.epoch_latents_cache.get(idx):
-                epoch_latents[idx] = torch.cat(self.epoch_latents_cache[idx], dim=0).to(self.device)
-                epoch_labels[idx] = torch.cat(self.epoch_labels_cache[idx], dim=0).to(self.device)
+                raw_A = torch.cat(self.epoch_latents_cache[idx], dim=0).to(self.device)
+                raw_keys = torch.cat(self.epoch_labels_cache[idx], dim=0).to(self.device)
+
+                if self.anchor_config.use_prototypes:
+                    final_A, final_keys = self._compute_class_prototypes(raw_A, raw_keys)
+                elif self.hparams.num_anchors < raw_A.shape[0]:
+                    # Global Uniform Subsampling
+                    g = torch.Generator(device=self.device).manual_seed(self.current_epoch)
+                    indices = torch.randperm(
+                        raw_A.shape[0],
+                        generator=g,
+                        device=raw_A.device,
+                    )[: self.hparams.num_anchors]
+                    final_A = raw_A[indices]
+                    final_keys = raw_keys[indices]
+                else:
+                    final_A, final_keys = raw_A, raw_keys
+
+                epoch_latents[idx] = normalize_anchor_matrix(final_A, self.anchor_config)
+                epoch_keys[idx] = final_keys
 
         if epoch_latents:
-            self._update_stiefel_matrices(epoch_latents, epoch_labels)
+            self._update_stiefel_matrices(epoch_latents, epoch_keys)
 
         for idx in self.epoch_latents_cache:
             self.epoch_latents_cache[idx].clear()
@@ -251,7 +265,7 @@ class SheafFRL(BaseOrchestrator):
         agent_performances = {}
 
         latents_per_agent: dict[int, torch.Tensor] = {}
-        labels_per_agent: dict[int, torch.Tensor] = {}
+        keys_per_agent: dict[int, torch.Tensor] = {}
         task_latents_cache: dict[int, torch.Tensor] = {}
         task_labels_cache: dict[int, torch.Tensor] = {}
         anchor_config = self._effective_anchor_config()
@@ -260,9 +274,6 @@ class SheafFRL(BaseOrchestrator):
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             x_task, y_task = batch[self._resolve_key(batch, idx)]
-
-            if prefix == 'train':
-                self.seen_classes[idx].update(y_task.detach().cpu().tolist())
 
             latent_task = agent.encode(x_task)
             y_hat = agent.decoder(latent_task)
@@ -283,29 +294,39 @@ class SheafFRL(BaseOrchestrator):
                 self._train_local_step_count % int(self.hparams.local_steps) == 0
             )
 
-        # Extract anchors and compute prototypes if configured, then cache for SVD at epoch end
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
+            
+            # Extract anchors
             if self.hparams.anchor_strategy == 'batch_anchors':
                 raw_latents = task_latents_cache[idx]
-                anchor_labels = task_labels_cache[idx]
-                raw_latents, anchor_labels = self._compute_class_prototypes(raw_latents, anchor_labels)
+                raw_keys = task_labels_cache[idx]
+                class_labels = task_labels_cache[idx]
             elif self.hparams.anchor_strategy == 'pilots':
-                x_pilot, y_pilot, _ = self._extract_pilot_batch(batch, idx)
+                x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
                 raw_latents = agent.encode(x_pilot)
-                anchor_labels = y_pilot
-                if anchor_config.use_prototypes:
-                    raw_latents, anchor_labels = self._compute_class_prototypes(raw_latents, anchor_labels)
+                raw_keys = sample_ids if sample_ids is not None else y_pilot
+                class_labels = y_pilot
             else:
                 raise ValueError(f'Unknown anchor_strategy: {self.hparams.anchor_strategy}')
 
-            latents_per_agent[idx] = normalize_anchor_matrix(raw_latents, anchor_config)
-            labels_per_agent[idx] = anchor_labels
+            # Caching (ensuring SVD groups by class if prototype, else by sample ID for pilots)
+            if prefix == 'train':
+                self.epoch_latents_cache[idx].append(raw_latents.detach().cpu())
+                keys_to_cache = class_labels if anchor_config.use_prototypes else raw_keys
+                self.epoch_labels_cache[idx].append(keys_to_cache.detach().cpu())
 
-        if prefix == 'train':
-            for idx in latents_per_agent:
-                self.epoch_latents_cache[idx].append(latents_per_agent[idx].detach().cpu())
-                self.epoch_labels_cache[idx].append(labels_per_agent[idx].detach().cpu())
+            # Apply strategy to current step
+            if anchor_config.use_prototypes:
+                step_latents, step_keys = self._compute_class_prototypes(raw_latents, class_labels)
+            elif self.hparams.num_anchors < raw_latents.shape[0]:
+                step_latents = raw_latents[:self.hparams.num_anchors]
+                step_keys = raw_keys[:self.hparams.num_anchors]
+            else:
+                step_latents, step_keys = raw_latents, raw_keys
+
+            latents_per_agent[idx] = normalize_anchor_matrix(step_latents, anchor_config)
+            keys_per_agent[idx] = step_keys
 
         # Early exit for local training steps
         if prefix == 'train' and not is_communication_step:
@@ -323,14 +344,15 @@ class SheafFRL(BaseOrchestrator):
             )
             return outputs, total_task_loss
 
-        if prefix in {'train', 'test', 'test_monitor'} or (prefix == 'train' and is_communication_step):
+        # Communication Payload
+        if prefix in {'train', 'test', 'test_monitor'}:
             self._record_communication_round(n_rounds=1, prefix=prefix)
             for idx, latents in latents_per_agent.items():
                 n_neighbors = len(self.hparams.neighbors.get(idx, self.hparams.neighbors.get(str(idx), set())))
                 if n_neighbors > 0:
                     payload = communication_anchor_payload(
                         anchor_matrix=latents,
-                        labels=labels_per_agent[idx],
+                        labels=keys_per_agent[idx],
                         config=anchor_config,
                     )
                     self._record_communication(
@@ -338,9 +360,6 @@ class SheafFRL(BaseOrchestrator):
                     )
 
         sheaf_penalty = torch.tensor(0.0, device=self.device)
-        
-        # Disable re-averaging in step penalty because we already compressed them in step 2
-        step_penalty_config = replace(anchor_config, use_prototypes=False)
 
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
@@ -348,20 +367,18 @@ class SheafFRL(BaseOrchestrator):
             if node_i not in latents_per_agent or node_j not in latents_per_agent:
                 continue
 
-            shared_rows = shared_anchor_rows(
+            shared_rows = self._match_keys(
                 A_i=latents_per_agent[node_i],
                 A_j=latents_per_agent[node_j],
-                labels_i=labels_per_agent[node_i],
-                labels_j=labels_per_agent[node_j],
-                seen_i=self.seen_classes[node_i],
-                seen_j=self.seen_classes[node_j],
-                config=step_penalty_config,
+                keys_i=keys_per_agent[node_i],
+                keys_j=keys_per_agent[node_j],
             )
             if shared_rows is None:
                 continue
 
             A_i_shared, A_j_shared = shared_rows
             diff = A_i_shared - torch.matmul(A_j_shared, V.T)
+            
             sheaf_penalty += (diff**2).sum(dim=1).mean()
 
         total_loss = total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
