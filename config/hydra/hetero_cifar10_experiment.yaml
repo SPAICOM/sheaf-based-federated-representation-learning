@@ -97,7 +97,7 @@ model:
   use_batchnorm: true
 
 orchestrator:
-  lambda_sheaf: 0.05
+  max_lmb: 0.05
   anchor_strategy: pilots
   #num_anchors: 64
   parseval_normalization: false

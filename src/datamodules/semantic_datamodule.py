@@ -486,94 +486,54 @@ class SemanticDataModule(l.LightningDataModule):
             num_workers=self.num_workers,
         )
 
-    def _add_pilot_loaders(
-        self, loaders: dict, target_num_batches: int
-    ) -> None:
-        if self.comm_data == 'private_pilots':
-            loaders.update(
-                {
-                    f'pilot_{m}': self._make_pilot_loader(
-                        ds, target_num_batches
-                    )
-                    for m, ds in self.pilot_datasets.items()
-                }
+    def _create_loaders(self, split: str) -> CombinedLoader:
+        split_map: dict[str, tuple[dict, bool]] = {
+            'train': (self.train_datasets, True),
+            'val': (self.val_datasets, False),
+            'test': (self.test_datasets, False),
+        }
+        if split not in split_map:
+            raise ValueError(
+                f'Unknown split {split!r}. Valid options: {list(split_map)}'
             )
-        elif self.comm_data == 'shared_global_pilots':
-            first_key = next(iter(self.pilot_datasets.keys()))
-            loaders['global_pilot'] = self._make_pilot_loader(
-                self.pilot_datasets[first_key], target_num_batches
+        datasets, shuffle = split_map[split]
+        loaders: dict = {m: self._make_loader(ds, shuffle) for m, ds in datasets.items()}
+
+        if self.include_pilot_loaders and self.pilot_datasets:
+            target_num_batches = max(
+                (len(ds) + self.batch_size - 1) // self.batch_size
+                for ds in datasets.values()
             )
-        elif self.comm_data == 'pairwise_pilots':
             agent_keys = list(self.pilot_datasets.keys())
-            for i in range(len(agent_keys)):
-                for j in range(i + 1, len(agent_keys)):
-                    key_i, key_j = agent_keys[i], agent_keys[j]
-                    pairwise_ds = PairwiseDataset(
-                        self.pilot_datasets[key_i],
-                        self.pilot_datasets[key_j],
+            if self.comm_data == 'private_pilots':
+                loaders.update({
+                    f'pilot_{m}': self._make_pilot_loader(ds, target_num_batches)
+                    for m, ds in self.pilot_datasets.items()
+                })
+            elif self.comm_data == 'shared_global_pilots':
+                loaders['global_pilot'] = self._make_pilot_loader(
+                    self.pilot_datasets[agent_keys[0]], target_num_batches
+                )
+            elif self.comm_data == 'pairwise_pilots':
+                loaders.update({
+                    f'pilot_{agent_keys[i]}_{agent_keys[j]}': self._make_pilot_loader(
+                        PairwiseDataset(
+                            self.pilot_datasets[agent_keys[i]],
+                            self.pilot_datasets[agent_keys[j]],
+                        ),
+                        target_num_batches,
                     )
-                    loaders[f'pilot_{key_i}_{key_j}'] = (
-                        self._make_pilot_loader(
-                            pairwise_ds, target_num_batches
-                        )
-                    )
+                    for i in range(len(agent_keys))
+                    for j in range(i + 1, len(agent_keys))
+                })
+
+        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
 
     def train_dataloader(self) -> CombinedLoader:
-        """Create and return the training data loader.
-
-        Returns
-        -------
-        CombinedLoader
-            CombinedLoader containing all training datasets.
-        """
-        loaders = {
-            m: self._make_loader(ds, True)
-            for m, ds in self.train_datasets.items()
-        }
-        if self.include_pilot_loaders and self.pilot_datasets:
-            target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.train_datasets.values()
-            )
-            self._add_pilot_loaders(loaders, target_num_batches)
-        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
+        return self._create_loaders('train')
 
     def val_dataloader(self) -> CombinedLoader:
-        """Create and return the validation data loader.
-
-        Returns
-        -------
-        CombinedLoader
-            CombinedLoader containing all validation datasets.
-        """
-        loaders = {
-            m: self._make_loader(ds, False)
-            for m, ds in self.val_datasets.items()
-        }
-        if self.include_pilot_loaders and self.pilot_datasets:
-            target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.val_datasets.values()
-            )
-            self._add_pilot_loaders(loaders, target_num_batches)
-        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
+        return self._create_loaders('val')
 
     def test_dataloader(self) -> CombinedLoader:
-        """Create and return the test data loader.
-
-        Returns
-        -------
-        CombinedLoader
-            CombinedLoader containing all test datasets.
-        """
-        loaders = {
-            m: self._make_loader(ds, False)
-            for m, ds in self.test_datasets.items()
-        }
-        if self.include_pilot_loaders and self.pilot_datasets:
-            target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.test_datasets.values()
-            )
-            self._add_pilot_loaders(loaders, target_num_batches)
-        return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
+        return self._create_loaders('test')

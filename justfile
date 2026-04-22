@@ -30,12 +30,17 @@ multimodal_dec *args="":
     uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=heterofl {{args}}
 
 # Run multimodal (DeepSense) experiment for all supported orchestrators
-multimodal *args="":
+deepsense *args="":
     uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=fedproto {{args}}
     uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=fedmuscle {{args}}
     uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=comfed {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=sheaf_frl {{args}}
     uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=sheaf_fmtl {{args}}
+
+mhealth *args="":
+    uv run scripts/mhealth_experiment.py --config-name mhealth_experiment orchestrator=fedproto {{args}}
+    uv run scripts/mhealth_experiment.py --config-name mhealth_experiment orchestrator=fedmuscle {{args}}
+    uv run scripts/mhealth_experiment.py --config-name mhealth_experiment orchestrator=comfed {{args}}
+    uv run scripts/mhealth_experiment.py --config-name mhealth_experiment orchestrator=sheaf_fmtl {{args}}
 
 # Install test dependencies
 test_setup:

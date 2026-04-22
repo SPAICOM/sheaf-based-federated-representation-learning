@@ -1,6 +1,7 @@
 _target_: src.orchestrators.FedMuscle
 
-lambda_muscle: 0.1
+max_lmb: 0.1
+lambda_schedule: null
 temperature: 0.1
 
 E: 4

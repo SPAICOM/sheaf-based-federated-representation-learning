@@ -16,12 +16,13 @@ All support:
 
 from .classification_datamodule import ClassificationDataModule
 from .deepsense_datamodule import DeepSenseDataModule
-from .mhealth_datamodule import MHealthDataModule
+from .mhealth_datamodule import MHEALTH_SENSOR_MODALITIES, MHealthDataModule
 from .semantic_datamodule import SemanticDataModule
 
 __all__ = [
     'ClassificationDataModule',
     'MHealthDataModule',
+    'MHEALTH_SENSOR_MODALITIES',
     'SemanticDataModule',
     'DeepSenseDataModule',
 ]

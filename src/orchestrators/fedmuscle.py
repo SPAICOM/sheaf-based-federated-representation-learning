@@ -40,8 +40,10 @@ class FedMuscle(BaseOrchestrator):
         Dictionary mapping each agent index to the set of its neighbor indices.
     optimizer : hydra config
         Optimizer configuration for training.
-    lambda_muscle : float, optional
-        Weight coefficient for the Muscle loss (default: 0.1).
+    max_lmb : float, optional
+        Maximum weight coefficient for the Muscle loss (default: 0.1).
+    lambda_schedule : str or None, optional
+        Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     temperature : float, optional
         Temperature parameter for contrastive loss (default: 0.1).
     E : int, optional
@@ -65,11 +67,12 @@ class FedMuscle(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer: Any,
-        lambda_muscle: float = 0.1,
+        max_lmb: float = 0.1,
         temperature: float = 0.1,
         E: int = 4,
         T: int = 1,
         alignment_mode: str = 'contrastive',
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -408,7 +411,7 @@ class FedMuscle(BaseOrchestrator):
 
             if pilot_representations:
                 muscle_loss = self._compute_muscle_loss(pilot_representations)
-                effective_lambda = self.hparams.lambda_muscle
+                effective_lambda = self._effective_lambda_reg()
 
                 for idx in pilot_representations:
                     self._record_communication(

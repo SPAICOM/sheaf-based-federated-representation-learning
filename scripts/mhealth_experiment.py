@@ -26,6 +26,7 @@ from src.agents import (
     MHealthGyroscopeClassifier,
     MHealthMagnetometerClassifier,
 )
+from src.datamodules.mhealth_datamodule import MHEALTH_SENSOR_MODALITIES
 from src.utils.graph_generator import generate_neighbors
 
 MODALITY_CLASSIFIER = {
@@ -42,34 +43,55 @@ MODALITY_CHANNELS = {
     'ecg': 2,
 }
 
+# Maps each MHEALTH_SENSOR_MODALITIES key to the classifier type key above.
+_SENSOR_MOD_TO_CLASSIFIER_TYPE: dict[str, str] = {
+    'acc_chest': 'accelerometer',
+    'acc_ankle': 'accelerometer',
+    'acc_wrist': 'accelerometer',
+    'gyro_ankle': 'gyroscope',
+    'gyro_wrist': 'gyroscope',
+    'mag_ankle': 'magnetometer',
+    'mag_wrist': 'magnetometer',
+    'ecg': 'ecg',
+}
 
-def _infer_agent_modalities(datamodule) -> dict[int, list[str]]:
-    """Infer agent modalities from the datamodule's feature columns.
 
-    Groups feature columns by sensor type and assigns each agent a primary
-    modality based on its feature columns.
+def _resolve_agent_classifier_types(datamodule) -> dict[int, str]:
+    """Return the classifier type (e.g. 'accelerometer') for each agent.
+
+    When *agent_modalities* is configured on the datamodule, each agent has
+    already been sliced to its own 3-D (or 2-D) sensor columns, so we read
+    the assignment directly from there.
+
+    As a fallback (no *agent_modalities* set), the modality is inferred from
+    each agent's actual dataset feature columns: the sensor type that
+    contributes the most columns wins.  This correctly handles both single-
+    modality configs (all columns from one sensor type) and multi-modality
+    configs (majority vote).
     """
-    feature_cols = datamodule.feature_cols
+    if datamodule.agent_modalities:
+        return {
+            i: _SENSOR_MOD_TO_CLASSIFIER_TYPE[mod]
+            for i, mod in datamodule.agent_modalities.items()
+        }
 
-    modality_features = {
-        'accelerometer': [c for c in feature_cols if 'acc_' in c],
-        'gyroscope': [c for c in feature_cols if 'gyro_' in c],
-        'magnetometer': [c for c in feature_cols if 'mag_' in c],
-        'ecg': [c for c in feature_cols if 'ecg_' in c],
-    }
+    # Build reverse map: column_name → classifier type
+    col_to_type: dict[str, str] = {}
+    for sensor_mod, cols in MHEALTH_SENSOR_MODALITIES.items():
+        cls_type = _SENSOR_MOD_TO_CLASSIFIER_TYPE[sensor_mod]
+        for col in cols:
+            col_to_type[col] = cls_type
 
-    agent_modalities = {}
+    result: dict[int, str] = {}
     for agent_id in range(datamodule.n_agents):
-        agent_features = [c for c in feature_cols]
-
-        for mod_name, mod_features in modality_features.items():
-            if any(f in agent_features for f in mod_features):
-                agent_modalities[agent_id] = [mod_name]
-                break
-        else:
-            agent_modalities[agent_id] = ['accelerometer']
-
-    return agent_modalities
+        agent_cols = datamodule.train_datasets[agent_id].feature_cols
+        counts: dict[str, int] = {}
+        for col in agent_cols:
+            t = col_to_type.get(col)
+            if t:
+                counts[t] = counts.get(t, 0) + 1
+        result[agent_id] = max(counts, key=counts.__getitem__) if counts else 'accelerometer'
+    return result
 
 
 @hydra.main(
@@ -90,8 +112,8 @@ def main(cfg: DictConfig) -> None:
     print(f'  feature_cols : {datamodule.feature_cols}')
     print(f'  input_shape  : {datamodule.input_shape}')
 
-    agent_modalities = _infer_agent_modalities(datamodule)
-    print(f'  agent_modalities: {agent_modalities}')
+    agent_classifier_types = _resolve_agent_classifier_types(datamodule)
+    print(f'  agent_classifier_types: {agent_classifier_types}')
 
     num_classes = datamodule.num_classes['label']
 
@@ -101,10 +123,9 @@ def main(cfg: DictConfig) -> None:
     output_dim = cfg.model.get('output_dim', 64)
     decoder_hidden_dims = cfg.model.get('decoder_hidden_dims', [256])
 
-    for agent_id, mod_list in agent_modalities.items():
-        primary_modality = mod_list[0]
-        cls = MODALITY_CLASSIFIER[primary_modality]
-        input_channels = MODALITY_CHANNELS[primary_modality]
+    for agent_id, classifier_type in agent_classifier_types.items():
+        cls = MODALITY_CLASSIFIER[classifier_type]
+        input_channels = MODALITY_CHANNELS[classifier_type]
 
         agent = cls(
             num_classes=num_classes,
@@ -115,7 +136,7 @@ def main(cfg: DictConfig) -> None:
         latent_dims[agent_id] = agent.encoder.output_dim
         print(
             f'[mhealth] Agent {agent_id}: '
-            f'modality={primary_modality} ({cls.__name__}), '
+            f'modality={classifier_type} ({cls.__name__}), '
             f'input_channels={input_channels}, '
             f'latent_dim={latent_dims[agent_id]}'
         )

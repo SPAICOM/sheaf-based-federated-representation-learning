@@ -118,6 +118,18 @@ MHEALTH_FEATURE_GROUPS: dict[str, list[str]] = {
     ],
 }
 
+# ── Per-sensor modality groupings (x,y,z axes treated as one 3-D modality) ───
+MHEALTH_SENSOR_MODALITIES: dict[str, list[str]] = {
+    'acc_chest': ['acc_chest_x', 'acc_chest_y', 'acc_chest_z'],
+    'ecg': ['ecg_lead1', 'ecg_lead2'],
+    'acc_ankle': ['acc_ankle_x', 'acc_ankle_y', 'acc_ankle_z'],
+    'gyro_ankle': ['gyro_ankle_x', 'gyro_ankle_y', 'gyro_ankle_z'],
+    'mag_ankle': ['mag_ankle_x', 'mag_ankle_y', 'mag_ankle_z'],
+    'acc_wrist': ['acc_wrist_x', 'acc_wrist_y', 'acc_wrist_z'],
+    'gyro_wrist': ['gyro_wrist_x', 'gyro_wrist_y', 'gyro_wrist_z'],
+    'mag_wrist': ['mag_wrist_x', 'mag_wrist_y', 'mag_wrist_z'],
+}
+
 _LABEL_COL = 'activity'
 
 
@@ -151,7 +163,7 @@ def _load_mhealth_df(
     def _load_single_file(
         fpath: Path, subject_id: int | None = None
     ) -> pd.DataFrame:
-        df = pd.read_csv(fpath)
+        df = pd.read_csv(fpath, sep='\t')
 
         if set(df.columns) == set(MHEALTH_KAGGLE_COLUMNS.keys()):
             df = df.rename(columns=MHEALTH_KAGGLE_COLUMNS)
@@ -397,6 +409,7 @@ class MHealthDataModule(l.LightningDataModule):
         n_agents: int | None = None,
         feature_cols: list[str] | None = None,
         feature_groups: list[str] | None = None,
+        agent_modalities: dict[int, str] | None = None,
         label_col: str = _LABEL_COL,
         exclude_null_activity: bool = True,
         window_size: int | None = None,
@@ -424,6 +437,7 @@ class MHealthDataModule(l.LightningDataModule):
         self.n_agents = n_agents
         self._feature_cols_param = feature_cols
         self.feature_groups = feature_groups
+        self.agent_modalities: dict[int, str] = agent_modalities or {}
         self.label_col = label_col
         self.exclude_null_activity = exclude_null_activity
         self.window_size = window_size
@@ -501,10 +515,12 @@ class MHealthDataModule(l.LightningDataModule):
         self,
         df: pd.DataFrame,
         sample_ids: list[int] | None = None,
+        feature_cols: list[str] | None = None,
     ) -> MHealthDataset:
-        available_cols = [c for c in self.feature_cols if c in df.columns]
-        if len(available_cols) < len(self.feature_cols):
-            missing = set(self.feature_cols) - set(available_cols)
+        cols = feature_cols if feature_cols is not None else self.feature_cols
+        available_cols = [c for c in cols if c in df.columns]
+        if len(available_cols) < len(cols):
+            missing = set(cols) - set(available_cols)
             print(
                 f'[setup] Note: {len(missing)} columns not available '
                 f'in dataset: {missing}'
@@ -529,7 +545,9 @@ class MHealthDataModule(l.LightningDataModule):
         self.pilot_datasets = {}
         for i in range(self.n_agents):
             self.pilot_datasets[i] = self._make_dataset(
-                pilot_df, sample_ids=pilot_indices
+                pilot_df,
+                sample_ids=pilot_indices,
+                feature_cols=self._agent_feature_cols.get(i),
             )
 
     # ── Split-strategy implementations ───────────────────────────────────────
@@ -556,7 +574,8 @@ class MHealthDataModule(l.LightningDataModule):
             chunks = idx.split(len(split_df) // self.n_agents)
             for i in range(self.n_agents):
                 target[i] = self._make_dataset(
-                    self._select(split_df, chunks[i].tolist())
+                    self._select(split_df, chunks[i].tolist()),
+                    feature_cols=self._agent_feature_cols.get(i),
                 )
 
     def _split_data_class_partition(
@@ -587,7 +606,8 @@ class MHealthDataModule(l.LightningDataModule):
                         f'agent {i} has no assigned classes in agent_classes'
                     )
                 target[i] = self._make_dataset(
-                    self._select(split_df, partition[i])
+                    self._select(split_df, partition[i]),
+                    feature_cols=self._agent_feature_cols.get(i),
                 )
 
     def _split_data_non_iid(
@@ -624,7 +644,8 @@ class MHealthDataModule(l.LightningDataModule):
                 )
             for i in range(self.n_agents):
                 target[i] = self._make_dataset(
-                    self._select(split_df, partition[i])
+                    self._select(split_df, partition[i]),
+                    feature_cols=self._agent_feature_cols.get(i),
                 )
 
     def _split_data_subject(self, df: pd.DataFrame) -> None:
@@ -650,14 +671,15 @@ class MHealthDataModule(l.LightningDataModule):
                 pilot_split=0.0,
                 pilot_num_samples=None,
             )
+            fcols = self._agent_feature_cols.get(i)
             self.train_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['train'])
+                self._select(subj_df, idxs['train']), feature_cols=fcols
             )
             self.val_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['val'])
+                self._select(subj_df, idxs['val']), feature_cols=fcols
             )
             self.test_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['test'])
+                self._select(subj_df, idxs['test']), feature_cols=fcols
             )
 
     # ── LightningDataModule interface ─────────────────────────────────────────
@@ -679,6 +701,36 @@ class MHealthDataModule(l.LightningDataModule):
         self.feature_cols: list[str] = _resolve_feature_cols(
             df, self._feature_cols_param, self.feature_groups
         )
+
+        # Remap labels to 0-indexed.  The raw MHEALTH labels are 1–12 (label 0
+        # is the null/transition activity that is excluded above).
+        # CrossEntropyLoss requires contiguous indices starting from 0, so a
+        # label of 12 with num_classes=12 would trigger an out-of-bounds CUDA
+        # assert without this remapping.
+        if self.label_col in df.columns:
+            min_label = df[self.label_col].min()
+            if min_label != 0:
+                df[self.label_col] = df[self.label_col] - min_label
+
+        # Build per-agent feature column mapping.
+        # When agent_modalities is set, each agent receives only the 3 (or 2
+        # for ECG) columns belonging to its assigned sensor modality, so that
+        # modality-specific encoders (MHealthAccelerometerEncoder, etc.) see
+        # the correct 3-D (or 2-D) input vectors instead of a flat concat of
+        # all sensor channels.
+        if self.agent_modalities:
+            for mod in self.agent_modalities.values():
+                if mod not in MHEALTH_SENSOR_MODALITIES:
+                    raise ValueError(
+                        f'Unknown modality "{mod}". '
+                        f'Valid options: {list(MHEALTH_SENSOR_MODALITIES)}'
+                    )
+            self._agent_feature_cols: dict[int, list[str] | None] = {
+                i: MHEALTH_SENSOR_MODALITIES[mod]
+                for i, mod in self.agent_modalities.items()
+            }
+        else:
+            self._agent_feature_cols = {}
 
         self.train_datasets: dict[int, MHealthDataset] = {}
         self.val_datasets: dict[int, MHealthDataset] = {}
@@ -762,14 +814,26 @@ class MHealthDataModule(l.LightningDataModule):
         # Global label space (used by classifier heads)
         self.num_classes['label'] = len(df[self.label_col].unique())
 
-        # Infer input shape from first sample
+        # Infer input shape from first sample of agent 0
         sample_x, *_ = self.train_datasets[0][0]
         self.input_shape: tuple[int, ...] = tuple(sample_x.shape)
 
         self.models: list[int] = list(range(self.n_agents))
-        # Last dim is always the raw feature count (works for 1-D and 2-D)
-        n_feat = self.input_shape[-1]
-        self.input_dims: dict[str, int] = {str(i): n_feat for i in self.models}
+
+        # input_dims: per-agent last feature dimension.
+        # When agent_modalities is set, each agent's dimension equals the
+        # number of channels in its sensor modality (3 for acc/gyro/mag,
+        # 2 for ECG) so that modality-specific encoders receive the correct
+        # input size.
+        if self.agent_modalities:
+            self.input_dims: dict[str, int] = {
+                str(i): len(MHEALTH_SENSOR_MODALITIES[self.agent_modalities[i]])
+                for i in self.models
+                if i in self.agent_modalities
+            }
+        else:
+            n_feat = self.input_shape[-1]
+            self.input_dims = {str(i): n_feat for i in self.models}
 
     # ── DataLoader factories ──────────────────────────────────────────────────
 
@@ -795,52 +859,53 @@ class MHealthDataModule(l.LightningDataModule):
             num_workers=self.num_workers,
         )
 
-    def _build_combined_loader(
-        self,
-        datasets: dict[int, MHealthDataset],
-        shuffle: bool,
-    ) -> CombinedLoader:
+    def _create_loaders(self, split: str) -> CombinedLoader:
+        split_map: dict[str, tuple[dict[int, MHealthDataset], bool]] = {
+            'train': (self.train_datasets, True),
+            'val': (self.val_datasets, False),
+            'test': (self.test_datasets, False),
+        }
+        if split not in split_map:
+            raise ValueError(
+                f'Unknown split {split!r}. Valid options: {list(split_map)}'
+            )
+        datasets, shuffle = split_map[split]
         loaders: dict = {
             i: self._make_loader(ds, shuffle) for i, ds in datasets.items()
         }
+
         if self.pilot_datasets:
             target_num_batches = max(
                 (len(ds) + self.batch_size - 1) // self.batch_size
                 for ds in datasets.values()
             )
-
             if self.comm_data == 'private_pilots':
-                loaders.update(
-                    {
-                        f'pilot_{i}': self._make_pilot_loader(
-                            ds, target_num_batches
-                        )
-                        for i, ds in self.pilot_datasets.items()
-                    }
-                )
+                loaders.update({
+                    f'pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
+                    for i, ds in self.pilot_datasets.items()
+                })
             elif self.comm_data == 'shared_global_pilots':
-                shared_ds = self.pilot_datasets[0]
-                loaders['global_pilot'] = self._make_pilot_loader(
-                    shared_ds, target_num_batches
-                )
+                loaders.update({
+                    f'global_pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
+                    for i, ds in self.pilot_datasets.items()
+                })
             elif self.comm_data == 'pairwise_pilots':
-                for i in range(self.n_agents):
-                    for j in range(i + 1, self.n_agents):
-                        pairwise_ds = PairwiseDataset(
-                            self.pilot_datasets[i],
-                            self.pilot_datasets[j],
-                        )
-                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
-                            pairwise_ds, target_num_batches
-                        )
+                loaders.update({
+                    f'pilot_{i}_{j}': self._make_pilot_loader(
+                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
+                        target_num_batches,
+                    )
+                    for i in range(self.n_agents)
+                    for j in range(i + 1, self.n_agents)
+                })
 
         return CombinedLoader(loaders, mode=self.mode)
 
     def train_dataloader(self) -> CombinedLoader:
-        return self._build_combined_loader(self.train_datasets, shuffle=True)
+        return self._create_loaders('train')
 
     def val_dataloader(self) -> CombinedLoader:
-        return self._build_combined_loader(self.val_datasets, shuffle=False)
+        return self._create_loaders('val')
 
     def test_dataloader(self) -> CombinedLoader:
-        return self._build_combined_loader(self.test_datasets, shuffle=False)
+        return self._create_loaders('test')

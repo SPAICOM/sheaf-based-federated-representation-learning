@@ -812,83 +812,53 @@ class ClassificationDataModule(l.LightningDataModule):
             collate_fn=_collate_fn,
         )
 
-    def train_dataloader(self) -> CombinedLoader:
-        loaders = {
-            i: self._make_loader(self.train_datasets[i], True)
-            for i in self.train_datasets
+    def _create_loaders(self, split: str) -> CombinedLoader:
+        split_map: dict[str, tuple[dict, bool]] = {
+            'train': (self.train_datasets, True),
+            'val': (self.val_datasets, False),
+            'test': (self.test_datasets, False),
         }
-        #if self.include_pilot_loaders and self.pilot_datasets:
-        if self.pilot_datasets:
-            target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.train_datasets.values()
+        if split not in split_map:
+            raise ValueError(
+                f'Unknown split {split!r}. Valid options: {list(split_map)}'
             )
-            self._add_pilot_loaders(loaders, target_num_batches)
-        return CombinedLoader(loaders, mode=self.mode)
+        datasets, shuffle = split_map[split]
+        loaders: dict = {i: self._make_loader(ds, shuffle) for i, ds in datasets.items()}
 
-    def val_dataloader(self) -> CombinedLoader | list[CombinedLoader]:
-        loaders = {
-            i: self._make_loader(self.val_datasets[i], False)
-            for i in self.val_datasets
-        }
         if self.pilot_datasets:
             target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.val_datasets.values()
+                (len(ds) + self.batch_size - 1) // self.batch_size
+                for ds in datasets.values()
             )
-            loaders.update(
-                {
-                    f'pilot_{i}': self._make_pilot_loader(
-                        self.pilot_datasets[i],
+            if self.comm_data == 'private_pilots':
+                loaders.update({
+                    f'pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
+                    for i, ds in self.pilot_datasets.items()
+                })
+            elif self.comm_data == 'shared_global_pilots':
+                loaders['global_pilot'] = self._make_pilot_loader(
+                    self.pilot_datasets[0], target_num_batches
+                )
+            elif self.comm_data == 'pairwise_pilots':
+                loaders.update({
+                    f'pilot_{i}_{j}': self._make_pilot_loader(
+                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
                         target_num_batches,
                     )
-                    for i in self.pilot_datasets
-                }
-            )
-        val_loader = CombinedLoader(loaders, mode=self.mode)
+                    for i in range(self.n_agents)
+                    for j in range(i + 1, self.n_agents)
+                })
+
+        return CombinedLoader(loaders, mode=self.mode)
+
+    def train_dataloader(self) -> CombinedLoader:
+        return self._create_loaders('train')
+
+    def val_dataloader(self) -> CombinedLoader | list[CombinedLoader]:
+        val_loader = self._create_loaders('val')
         if not self.monitor_test_during_fit:
             return val_loader
         return [val_loader, self.test_dataloader()]
 
     def test_dataloader(self) -> CombinedLoader:
-        loaders = {
-            i: self._make_loader(self.test_datasets[i], False)
-            for i in self.test_datasets
-        }
-        #if self.include_pilot_loaders and self.pilot_datasets:
-        if self.pilot_datasets:
-            target_num_batches = max(
-                (len(dataset) + self.batch_size - 1) // self.batch_size
-                for dataset in self.test_datasets.values()
-            )
-            self._add_pilot_loaders(loaders, target_num_batches)
-        return CombinedLoader(loaders, mode=self.mode)
-
-    def _add_pilot_loaders(
-        self, loaders: dict, target_num_batches: int
-    ) -> None:
-        if self.comm_data == 'private_pilots':
-            loaders.update(
-                {
-                    f'pilot_{i}': self._make_pilot_loader(
-                        self.pilot_datasets[i],
-                        target_num_batches,
-                    )
-                    for i in self.pilot_datasets
-                }
-            )
-        elif self.comm_data == 'shared_global_pilots':
-            loaders['global_pilot'] = self._make_pilot_loader(
-                self.pilot_datasets[0],
-                target_num_batches,
-            )
-        elif self.comm_data == 'pairwise_pilots':
-            for i in range(self.n_agents):
-                for j in range(i + 1, self.n_agents):
-                    pairwise_ds = PairwiseDataset(
-                        self.pilot_datasets[i],
-                        self.pilot_datasets[j],
-                    )
-                    loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
-                        pairwise_ds, target_num_batches
-                    )
+        return self._create_loaders('test')

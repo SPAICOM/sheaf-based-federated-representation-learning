@@ -14,8 +14,23 @@ Modalities
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .utils import BaseEncoder
+
+
+class _SafeMaxPool1d(nn.Module):
+    """MaxPool1d(2) that skips pooling when the sequence length is already 1.
+
+    Prevents the ``output size = 0`` error that would occur when point-wise
+    data is fed as a length-1 sequence.  For longer sequences the behaviour is
+    identical to ``nn.MaxPool1d(kernel_size=2)``.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) <= 1:
+            return x
+        return F.max_pool1d(x, kernel_size=2)
 
 
 class MHealthSensorEncoder(BaseEncoder):
@@ -55,7 +70,7 @@ class MHealthSensorEncoder(BaseEncoder):
                     nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
                     nn.BatchNorm1d(out_ch),
                     nn.ReLU(),
-                    nn.MaxPool1d(2),
+                    _SafeMaxPool1d(),
                 ]
             )
             in_ch = out_ch
@@ -77,7 +92,7 @@ class MHealthSensorEncoder(BaseEncoder):
         Output: (B, output_dim)
         """
         if x.ndim == 2:
-            x = x.unsqueeze(-1).repeat(1, 1, 1)
+            x = x.unsqueeze(-1)  # (B, C) → (B, C, 1)
         elif x.ndim == 3:
             x = x.transpose(1, 2)
 

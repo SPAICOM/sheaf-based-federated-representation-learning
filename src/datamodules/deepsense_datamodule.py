@@ -724,116 +724,53 @@ class DeepSenseDataModule(l.LightningDataModule):
             num_workers=self.num_workers,
         )
 
-    def _create_loaders(self, shuffle: bool) -> dict:
-        loaders = {}
-        for agent_id in range(self.n_agents):
-            loaders[agent_id] = self._make_loader(
-                self.train_datasets[agent_id], shuffle
+    def _create_loaders(self, split: str) -> CombinedLoader:
+        split_map: dict[str, tuple[dict, bool]] = {
+            'train': (self.train_datasets, True),
+            'val': (self.val_datasets, False),
+            'test': (self.test_datasets, False),
+        }
+        if split not in split_map:
+            raise ValueError(
+                f'Unknown split {split!r}. Valid options: {list(split_map)}'
             )
+        datasets, shuffle = split_map[split]
+        loaders: dict = {
+            i: self._make_loader(ds, shuffle) for i, ds in datasets.items()
+        }
 
         if self.pilot_datasets:
             target_batches = max(
-                (len(datasets) + self.batch_size - 1) // self.batch_size
-                for datasets in self.pilot_datasets.values()
+                (len(ds) + self.batch_size - 1) // self.batch_size
+                for ds in self.pilot_datasets.values()
             )
-
             if self.comm_data == 'private_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
-                        self.pilot_datasets[agent_id],
+                loaders.update({
+                    f'pilot_{i}': self._make_pilot_loader(ds, target_batches)
+                    for i, ds in self.pilot_datasets.items()
+                })
+            elif self.comm_data == 'shared_global_pilots':
+                loaders.update({
+                    f'global_pilot_{i}': self._make_pilot_loader(ds, target_batches)
+                    for i, ds in self.pilot_datasets.items()
+                })
+            elif self.comm_data == 'pairwise_pilots':
+                loaders.update({
+                    f'pilot_{i}_{j}': self._make_pilot_loader(
+                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
                         target_batches,
                     )
-            elif self.comm_data == 'shared_global_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'global_pilot_{agent_id}'] = (
-                        self._make_pilot_loader(
-                            self.pilot_datasets[agent_id],
-                            target_batches,
-                        )
-                    )
-            elif self.comm_data == 'pairwise_pilots':
-                for i in range(self.n_agents):
-                    for j in range(i + 1, self.n_agents):
-                        pairwise_ds = PairwiseDataset(
-                            self.pilot_datasets[i],
-                            self.pilot_datasets[j],
-                        )
-                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
-                            pairwise_ds,
-                            target_batches,
-                        )
+                    for i in range(self.n_agents)
+                    for j in range(i + 1, self.n_agents)
+                })
 
-        return loaders
+        return CombinedLoader(loaders, mode=self.mode)
 
     def train_dataloader(self) -> CombinedLoader:
-        return CombinedLoader(
-            self._create_loaders(shuffle=True), mode=self.mode
-        )
+        return self._create_loaders('train')
 
     def val_dataloader(self) -> CombinedLoader:
-        loaders = {}
-        for agent_id in range(self.n_agents):
-            loaders[agent_id] = self._make_loader(
-                self.val_datasets[agent_id], shuffle=False
-            )
-
-        if self.pilot_datasets:
-            target_batches = max(
-                (len(datasets) + self.batch_size - 1) // self.batch_size
-                for datasets in self.pilot_datasets.values()
-            )
-            if self.comm_data == 'private_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
-                        self.pilot_datasets[agent_id], target_batches
-                    )
-            elif self.comm_data == 'shared_global_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'global_pilot_{agent_id}'] = self._make_pilot_loader(
-                        self.pilot_datasets[agent_id], target_batches
-                    )
-            elif self.comm_data == 'pairwise_pilots':
-                for i in range(self.n_agents):
-                    for j in range(i + 1, self.n_agents):
-                        pairwise_ds = PairwiseDataset(
-                            self.pilot_datasets[i], self.pilot_datasets[j]
-                        )
-                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
-                            pairwise_ds, target_batches
-                        )
-
-        return CombinedLoader(loaders, mode=self.mode)
+        return self._create_loaders('val')
 
     def test_dataloader(self) -> CombinedLoader:
-        loaders = {}
-        for agent_id in range(self.n_agents):
-            loaders[agent_id] = self._make_loader(
-                self.test_datasets[agent_id], shuffle=False
-            )
-
-        if self.pilot_datasets:
-            target_batches = max(
-                (len(datasets) + self.batch_size - 1) // self.batch_size
-                for datasets in self.pilot_datasets.values()
-            )
-            if self.comm_data == 'private_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'pilot_{agent_id}'] = self._make_pilot_loader(
-                        self.pilot_datasets[agent_id], target_batches
-                    )
-            elif self.comm_data == 'shared_global_pilots':
-                for agent_id in self.pilot_datasets:
-                    loaders[f'global_pilot_{agent_id}'] = self._make_pilot_loader(
-                        self.pilot_datasets[agent_id], target_batches
-                    )
-            elif self.comm_data == 'pairwise_pilots':
-                for i in range(self.n_agents):
-                    for j in range(i + 1, self.n_agents):
-                        pairwise_ds = PairwiseDataset(
-                            self.pilot_datasets[i], self.pilot_datasets[j]
-                        )
-                        loaders[f'pilot_{i}_{j}'] = self._make_pilot_loader(
-                            pairwise_ds, target_batches
-                        )
-
-        return CombinedLoader(loaders, mode=self.mode)
+        return self._create_loaders('test')

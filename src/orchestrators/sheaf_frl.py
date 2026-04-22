@@ -31,7 +31,7 @@ class SheafFRL(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
-        lambda_sheaf: float,
+        max_lmb: float,
         latent_dims: dict,
         parseval_normalization: bool,
         l2_normalization: bool,
@@ -40,6 +40,7 @@ class SheafFRL(BaseOrchestrator):
         anchor_strategy: str = 'pilots',
         filter_unseen_classes: bool = True,
         use_prototypes: bool = False,
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -375,7 +376,7 @@ class SheafFRL(BaseOrchestrator):
             diff = A_i_shared - torch.matmul(A_j_shared, V.T)
             sheaf_penalty += (diff**2).sum(dim=1).mean()
 
-        total_loss = total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
+        total_loss = total_task_loss + self._effective_lambda_reg() * sheaf_penalty
 
         self._log_shared_metrics(
             prefix=prefix,

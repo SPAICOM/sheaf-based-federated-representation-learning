@@ -38,8 +38,10 @@ class FedProto(BaseOrchestrator):
         Dictionary mapping each agent index to the set of its neighbor indices.
     optimizer : hydra config
         Optimizer configuration for training.
-    lambda_proto : float, optional
-        Weight coefficient for the prototype regularization loss (default: 0.1).
+    max_lmb : float, optional
+        Maximum weight coefficient for the prototype regularization loss (default: 0.1).
+    lambda_schedule : str or None, optional
+        Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     prototype_momentum : float, optional
         Momentum for updating global prototypes (default: 0.9).
 
@@ -56,8 +58,9 @@ class FedProto(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer: Any,
-        lambda_proto: float = 0.1,
+        max_lmb: float = 0.1,
         prototype_momentum: float = 0.9,
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -301,7 +304,7 @@ class FedProto(BaseOrchestrator):
                     ).mean()
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
-        total_loss = total_task_loss + self.hparams.lambda_proto * proto_loss
+        total_loss = total_task_loss + self._effective_lambda_reg() * proto_loss
 
         self._log_shared_metrics(
             prefix=prefix,
