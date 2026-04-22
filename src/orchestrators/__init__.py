@@ -25,7 +25,9 @@ from .dfedu import DFedU
 from .dpsgd import DPSGD
 from .epochend_dpsgd import EpochEndDPSGD
 from .federated import FederatedLearning
+from .fedmuscle import FedMuscle
 from .fedper import FedPer
+from .fedproto import FedProto
 from .heterofl import HeteroFL
 from .non_cooperative import NonCooperativeLearning
 from .sheaf_fmtl import SheafFMTL

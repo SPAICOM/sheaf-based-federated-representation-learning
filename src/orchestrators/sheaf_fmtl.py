@@ -25,7 +25,7 @@ Implementation Details:
     - After the epoch-end parameter update, the orchestrator recomputes the
       projected edge vectors using the updated theta_i values
     - Each restriction map is then updated manually as
-     P_ij <- P_ij - eta * lambda_reg * (P_ij * theta_i - P_ji * theta_j) * theta_i^T
+     P_ij <- P_ij - eta * lambda * (P_ij * theta_i - P_ji * theta_j) * theta_i^T
     - One epoch-end synchronization therefore incurs two projected-vector
       exchange rounds: one before the agent update and one before the
       restriction-map update
@@ -54,8 +54,10 @@ class SheafFMTL(BaseOrchestrator):
         Optimizer configuration for training.
     gamma : float
         Ratio for determining the projection dimension (d_ij).
-    lambda_reg : float
-        Regularization strength for the Sheaf Laplacian penalty.
+    max_lmb : float
+        Maximum regularization coefficient for the Sheaf Laplacian penalty.
+    lambda_schedule : str or None
+        Scheduling strategy for lambda: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     eta : float
         Learning rate for the manual P_ij matrix update step.
     """
@@ -66,8 +68,9 @@ class SheafFMTL(BaseOrchestrator):
         neighbors: dict[int, set[int]],
         optimizer: Any,
         gamma: float = 0.01,
-        lambda_reg: float = 0.001,
+        max_lmb: float = 0.001,
         eta: float = 0.01,
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -126,7 +129,7 @@ class SheafFMTL(BaseOrchestrator):
                     diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
                         f'{j}_{i}'
                     ]
-                    sheaf_penalty_i += self.hparams.lambda_reg * torch.matmul(
+                    sheaf_penalty_i += self._effective_lambda_reg() * torch.matmul(
                         P_ij.t(), diff_ij
                     )
 
@@ -161,7 +164,7 @@ class SheafFMTL(BaseOrchestrator):
                 )
                 projection_updates[edge_key] = (
                     self.hparams.eta
-                    * self.hparams.lambda_reg
+                    * self._effective_lambda_reg()
                     * torch.outer(diff, theta_i)
                 )
 
@@ -260,7 +263,7 @@ class SheafFMTL(BaseOrchestrator):
     #                 ]
     #
     #                 # grad_contribution = lambda * P_ij^T * diff_ij
-    #                 grad_penalty_i += self.hparams.lambda_reg * torch.matmul(
+    #                 grad_penalty_i += self._effective_lambda_reg() * torch.matmul(
     #                     P_ij.t(), diff_ij
     #                 )
     #
@@ -309,7 +312,7 @@ class SheafFMTL(BaseOrchestrator):
     #             # update: outer product diff * theta_i^T (shape: d_ij x d_i)
     #             grad_P_ij = torch.outer(diff, theta_i)
     #             updates[edge_key] = (
-    #                 self.hparams.eta * self.hparams.lambda_reg * grad_P_ij
+    #                 self.hparams.eta * self._effective_lambda_reg() * grad_P_ij
     #             )
     #
     #         # Apply updates

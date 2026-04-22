@@ -29,8 +29,19 @@ from .deepsense_encoders import (
     DeepSenseRGBEncoder,
 )
 from .fmtl_classifier import FMTLCNNClassifier
-from .fmtl_classifier import FMTLCNNClassifier
 from .latent_classifier import LatentClassifier
+from .mhealth_classifiers import (
+    MHealthAccelerometerClassifier,
+    MHealthECGClassifier,
+    MHealthGyroscopeClassifier,
+    MHealthMagnetometerClassifier,
+)
+from .mhealth_encoders import (
+    MHealthAccelerometerEncoder,
+    MHealthECGEncoder,
+    MHealthGyroscopeEncoder,
+    MHealthMagnetometerEncoder,
+)
 from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
 from .utils import CNN, MLP, BaseEncoder, TimmEncoder
@@ -47,8 +58,15 @@ __all__ = [
     'DeepSenseRGBClassifier',
     'DeepSenseRGBEncoder',
     'FMTLCNNClassifier',
-    'FMTLCNNClassifier',
     'LatentClassifier',
+    'MHealthAccelerometerClassifier',
+    'MHealthAccelerometerEncoder',
+    'MHealthECGClassifier',
+    'MHealthECGEncoder',
+    'MHealthGyroscopeClassifier',
+    'MHealthGyroscopeEncoder',
+    'MHealthMagnetometerClassifier',
+    'MHealthMagnetometerEncoder',
     'MLP',
     'PersonalizedClassifier',
     'TimmClassifier',

@@ -30,7 +30,7 @@ class SheafFRL(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
-        lambda_sheaf: float,
+        max_lmb: float,
         latent_dims: dict,
         parseval_normalization: bool,
         l2_normalization: bool,
@@ -39,6 +39,7 @@ class SheafFRL(BaseOrchestrator):
         anchor_strategy: str = 'pilots',
         num_anchors: int = 64,
         use_prototypes: bool = False,
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -99,6 +100,12 @@ class SheafFRL(BaseOrchestrator):
             return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
         if 'global_pilot' in batch:
             return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
+        """Extract pilot data for an agent, handling global, private, or pairwise keys."""
+        if f'global_pilot_{idx}' in batch:
+            return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
+            
+        if f'pilot_{idx}' in batch:
+            return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
             
         for key, value in batch.items():
             if isinstance(key, str) and key.startswith('pilot_'):
@@ -342,7 +349,16 @@ class SheafFRL(BaseOrchestrator):
                 prog_bar=False,
                 per_agent_loss_name='task_loss',
             )
-            return outputs, total_task_loss
+            return outputs, total_loss
+
+        # Pilot batch
+        for idx_str, agent in self.agents.items():
+            idx = int(idx_str)
+            x_pilot, y_pilot, _ = self._extract_pilot_batch(batch, idx)
+
+            raw_latents = agent.encode(x_pilot)
+            latents_per_agent[idx] = normalize_anchor_matrix(raw_latents, self.anchor_config)
+            labels_per_agent[idx] = y_pilot
 
         # Communication Payload
         if prefix in {'train', 'test', 'test_monitor'}:
@@ -381,7 +397,7 @@ class SheafFRL(BaseOrchestrator):
             
             sheaf_penalty += (diff**2).sum(dim=1).mean()
 
-        total_loss = total_task_loss + self.hparams.lambda_sheaf * sheaf_penalty
+        total_loss = total_task_loss + self._effective_lambda_reg() * sheaf_penalty
 
         self._log_shared_metrics(
             prefix=prefix,

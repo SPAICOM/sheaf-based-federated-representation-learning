@@ -6,6 +6,7 @@ across multiple agents in a federated learning setting. Subclasses must
 implement epoch-end aggregation logic and evaluation procedures.
 """
 
+import math
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -98,6 +99,44 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._communication_by_split[prefix] = (
             self._empty_communication_state()
         )
+
+    def _effective_lambda_reg(self) -> float:
+        """Return the current regularization coefficient, applying schedule if configured.
+
+        Reads ``max_lmb`` and ``lambda_schedule`` from hparams. When
+        ``lambda_schedule`` is ``null``/``None`` the coefficient is constant at
+        ``max_lmb``. Otherwise it is warmed up from 0 to ``max_lmb`` over the
+        full training run:
+
+        - ``cosine``: λ(t) = max_lmb · (1 − cos(π·t)) / 2
+        - ``exp``:    λ(t) = max_lmb · (1 − exp(−5·t))
+
+        where t = current_epoch / (max_epochs − 1) ∈ [0, 1].
+        """
+        max_lmb = float(self.hparams.max_lmb)
+        schedule = getattr(self.hparams, 'lambda_schedule', None)
+
+        if not schedule:
+            return max_lmb
+
+        trainer = getattr(self, '_trainer', None)
+        max_epochs = (
+            int(trainer.max_epochs)
+            if trainer is not None and trainer.max_epochs
+            else 1
+        )
+        t = float(self.current_epoch) / max(max_epochs - 1, 1)
+        t = min(max(t, 0.0), 1.0)
+
+        if schedule == 'cosine':
+            return max_lmb * (1.0 - math.cos(math.pi * t)) / 2.0
+        elif schedule == 'exp':
+            return max_lmb * (1.0 - math.exp(-5.0 * t))
+        else:
+            raise ValueError(
+                f"Unknown lambda_schedule '{schedule}'. "
+                "Valid options: [null, 'cosine', 'exp']"
+            )
 
     def _metric_tensor(self, value: Any) -> torch.Tensor:
         """Ensure a metric value is a scalar tensor on the module device.
@@ -197,6 +236,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def _finalize_train_epoch_communication(self) -> None:
         """Log cumulative train communication metrics once per epoch."""
         communication_logs = self._communication_metrics('train')
+        if hasattr(self.hparams, 'max_lmb'):
+            communication_logs['train/lambda_reg'] = self._effective_lambda_reg()
         self.log_dict(
             communication_logs,
             on_step=False,

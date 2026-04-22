@@ -7,21 +7,36 @@ split_strategy: subject
 n_agents: null
 
 feature_groups:
-  - chest
   - left_ankle
   - right_wrist
+
+# Each agent is assigned a single 3-D sensor modality so that the
+# modality-specific encoders receive a (B, 3) input vector instead of the
+# full flat feature vector.  Cycles acc → gyro → mag across body positions
+# for 10 subjects.
+agent_modalities:
+  0: acc_ankle
+  1: gyro_ankle
+  2: mag_ankle
+  3: acc_wrist
+  4: gyro_wrist
+  5: mag_wrist
+  6: acc_ankle
+  7: gyro_ankle
+  8: mag_ankle
+  9: acc_wrist
 
 exclude_null_activity: true
 window_size: null
 stride: 1
 
 batch_size: 64
-num_workers: 4
+num_workers: 0
 mode: min_size
 
 val_split: 0.1
 test_split: 0.1
-pilot_split: 0.0
+pilot_split: 0.1
 pilot_num_samples: null
-comm_data: private_pilots
+comm_data: shared_global_pilots
 seed: 42

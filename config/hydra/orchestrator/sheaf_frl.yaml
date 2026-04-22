@@ -1,6 +1,7 @@
 _target_: src.orchestrators.SheafFRL
 
-lambda_sheaf: 0.01
+max_lmb: 0.01
+lambda_schedule: cosine
 anchor_strategy: pilots
 parseval_normalization: False
 l2_normalization: False

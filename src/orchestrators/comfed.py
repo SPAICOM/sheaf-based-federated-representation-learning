@@ -38,8 +38,10 @@ class ComFed(BaseOrchestrator):
         Dictionary mapping each agent index to the set of its neighbor indices.
     optimizer : hydra config
         Optimizer configuration for training.
-    lambda_comfed : float
-        Weight coefficient for the alignment penalty in the total loss.
+    max_lmb : float
+        Maximum weight coefficient for the alignment penalty in the total loss.
+    lambda_schedule : str or None
+        Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     latent_dims : dict
         Dictionary mapping agent indices to their latent space dimensions.
 
@@ -59,8 +61,9 @@ class ComFed(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
-        lambda_comfed: float,
+        max_lmb: float,
         latent_dims: dict,
+        lambda_schedule: str | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -101,8 +104,9 @@ class ComFed(BaseOrchestrator):
                     )
 
     def on_train_epoch_end(self) -> None:
-        """No-op: projection matrices are updated via autodiff each step."""
-        pass
+        """Flush accumulated communication metrics; no parameter aggregation needed."""
+        self._record_communication_round(prefix='train')
+        self._finalize_train_epoch_communication()
 
     def _compute_class_means(
         self,
@@ -248,7 +252,7 @@ class ComFed(BaseOrchestrator):
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
         total_loss = (
-            total_task_loss + self.hparams.lambda_comfed * alignment_penalty
+            total_task_loss + self._effective_lambda_reg() * alignment_penalty
         )
 
         self._log_shared_metrics(

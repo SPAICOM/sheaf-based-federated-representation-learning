@@ -13,7 +13,7 @@ hydra:
       _target_: optuna.samplers.TPESampler
       seed: ${seed}
     params:
-      orchestrator.lambda_sheaf: choice( 1e-2, 5e-2, 1e-1, 5e-1, 1e0, 5e0)
+      orchestrator.max_lmb: choice( 1e-2, 5e-2, 1e-1, 5e-1, 1e0, 5e0)
       #orchestrator.anchor_strategy: choice(prototype, semantic_pilots, clustering, dynamic)
       #orchestrator.num_anchors: choice(16, 32, 64, 128)
       orchestrator.parseval_normalization: choice(false, true)
