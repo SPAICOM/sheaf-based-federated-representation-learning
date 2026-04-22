@@ -6,14 +6,14 @@ hydra:
   mode: MULTIRUN
   sweeper:
     direction: maximize
-    study_name: ${study_name}_DFedU
+    study_name: ${study_name}_SheafFRLBatchAnchors
     n_trials: 20
     n_jobs: 1
     sampler:
       _target_: optuna.samplers.TPESampler
       seed: ${seed}
     params:
-      orchestrator.eta: choice(1e-3, 5e-3, 1e-2, 5e-2, 1e-1)
+      orchestrator.lambda_sheaf: choice(1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2)
       optimizer.lr: tag(log, interval(5e-4, 5e-2))
       optimizer.weight_decay: choice(0.0, 1e-5, 1e-4, 1e-3)
       optimizer.momentum: choice(0.85, 0.9, 0.95)
@@ -31,10 +31,18 @@ callbacks:
     save_last: false
 
 model:
-  use_batchnorm: false
+  use_batchnorm: true
+
+orchestrator:
+  anchor_strategy: batch_anchors
+  local_steps: 1
+  parseval_normalization: false
+  l2_normalization: false
+  use_prototypes: true
 
 dataset:
   split_strategy: non_iid_with_margin
+  n_agents: 30
   classes_per_agent: 5
   alpha: -1
   starve_clients: false

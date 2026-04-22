@@ -11,6 +11,7 @@ dependencies = [
     "hydra-optuna-sweeper==1.2.0",
     "kaggle>=2.0.1",
     "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
     "optuna>=2.10.0,<3.0.0",
     "python-dotenv>=1.0.0",
     "scipy>=1.10.0",

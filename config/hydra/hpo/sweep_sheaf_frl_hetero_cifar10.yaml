@@ -44,9 +44,10 @@ orchestrator:
 dataset:
   split_strategy: non_iid_with_margin
   n_agents: 30
-  classes_per_agent: 10
+  classes_per_agent: 5
   alpha: -1
   starve_clients: false
+  pilot_split: 0.05
 
 optimization:
   run_test: false
