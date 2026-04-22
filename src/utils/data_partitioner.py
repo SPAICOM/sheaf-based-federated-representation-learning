@@ -10,9 +10,6 @@ assigned exactly once and that every agent receives at least one sample.
 from collections import defaultdict
 
 import torch
-import random
-import numpy as np
-import torch
 
 
 def build_shared_class_partition(
@@ -611,7 +608,7 @@ def partition_non_iid_with_margin(
         agent_id: [] for agent_id in range(n_agents)
     }
 
-    # Index the global data once, class by class, using shuffled global row ids.
+    # Index the global data once, class by class, using shuffled row ids.
     for class_label in unique_classes:
         class_indices = torch.where(labels_tensor == int(class_label))[0]
         shuffled_indices = class_indices[
@@ -659,6 +656,299 @@ def partition_non_iid_with_margin(
             skewed_indices = remaining_indices[offset : offset + count]
             agent_indices[agent_id].extend(skewed_indices)
             offset += count
+
+    for agent_id in range(n_agents):
+        agent_indices[agent_id].sort()
+
+    if return_agent_classes:
+        return agent_indices, resolved_agent_classes
+    return agent_indices
+
+
+def _sample_counts_from_proportions(
+    proportions: torch.Tensor,
+    total: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Sample integer counts that sum to ``total``."""
+    if total < 0:
+        raise ValueError('total must be non-negative')
+    if total == 0:
+        return torch.zeros(len(proportions), dtype=torch.long)
+
+    normalized = proportions.to(torch.float32)
+    normalized_sum = normalized.sum()
+    if normalized_sum <= 0:
+        normalized = torch.full(
+            (len(proportions),),
+            1 / len(proportions),
+            dtype=torch.float32,
+        )
+    else:
+        normalized = normalized / normalized_sum
+
+    draws = torch.multinomial(
+        normalized,
+        num_samples=total,
+        replacement=True,
+        generator=generator,
+    )
+    return torch.bincount(draws, minlength=len(proportions)).to(torch.long)
+
+
+def partition_non_iid_fair(
+    labels: list[int],
+    n_agents: int,
+    classes_per_agent: int,
+    seed: int = 42,
+    alpha: float = 0.5,
+    agent_classes: dict[int, list[int]] | None = None,
+    return_agent_classes: bool = False,
+    safety_margin: int = 10,
+) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Partition non-IID data with equal volume and per-agent class skew.
+
+    Every agent receives exactly ``N / n_agents`` samples. Unlike
+    ``partition_non_iid_with_margin``, skew is sampled per agent: each agent
+    draws one normalized vector over its assigned classes, and that vector is
+    used to fill the agent's fixed sample quota.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if classes_per_agent < 1:
+        raise ValueError('classes_per_agent must be at least 1')
+    if safety_margin < 0:
+        raise ValueError('safety_margin must be non-negative')
+    if alpha == 0:
+        raise ValueError('alpha must be non-zero')
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    total_samples = int(labels_tensor.numel())
+    if total_samples == 0:
+        empty_partition = {agent_id: [] for agent_id in range(n_agents)}
+        if return_agent_classes:
+            resolved_classes = agent_classes or {
+                agent_id: [] for agent_id in range(n_agents)
+            }
+            return empty_partition, resolved_classes
+        return empty_partition
+
+    if total_samples % n_agents != 0:
+        raise ValueError(
+            'partition_non_iid_fair requires the number of samples to be '
+            f'divisible by n_agents so every agent can receive exactly N/n; '
+            f'got N={total_samples}, n_agents={n_agents}.'
+        )
+
+    samples_per_agent = total_samples // n_agents
+    unique_classes = sorted(torch.unique(labels_tensor).tolist())
+    unique_class_set = set(unique_classes)
+    class_to_position = {
+        int(class_label): position
+        for position, class_label in enumerate(unique_classes)
+    }
+    class_counts = torch.tensor(
+        [
+            int(torch.sum(labels_tensor == int(class_label)).item())
+            for class_label in unique_classes
+        ],
+        dtype=torch.long,
+    )
+    generator = torch.Generator().manual_seed(seed)
+
+    if agent_classes is None:
+        resolved_agent_classes = _sample_exact_k_class_assignments(
+            unique_classes=unique_classes,
+            n_agents=n_agents,
+            classes_per_agent=classes_per_agent,
+            generator=generator,
+        )
+    else:
+        resolved_agent_classes = {}
+        for agent_id in range(n_agents):
+            assigned_classes = sorted(set(agent_classes.get(agent_id, [])))
+            if len(assigned_classes) != classes_per_agent:
+                raise ValueError(
+                    f'agent {agent_id} must have exactly '
+                    f'{classes_per_agent} classes, got '
+                    f'{len(assigned_classes)}'
+                )
+            unknown_classes = set(assigned_classes) - unique_class_set
+            if unknown_classes:
+                raise ValueError(
+                    f'agent {agent_id} was assigned classes not present in '
+                    f'the dataset split: {sorted(unknown_classes)}'
+                )
+            resolved_agent_classes[agent_id] = assigned_classes
+
+        covered_classes = set().union(*resolved_agent_classes.values())
+        uncovered_classes = sorted(unique_class_set - covered_classes)
+        if uncovered_classes:
+            raise ValueError(
+                'Every class in the split must be assigned to at least one '
+                f'agent. Uncovered classes: {uncovered_classes}'
+            )
+
+    support = torch.zeros(
+        (n_agents, len(unique_classes)),
+        dtype=torch.bool,
+    )
+    weight_matrix = torch.zeros(
+        (n_agents, len(unique_classes)),
+        dtype=torch.float32,
+    )
+    margin_counts = torch.zeros(
+        (n_agents, len(unique_classes)),
+        dtype=torch.long,
+    )
+
+    for agent_id in range(n_agents):
+        assigned_classes = resolved_agent_classes[agent_id]
+        minimum_agent_samples = safety_margin * len(assigned_classes)
+        if samples_per_agent < minimum_agent_samples:
+            raise ValueError(
+                f'agent {agent_id} has capacity {samples_per_agent}, but '
+                f'needs {minimum_agent_samples} samples for the requested '
+                'safety margins.'
+            )
+
+        proportions = _generate_skewed_proportions(
+            n_parts=len(assigned_classes),
+            alpha=alpha,
+            generator=generator,
+        )
+        for offset, class_label in enumerate(assigned_classes):
+            class_pos = class_to_position[int(class_label)]
+            support[agent_id, class_pos] = True
+            weight_matrix[agent_id, class_pos] = float(proportions[offset])
+            margin_counts[agent_id, class_pos] = safety_margin
+
+    class_margin_counts = margin_counts.sum(dim=0)
+    if torch.any(class_counts < class_margin_counts):
+        failing_classes = [
+            unique_classes[pos]
+            for pos in torch.where(
+                class_counts < class_margin_counts
+            )[0].tolist()
+        ]
+        raise ValueError(
+            'At least one class has too few samples for the requested safety '
+            f'margins: {failing_classes}'
+        )
+
+    count_matrix = margin_counts.clone()
+    remaining_agent_capacity = (
+        torch.full((n_agents,), samples_per_agent, dtype=torch.long)
+        - margin_counts.sum(dim=1)
+    )
+    remaining_class_counts = class_counts - class_margin_counts
+    pending_classes = set(range(len(unique_classes)))
+
+    # Class samples are placed into agents that still have quota. The weights
+    # are still agent-normalized: each row of ``weight_matrix`` sums to one
+    # over that agent's assigned classes.
+    while pending_classes:
+        class_pos = min(
+            pending_classes,
+            key=lambda current_class: (
+                int(
+                    remaining_agent_capacity[support[:, current_class]]
+                    .sum()
+                    .item()
+                )
+                - int(remaining_class_counts[current_class].item()),
+                int(support[:, current_class].sum().item()),
+                -int(remaining_class_counts[current_class].item()),
+            ),
+        )
+        pending_classes.remove(class_pos)
+        class_label = unique_classes[class_pos]
+        remaining_for_class = int(remaining_class_counts[class_pos].item())
+
+        assigned_capacity = int(
+            remaining_agent_capacity[support[:, class_pos]].sum().item()
+        )
+        if remaining_for_class > assigned_capacity:
+            raise ValueError(
+                f'class {class_label} has {remaining_for_class} residual '
+                f'samples, but assigned agents only have {assigned_capacity} '
+                'remaining slots.'
+            )
+
+        while remaining_for_class > 0:
+            eligible_agents = torch.where(
+                support[:, class_pos] & (remaining_agent_capacity > 0)
+            )[0]
+            if len(eligible_agents) == 0:
+                raise ValueError(
+                    f'class {class_label} still has {remaining_for_class} '
+                    'samples but no assigned agent has remaining capacity.'
+                )
+
+            sampled_counts = _sample_counts_from_proportions(
+                proportions=weight_matrix[eligible_agents, class_pos],
+                total=remaining_for_class,
+                generator=generator,
+            )
+
+            added = 0
+            for offset in torch.argsort(
+                sampled_counts,
+                descending=True,
+            ).tolist():
+                if added >= remaining_for_class:
+                    break
+                agent_id = int(eligible_agents[offset].item())
+                proposed = int(sampled_counts[offset].item())
+                capacity = int(remaining_agent_capacity[agent_id].item())
+                count = min(proposed, capacity, remaining_for_class - added)
+                if count <= 0:
+                    continue
+                count_matrix[agent_id, class_pos] += count
+                remaining_agent_capacity[agent_id] -= count
+                added += count
+
+            if added == 0:
+                agent_id = int(
+                    eligible_agents[
+                        torch.argmax(
+                            remaining_agent_capacity[eligible_agents]
+                        ).item()
+                    ].item()
+                )
+                count_matrix[agent_id, class_pos] += 1
+                remaining_agent_capacity[agent_id] -= 1
+                added = 1
+
+            remaining_for_class -= added
+
+    expected_row_counts = torch.full(
+        (n_agents,), samples_per_agent, dtype=torch.long
+    )
+    if not torch.equal(count_matrix.sum(dim=1), expected_row_counts):
+        raise RuntimeError('Fair non-IID partition failed to fill all agents.')
+    if not torch.equal(count_matrix.sum(dim=0), class_counts):
+        raise RuntimeError('Fair non-IID partition failed to consume classes.')
+
+    agent_indices: dict[int, list[int]] = {
+        agent_id: [] for agent_id in range(n_agents)
+    }
+    for class_label in unique_classes:
+        class_pos = class_to_position[int(class_label)]
+        class_indices = torch.where(labels_tensor == int(class_label))[0]
+        shuffled_indices = class_indices[
+            torch.randperm(len(class_indices), generator=generator)
+        ].tolist()
+
+        cursor = 0
+        for agent_id in range(n_agents):
+            count = int(count_matrix[agent_id, class_pos].item())
+            if count == 0:
+                continue
+            agent_indices[agent_id].extend(
+                shuffled_indices[cursor : cursor + count]
+            )
+            cursor += count
 
     for agent_id in range(n_agents):
         agent_indices[agent_id].sort()

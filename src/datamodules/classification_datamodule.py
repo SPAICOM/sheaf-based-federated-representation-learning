@@ -19,7 +19,6 @@ from lightning.pytorch.utilities.combined_loader import CombinedLoader
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.transforms import functional as TF
 
 from src.datamodules.utils import (
     PairwiseDataset,
@@ -130,11 +129,6 @@ class ClassificationDataset(Dataset):
         data = item[self.data_key]
         if isinstance(data, list):
             data = torch.tensor(data, dtype=torch.float32)
-        elif self.rotation_angle and isinstance(data, Image.Image):
-            data = TF.rotate(data, angle=self.rotation_angle)
-        elif self.rotation_angle and isinstance(data, torch.Tensor):
-            if data.ndim >= 2:
-                data = TF.rotate(data, angle=self.rotation_angle)
 
         # Extract label from specified column
         # Convert integer labels to long tensors for classification
@@ -304,7 +298,7 @@ class ClassificationDataModule(l.LightningDataModule):
         self.seed = seed
 
     def _starve_training_datasets(self, label_key: str) -> None:
-        """Reduce train data by 60% for a deterministic half of clients."""
+        """Reduce train data by 80% for a deterministic half of clients."""
         starved_client_count = self.n_agents // 2
         if starved_client_count == 0:
             return
@@ -318,7 +312,7 @@ class ClassificationDataModule(l.LightningDataModule):
             if len(train_dataset) <= 1:
                 continue
 
-            keep_count = max(1, int(round(len(train_dataset) * 0.4)))
+            keep_count = max(1, int(round(len(train_dataset) * 0.2)))
             selected_indices = torch.randperm(
                 len(train_dataset),
                 generator=torch.Generator().manual_seed(
@@ -842,7 +836,15 @@ class ClassificationDataModule(l.LightningDataModule):
                 (len(dataset) + self.batch_size - 1) // self.batch_size
                 for dataset in self.val_datasets.values()
             )
-            self._add_pilot_loaders(loaders, target_num_batches)
+            loaders.update(
+                {
+                    f'pilot_{i}': self._make_pilot_loader(
+                        self.pilot_datasets[i],
+                        target_num_batches,
+                    )
+                    for i in self.pilot_datasets
+                }
+            )
         val_loader = CombinedLoader(loaders, mode=self.mode)
         if not self.monitor_test_during_fit:
             return val_loader
@@ -876,14 +878,9 @@ class ClassificationDataModule(l.LightningDataModule):
                 }
             )
         elif self.comm_data == 'shared_global_pilots':
-            loaders.update(
-                {
-                    f'global_pilot_{i}': self._make_pilot_loader(
-                        self.pilot_datasets[i],
-                        target_num_batches,
-                    )
-                    for i in self.pilot_datasets
-                }
+            loaders['global_pilot'] = self._make_pilot_loader(
+                self.pilot_datasets[0],
+                target_num_batches,
             )
         elif self.comm_data == 'pairwise_pilots':
             for i in range(self.n_agents):

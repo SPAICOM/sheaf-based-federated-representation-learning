@@ -31,6 +31,7 @@ This module contains various utility functions and classes used throughout the f
     - `partition_by_agent_classes`: Builds disjoint per-agent splits from an explicit agent-to-class mapping
     - `partition_non_iid`: Standard non-IID splitter with reused or sampled class assignments and skew controlled by `alpha`
     - `partition_non_iid_with_margin`: Exact-`K` class assignment with full class coverage and a per-class safety margin reserved for every assigned agent before the skewed allocation
+    - `partition_non_iid_fair`: Exact-`K` non-IID split with per-agent normalized class skew, safety margins, and equal total samples per agent
   - **Usage**: Used in experiment setups to create heterogeneous data distributions across agents
 
 ### Graph Generation
@@ -128,6 +129,18 @@ partition = partition_non_iid_with_margin(
 )
 # Returns: {0: [...], 1: [...], ...}
 # Each agent gets exactly 3 classes and at least 10 reserved samples per assigned class
+
+# Fair variant: per-agent label skew with uniform client volume
+from src.utils.data_partitioner import partition_non_iid_fair
+
+fair_partition = partition_non_iid_fair(
+    labels=labels,
+    n_agents=5,
+    classes_per_agent=3,
+    alpha=-1.0,
+    safety_margin=10,
+)
+# Returns equal-size client partitions when len(labels) is divisible by n_agents
 
 # Example: Saving and loading model checkpoints
 from src.utils.io import save_checkpoint, load_checkpoint

@@ -7,6 +7,7 @@ multiple federated learning agents:
 - FedPer: centralized shared-base training with personalized heads
 - HeteroFL: heterogeneous-width federated learning (Diao et al., ICLR 2021)
 - DPSGD: decentralized parallel SGD with per-step model mixing
+- EpochEndDPSGD: decentralized SGD with the same mixing rule applied at epoch end
 - DFedU: decentralized federated multitask learning with Laplacian updates
 - SheafFMTL: sheaf multitask learning in parameter space
 - SheafFRL: sheaf-based FRL with latent alignment
@@ -22,6 +23,7 @@ Each orchestrator:
 from .comfed import ComFed
 from .dfedu import DFedU
 from .dpsgd import DPSGD
+from .epochend_dpsgd import EpochEndDPSGD
 from .federated import FederatedLearning
 from .fedper import FedPer
 from .heterofl import HeteroFL
@@ -33,6 +35,7 @@ __all__ = [
     "ComFed",
     "DFedU",
     "DPSGD",
+    "EpochEndDPSGD",
     "FedMuscle",
     "FedPer",
     "FedProto",

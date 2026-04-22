@@ -1,5 +1,5 @@
 defaults:
-  - dataset: cifar10
+  - dataset: hetero_cifar10
   - model: cnn_classifier
   - orchestrator: sheaf_frl
   - optimizer: sgd
@@ -52,19 +52,19 @@ callbacks:
 
 
 dataset:
-  # each client is randomly assigned exactly 5 classes
+  # each client is randomly assigned exactly `classes_per_agent` classes
   # To introduce sample size heterogeneity, the number of samples per class assigned to each client is drawn
   # from a Dirichlet distribution (α=15 approx equal n samples), ensuring mutually exclusive, non-IID local datasets while
   # preserving the global train/test splits
   # If alpha is negative, unif(a,b) is used for proportions
   split_strategy: non_iid_with_margin
   n_agents: 30
-  classes_per_agent: 10
-  alpha: -1
+  classes_per_agent: 5
+  alpha: -1 #lognormal
   monitor_test_during_fit: false
-  batch_size: 124
+  batch_size: 128
   num_workers: 0
-  mode: max_size_cycle
+  mode: min_size
   starve_clients: false
   pilot_split: 0.05
   pilot_batch_size: 64

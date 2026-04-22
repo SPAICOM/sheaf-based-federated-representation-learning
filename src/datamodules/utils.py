@@ -5,9 +5,12 @@ used by all datamodule classes.
 """
 
 from math import ceil
+from typing import TypeVar
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset
+
+T = TypeVar('T')
 
 
 class PairwiseDataset(Dataset):
@@ -176,6 +179,36 @@ def compute_split_indices(
         'val': val_indices,
         'test': test_indices,
     }
+
+
+def assign_agents_to_random_groups(
+    n_agents: int,
+    group_values: list[T],
+    seed: int,
+) -> dict[int, T]:
+    """Assign agents to seeded random groups as evenly as possible."""
+    if n_agents < 1:
+        raise ValueError('n_agents must be positive')
+    if not group_values:
+        raise ValueError('group_values must be non-empty')
+
+    shuffled_agents = torch.randperm(
+        n_agents,
+        generator=torch.Generator().manual_seed(seed),
+    ).tolist()
+    base_group_size, remainder = divmod(n_agents, len(group_values))
+
+    assignment: dict[int, T] = {}
+    start = 0
+    for group_idx, group_value in enumerate(group_values):
+        current_group_size = base_group_size + (
+            1 if group_idx < remainder else 0
+        )
+        for agent_idx in shuffled_agents[start : start + current_group_size]:
+            assignment[agent_idx] = group_value
+        start += current_group_size
+
+    return {agent_idx: assignment[agent_idx] for agent_idx in range(n_agents)}
 
 
 def repeat_dataset_to_num_samples(
