@@ -13,7 +13,7 @@ hydra:
       _target_: optuna.samplers.TPESampler
       seed: ${seed}
     params:
-      orchestrator.lambda_sheaf: choice(1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2)
+      orchestrator.max_lmb: choice(1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2)
       orchestrator.num_anchors: choice(16, 32, 64)
       optimizer.lr: tag(log, interval(5e-4, 5e-2))
       optimizer.weight_decay: choice(0.0, 1e-5, 1e-4, 1e-3)
@@ -45,7 +45,7 @@ dataset:
   split_strategy: non_iid_with_margin
   n_agents: 30
   classes_per_agent: 5
-  alpha: -1
+  alpha: -0.5
   starve_clients: false
   pilot_split: 0.05
 

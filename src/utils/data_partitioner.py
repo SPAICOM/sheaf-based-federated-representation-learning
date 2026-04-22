@@ -290,9 +290,10 @@ def _generate_skewed_proportions(
         weights = torch._standard_gamma(concentration, generator=generator)
     else:
         # Match the aggressive skew regime with a high-variance Log-Normal.
+        std_dev = abs(float(alpha))
         weights = torch.exp(
             torch.randn(n_parts, generator=generator, dtype=torch.float32)
-            * 2.0
+            * std_dev
         )
 
     total_weight = weights.sum()

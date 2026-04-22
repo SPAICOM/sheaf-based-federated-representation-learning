@@ -20,7 +20,7 @@ logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: hetero_cifar10
   group: ${study_name}
-  name: ${hydra:runtime.choices.orchestrator}_p0.3_trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -60,7 +60,7 @@ dataset:
   split_strategy: non_iid_with_margin
   n_agents: 30
   classes_per_agent: 5
-  alpha: -1 #lognormal
+  alpha: -0.5 #lognormal
   monitor_test_during_fit: false
   batch_size: 128
   num_workers: 0
@@ -70,6 +70,7 @@ dataset:
   pilot_batch_size: 64
   comm_data: shared_global_pilots
   pilot_apply_agent_rotations: false
+  safety_margin: 15
 
 #dataset:
   # Simplified 4 agents - 2 overlapping classes dataset
