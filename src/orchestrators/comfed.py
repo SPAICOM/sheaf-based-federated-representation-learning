@@ -267,7 +267,7 @@ class ComFed(BaseOrchestrator):
                 means_tensor = torch.stack(list(p_means.values())).detach()
                 n_neighbors = len(self._get_neighbor_indices(idx))
                 self._record_communication(
-                    means_tensor, n_transmissions=n_neighbors
+                    means_tensor, n_transmissions=n_neighbors, prefix=prefix
                 )
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
