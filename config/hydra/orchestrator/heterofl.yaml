@@ -1,19 +1,4 @@
 _target_: src.orchestrators.HeteroFL
-
-# Per-client width scaling factors in (0, 1].
-# Keys must match agent indices defined in the experiment config.
-# Override per-run if agents have different heterogeneity patterns.
-rates:
-  0: 1.0
-  1: 1.0
-  2: 1.0
-
-# Fair default: aggregate once per completed local epoch.
 aggregation_interval: 1
 aggregation_unit: epoch
-max_global_rounds: null
-
-sample_counts: null
 sync_on_train_start: true
-
-neighbors: {}

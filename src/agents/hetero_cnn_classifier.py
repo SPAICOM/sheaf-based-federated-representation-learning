@@ -7,26 +7,30 @@ PersonalizedClassifier.
 import torch.nn as nn
 
 from .personalized_classifier import PersonalizedClassifier
-from .utils import HeteroCNN
+from .utils import HeteroCNN, HeteroMLP
 
 
 class HeteroCNNClassifier(PersonalizedClassifier):
-    """HeteroCNN-based classifier built on top of PersonalizedClassifier.
+    """HeteroCNN encoder + HeteroMLP decoder classifier for heterogeneous FL.
 
-    Constructs a CNN encoder from the given architecture parameters and
-    delegates everything else to PersonalizedClassifier.
+    Both encoder and decoder channel widths are scaled by ``rate``, following
+    the HeteroFL width-scaling scheme (Diao et al., ICLR 2021).
 
     Parameters
     ----------
     in_features : int
-        Number of input channels, injected automatically by
-        experiment.py from the datamodule.
+        Number of input channels, injected automatically by the experiment
+        script from the datamodule.
     num_classes : int
         Number of output classes.
     encoder_hidden_dims : list[int], optional
-        Output channels for each Conv2d block (default: [32, 64, 128]).
+        Output channels for each Conv2d block before rate scaling
+        (default: [32, 64, 128]).
     decoder_hidden_dims : list[int], optional
-        Hidden layer dimensions for the decoder MLP (default: [256]).
+        Hidden layer dimensions for the decoder before rate scaling
+        (default: [256]).
+    rate : float, optional
+        Width scaling factor in (0, 1].  1.0 = full width (default).
     dropout : float, optional
         Dropout probability for encoder and decoder (default: 0.0).
     activation : type[nn.Module], optional
@@ -48,6 +52,8 @@ class HeteroCNNClassifier(PersonalizedClassifier):
     ):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
+        if decoder_hidden_dims is None:
+            decoder_hidden_dims = [256]
 
         encoder = HeteroCNN(
             in_features=in_features,
@@ -63,5 +69,17 @@ class HeteroCNNClassifier(PersonalizedClassifier):
             decoder_hidden_dims=decoder_hidden_dims,
             dropout=dropout,
             activation=activation,
+            use_batchnorm=use_batchnorm,
+        )
+
+        # Replace the MLP decoder built by PersonalizedClassifier with a
+        # HeteroMLP so that classifier-head widths also scale with rate.
+        self._decoder = HeteroMLP(
+            input_dim=encoder.out_features,
+            output_dim=num_classes,
+            hidden_dims=decoder_hidden_dims,
+            rate=rate,
+            activation=activation,
+            dropout=dropout,
             use_batchnorm=use_batchnorm,
         )
