@@ -43,6 +43,7 @@ def supported_anchor_strategy(anchor_strategy: str) -> str:
     return strategy
 '''
 
+'''
 def parseval_normalize(
     anchor_matrix: torch.Tensor,
     *,
@@ -78,6 +79,60 @@ def parseval_normalize(
         eigenvectors.T,
     )
     return torch.matmul(anchor_matrix, covariance_inv)
+'''
+
+def parseval_normalize(
+    anchor_matrix: torch.Tensor,
+    *,
+    eps: float = 1e-4,
+) -> torch.Tensor:
+    """Apply Parseval prewhitening to pilot anchor rows.
+
+    `anchor_matrix` is `[num_pilots, latent_dim]`
+    The prewhitening formulation treats latent dimensions as variables and
+    pilots as observations, so it operates on `anchor_matrix.T`. The final
+    `sqrt(num_pilots - 1)` scaling converts unit covariance into the
+    Parseval frame convention ``A.T @ A ~= I`` for the returned row-major
+    anchor matrix.
+    """
+    if anchor_matrix.ndim != 2:
+        raise ValueError('anchor_matrix must be a 2D tensor')
+
+    num_pilots = anchor_matrix.size(0)
+    if num_pilots <= 1 or anchor_matrix.numel() == 0:
+        return anchor_matrix
+    if eps < 0:
+        raise ValueError('eps must be non-negative')
+
+    original_dtype = anchor_matrix.dtype
+    feature_by_pilot = anchor_matrix.T.to(torch.float64)
+    mean = feature_by_pilot.mean(dim=1, keepdim=True)
+    centered = feature_by_pilot - mean
+
+    covariance_denominator = num_pilots - 1
+    covariance = torch.matmul(centered, centered.T) / covariance_denominator
+    jitter = float(eps)
+    eye = torch.eye(
+        covariance.size(0),
+        device=covariance.device,
+        dtype=covariance.dtype,
+    )
+    covariance = covariance + jitter * eye
+
+    cholesky, info = torch.linalg.cholesky_ex(covariance)
+    if bool(torch.any(info != 0)):
+        fallback_jitter = max(jitter * 10, 1e-12)
+        cholesky = torch.linalg.cholesky(covariance + fallback_jitter * eye)
+
+    whitened = torch.linalg.solve(cholesky, centered)
+    parseval_rows = whitened.T / torch.sqrt(
+        torch.tensor(
+            covariance_denominator,
+            device=anchor_matrix.device,
+            dtype=torch.float64,
+        )
+    )
+    return parseval_rows.to(dtype=original_dtype)
 
 
 def l2_normalize(anchor_matrix: torch.Tensor) -> torch.Tensor:

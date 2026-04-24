@@ -30,7 +30,7 @@ callbacks:
     save_last: false
 
 model:
-  use_batchnorm: false
+  use_batchnorm: true
 
 dataset:
   split_strategy: non_iid_with_margin

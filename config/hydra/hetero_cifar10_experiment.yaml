@@ -60,7 +60,7 @@ dataset:
   split_strategy: non_iid_with_margin
   n_agents: 30
   classes_per_agent: 5
-  alpha: -0.5 #lognormal
+  alpha: -1 #lognormal
   monitor_test_during_fit: false
   batch_size: 128
   num_workers: 0
@@ -70,7 +70,7 @@ dataset:
   pilot_batch_size: 64
   comm_data: shared_global_pilots
   pilot_apply_agent_rotations: false
-  safety_margin: 15
+  safety_margin: 100
 
 #dataset:
   # Simplified 4 agents - 2 overlapping classes dataset
@@ -93,13 +93,13 @@ model:
   encoder_hidden_dims: [32, 64, 128]
   decoder_hidden_dims: [256]
   dropout: 0.1
-  use_batchnorm: false
+  use_batchnorm: true
 
 orchestrator:
   max_lmb: 0.05
   anchor_strategy: pilots
   num_anchors: 64
-  parseval_normalization: false
+  parseval_normalization: true
   l2_normalization: false
   #filter_unseen_classes: false  
   use_prototypes: false
