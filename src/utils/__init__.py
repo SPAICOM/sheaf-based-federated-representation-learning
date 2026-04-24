@@ -6,6 +6,7 @@ This package provides helper functions for:
 - Communication accounting: Counting transmitted bits/KB consistently
 - Graph generation: Creating communication graphs for federated learning
 - I/O operations: Managing experiment directories and checkpoints
+- Logging: WandB logging, config persistence, and metric extraction
 """
 
 from .anchors import (
@@ -25,6 +26,16 @@ from .data_partitioner import (
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
+from .logging import (
+    _extract_objective_metric,
+    _filter_supported_init_kwargs,
+    _finish_active_wandb_run,
+    _json_ready,
+    _persist_run_results,
+    _resolve_agent_overrides,
+    _sanitize_instantiation_config,
+    _update_logger_config,
+)
 
 __all__ = [
     'AnchorConfig',
@@ -40,4 +51,12 @@ __all__ = [
     'remove_non_empty_dir',
     'shared_anchor_rows',
     #'supported_anchor_strategy',
+    '_extract_objective_metric',
+    '_filter_supported_init_kwargs',
+    '_finish_active_wandb_run',
+    '_json_ready',
+    '_persist_run_results',
+    '_resolve_agent_overrides',
+    '_sanitize_instantiation_config',
+    '_update_logger_config',
 ]

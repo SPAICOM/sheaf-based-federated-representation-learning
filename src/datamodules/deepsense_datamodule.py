@@ -328,6 +328,7 @@ class DeepSenseDataModule(l.LightningDataModule):
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         comm_data: str = 'private_pilots',
+        starve_clients: bool = False,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -345,12 +346,50 @@ class DeepSenseDataModule(l.LightningDataModule):
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
         self.comm_data = comm_data
+        self.starve_clients = starve_clients
         self.seed = seed
 
         if agent_modalities is None:
             self.agent_modalities = {i: [i] for i in range(n_agents)}
         else:
             self.agent_modalities = agent_modalities
+
+    def _starve_training_datasets(self) -> None:
+        """Reduce train data by 80% for a deterministic half of clients."""
+        starved_client_count = self.n_agents // 2
+        if starved_client_count == 0:
+            return
+
+        client_indices = torch.randperm(
+            self.n_agents,
+            generator=torch.Generator().manual_seed(self.seed),
+        ).tolist()
+
+        for client_idx in client_indices[:starved_client_count]:
+            mod_datasets = self.train_datasets[client_idx]
+            if not mod_datasets or len(mod_datasets[0]) <= 1:
+                continue
+
+            current_ids = mod_datasets[0].sample_ids
+            if current_ids is None:
+                current_ids = list(range(len(mod_datasets[0].base_dataset)))
+
+            keep_count = max(1, int(round(len(current_ids) * 0.2)))
+            perm = torch.randperm(
+                len(current_ids),
+                generator=torch.Generator().manual_seed(self.seed + client_idx),
+            ).tolist()
+            new_ids = [current_ids[i] for i in sorted(perm[:keep_count])]
+
+            self.train_datasets[client_idx] = [
+                DeepSenseModalityDataset(
+                    ds.base_dataset,
+                    ds.modality_idx,
+                    sample_ids=new_ids,
+                    return_sample_ids=ds.return_sample_ids,
+                )
+                for ds in mod_datasets
+            ]
 
     def prepare_data(self) -> None:
         """Download and extract DeepSense dataset if not present.
@@ -666,6 +705,9 @@ class DeepSenseDataModule(l.LightningDataModule):
                 raise ValueError(
                     f'Unknown split_strategy: {self.split_strategy}'
                 )
+
+            if self.starve_clients:
+                self._starve_training_datasets()
 
             if split_indices.get('pilot'):
                 for agent_id in range(self.n_agents):

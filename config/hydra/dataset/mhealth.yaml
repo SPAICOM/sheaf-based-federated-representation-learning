@@ -4,27 +4,24 @@ data_path: ./data/MHealth
 gdrive_file_id: 1HJnlZq_vVG-CFhfVhQdQsP7fUBocD3un
 
 split_strategy: subject
-n_agents: null
+n_agents: 5
 
 feature_groups:
+  - chest
   - left_ankle
   - right_wrist
 
-# Each agent is assigned a single 3-D sensor modality so that the
-# modality-specific encoders receive a (B, 3) input vector instead of the
-# full flat feature vector.  Cycles acc → gyro → mag across body positions
-# for 10 subjects.
+# One unique sensor modality per agent (8 modalities, 8 subjects).
+# Agent 6 is assigned the ECG modality (2-channel: lead1 + lead2).
 agent_modalities:
   0: acc_ankle
   1: gyro_ankle
-  2: mag_ankle
-  3: acc_wrist
-  4: gyro_wrist
-  5: mag_wrist
-  6: acc_ankle
-  7: gyro_ankle
-  8: mag_ankle
-  9: acc_wrist
+  # 2: mag_ankle
+  2: acc_wrist
+  3: gyro_wrist
+  # 5: mag_wrist
+  4: acc_chest
+  # 7: ecg
 
 exclude_null_activity: true
 window_size: null

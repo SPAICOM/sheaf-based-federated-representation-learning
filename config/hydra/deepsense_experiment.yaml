@@ -14,10 +14,22 @@ graph:
   m: 3
 
 model:
-  encoder_hidden_dims: [32, 64, 128]
+  output_dim: 64
   decoder_hidden_dims: [256]
   dropout: 0.1
   use_batchnorm: true
+  # Per-modality overrides: keys are modality indices (0=RGB, 1=mmWave, 2=LiDAR).
+  # Any key omitted here falls back to the global values above.
+  per_modality:
+    0:  # RGB (3, 64, 64)
+      output_dim: 128
+      decoder_hidden_dims: [512, 256]
+    1:  # mmWave (1, 16, 64)
+      output_dim: 64
+      decoder_hidden_dims: [256]
+    2:  # LiDAR (2, 32, 32)
+      output_dim: 64
+      decoder_hidden_dims: [128]
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
@@ -25,6 +37,7 @@ logger:
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false
+  reinit: true
 
 trainer:
   max_epochs: 5

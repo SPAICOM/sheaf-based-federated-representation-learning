@@ -39,6 +39,7 @@ logger:
   project: sheaf-repr-learning__cnn-agents-exp
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   log_model: false
+  reinit: true
 
 trainer:
   max_epochs: 50

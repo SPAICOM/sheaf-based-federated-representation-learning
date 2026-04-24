@@ -27,6 +27,10 @@ from src.agents import (
     MHealthMagnetometerClassifier,
 )
 from src.datamodules.mhealth_datamodule import MHEALTH_SENSOR_MODALITIES
+from src.utils import (
+    _finish_active_wandb_run,
+    remove_non_empty_dir,
+)
 from src.utils.graph_generator import generate_neighbors
 
 MODALITY_CLASSIFIER = {
@@ -90,7 +94,9 @@ def _resolve_agent_classifier_types(datamodule) -> dict[int, str]:
             t = col_to_type.get(col)
             if t:
                 counts[t] = counts.get(t, 0) + 1
-        result[agent_id] = max(counts, key=counts.__getitem__) if counts else 'accelerometer'
+        result[agent_id] = (
+            max(counts, key=counts.__getitem__) if counts else 'accelerometer'
+        )
     return result
 
 
@@ -168,6 +174,14 @@ def main(cfg: DictConfig) -> None:
     trainer = Trainer(**cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(orchestrator, datamodule=datamodule)
     trainer.test(orchestrator, datamodule=datamodule)
+
+    _finish_active_wandb_run()
+
+    # Clean up temporary directories created by Hydra, WandB, and Lightning
+    # These directories can accumulate over multiple experiment runs
+    remove_non_empty_dir('./multirun/')
+    remove_non_empty_dir('./outputs/')
+    remove_non_empty_dir(cfg.logger.project)
 
 
 if __name__ == '__main__':

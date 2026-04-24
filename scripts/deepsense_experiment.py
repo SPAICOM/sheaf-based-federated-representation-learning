@@ -25,6 +25,10 @@ from src.agents import (
     DeepSenseMMWaveClassifier,
     DeepSenseRGBClassifier,
 )
+from src.utils import (
+    _finish_active_wandb_run,
+    remove_non_empty_dir,
+)
 from src.utils.graph_generator import generate_neighbors
 
 MODALITY_CLASSIFIER = {
@@ -64,19 +68,30 @@ def main(cfg: DictConfig) -> None:
     agents = {}
     latent_dims = {}
 
-    output_dim = cfg.model.get('output_dim', 64)
-    decoder_hidden_dims = cfg.model.get('decoder_hidden_dims', [256])
+    global_output_dim = cfg.model.get('output_dim', 64)
+    global_decoder_hidden_dims = cfg.model.get('decoder_hidden_dims', [256])
+    global_dropout = cfg.model.get('dropout', 0.0)
+    global_use_batchnorm = cfg.model.get('use_batchnorm', False)
+    per_modality_cfg = cfg.model.get('per_modality', {})
 
     for agent_id, mod_list in datamodule.agent_modalities.items():
         primary_modality = mod_list[0]
         cls = MODALITY_CLASSIFIER[primary_modality]
         shape = datamodule.MODALITY_SHAPES[primary_modality]
 
+        mod_cfg = per_modality_cfg.get(primary_modality, {})
+        output_dim = mod_cfg.get('output_dim', global_output_dim)
+        decoder_hidden_dims = mod_cfg.get('decoder_hidden_dims', global_decoder_hidden_dims)
+        dropout = mod_cfg.get('dropout', global_dropout)
+        use_batchnorm = mod_cfg.get('use_batchnorm', global_use_batchnorm)
+
         agent = cls(
             num_classes=num_classes,
             input_channels=shape[0],
             output_dim=output_dim,
             decoder_hidden_dims=decoder_hidden_dims,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
         )
         agents[agent_id] = agent
         latent_dims[agent_id] = agent.encoder.output_dim  # BaseEncoder attr
@@ -84,6 +99,8 @@ def main(cfg: DictConfig) -> None:
             f'[deepsense] Agent {agent_id}: '
             f'modality={primary_modality} ({cls.__name__}), '
             f'input_channels={shape[0]}, '
+            f'output_dim={output_dim}, '
+            f'decoder_hidden_dims={decoder_hidden_dims}, '
             f'latent_dim={latent_dims[agent_id]}'
         )
 
@@ -117,6 +134,14 @@ def main(cfg: DictConfig) -> None:
     trainer = Trainer(**cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(orchestrator, datamodule=datamodule)
     trainer.test(orchestrator, datamodule=datamodule)
+
+    _finish_active_wandb_run()
+
+    # Clean up temporary directories created by Hydra, WandB, and Lightning
+    # These directories can accumulate over multiple experiment runs
+    remove_non_empty_dir('./multirun/')
+    remove_non_empty_dir('./outputs/')
+    remove_non_empty_dir(cfg.logger.project)
 
 
 if __name__ == '__main__':

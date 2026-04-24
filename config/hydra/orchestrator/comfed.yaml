@@ -1,7 +1,10 @@
 _target_: src.orchestrators.ComFed
 
-max_lmb: 0.01
+max_lmb: 0.4
 lambda_schedule: null
+
+proj_dim: 64
+proj_steps: 10
 
 neighbors: {}
 

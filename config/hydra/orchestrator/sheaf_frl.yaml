@@ -1,6 +1,6 @@
 _target_: src.orchestrators.SheafFRL
 
-max_lmb: 0.01
+max_lmb: 0.1
 lambda_schedule: cosine
 anchor_strategy: pilots
 parseval_normalization: False
@@ -15,4 +15,4 @@ neighbors: {}
 #  0: [128, 64]
 #  1: [64, 32]
 filter_unseen_classes: False
-use_prototypes: False
+use_prototypes: true
