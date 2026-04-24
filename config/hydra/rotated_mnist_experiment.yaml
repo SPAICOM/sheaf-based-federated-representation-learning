@@ -33,6 +33,7 @@ logger:
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false
+  reinit: true
 
 trainer:
   max_epochs: 50

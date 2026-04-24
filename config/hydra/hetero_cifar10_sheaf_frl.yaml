@@ -31,6 +31,7 @@ logger:
   name: trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
+  reinit: true
 
 trainer:
   max_epochs: 25

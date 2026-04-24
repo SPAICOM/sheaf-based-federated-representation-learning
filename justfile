@@ -24,17 +24,17 @@ experiment config="cnn_agents_experiment" *args="":
 
 # Run multimodal (DeepSense) experiment from sheaf_frl onwards
 multimodal_dec *args="":
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=sheaf_frl {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=sheaf_fmtl {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=fedper {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=heterofl {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=sheaf_frl {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=sheaf_fmtl {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=fedper {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=heterofl {{args}}
 
 # Run multimodal (DeepSense) experiment for all supported orchestrators
 deepsense *args="":
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=fedproto {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=fedmuscle {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=comfed {{args}}
-    uv run scripts/multimodal_experiment.py --config-name deepsense_experiment orchestrator=sheaf_fmtl {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=sheaf_frl {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=comfed {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=fedproto {{args}}
+    uv run scripts/deepsense_experiment.py --config-name deepsense_experiment orchestrator=fedmuscle {{args}}
 
 mhealth *args="":
     uv run scripts/mhealth_experiment.py --config-name mhealth_experiment orchestrator=fedproto {{args}}

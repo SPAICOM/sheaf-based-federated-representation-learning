@@ -25,6 +25,7 @@ logger:
   name: ${now:%Y-%m-%d}_${now:%H-%M-%S}
   save_dir: logs/
   log_model: false
+  reinit: true
 
 trainer:
   max_epochs: 50
@@ -47,3 +48,9 @@ callbacks:
     monitor: validation/global_task_performance_epoch
     patience: 10
     mode: max
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+     orchestrator: sheaf_frl, sheaf_align, comfed, non_cooperative

@@ -228,28 +228,27 @@ def _resolve_feature_cols(
 
 
 class MHealthDataset(Dataset):
-    """Dataset for MHEALTH sensor readings.
-
-    Each item is either a single time-step vector (when ``window_size`` is
-    ``None``) or a fixed-length sliding-window tensor.
+    """PyTorch dataset wrapping MHEALTH DataFrame rows.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Rows belonging to this agent/split, with at least ``feature_cols`` and
-        ``label_col`` present.
+        Input data.
     feature_cols : list[str]
-        Columns to stack as input features.
+        Feature column names.
     label_col : str
-        Column containing integer activity labels.
+        Label column name.
     window_size : int or None
-        Number of consecutive time steps per sample.  ``None`` means each row
-        is one sample (shape ``(n_features,)``).
+        Sliding-window length.  ``None`` → point-wise (row-level) sampling.
     stride : int
-        Sliding-window step size (only used when ``window_size`` is set).
+        Sliding-window step size.
     sample_ids : list[int] or None
         Global row indices carried along for pilot identification.  When set,
         ``__getitem__`` returns ``(features, label, sample_id)``.
+    normalize : bool or tuple of arrays
+        If True, apply standard normalization using precomputed stats.
+        If a tuple (mean, std), use those for normalization.
+        If False, no normalization applied.
     """
 
     def __init__(
@@ -260,6 +259,7 @@ class MHealthDataset(Dataset):
         window_size: int | None = None,
         stride: int = 1,
         sample_ids: list[int] | None = None,
+        normalize: bool | tuple[np.ndarray, np.ndarray] = True,
     ) -> None:
         self.feature_cols = feature_cols
         self.label_col = label_col
@@ -267,8 +267,27 @@ class MHealthDataset(Dataset):
         self.stride = stride
         self.sample_ids = sample_ids
 
-        self.features: np.ndarray = df[feature_cols].to_numpy(dtype='float32')
-        self.labels: np.ndarray = df[label_col].to_numpy(dtype='int64')
+        self.features: np.ndarray = (
+            df[feature_cols].to_numpy(dtype='float32').copy()
+        )
+        self.labels: np.ndarray = df[label_col].to_numpy(dtype='int64').copy()
+
+        if isinstance(normalize, tuple):
+            self.mean = normalize[0].copy()
+            self.std = normalize[1].copy()
+            self._normalize = True
+        elif normalize:
+            self.mean = np.mean(self.features, axis=0, keepdims=True).copy()
+            self.std = np.std(self.features, axis=0, keepdims=True).copy()
+            self.std = np.where(self.std < 1e-8, 1.0, self.std)
+            self._normalize = True
+        else:
+            self.mean = np.zeros((1, len(feature_cols)), dtype='float32')
+            self.std = np.ones((1, len(feature_cols)), dtype='float32')
+            self._normalize = False
+
+        if self._normalize:
+            self.features = (self.features - self.mean) / self.std
 
         if window_size is not None:
             n = len(self.features)
@@ -511,11 +530,24 @@ class MHealthDataModule(l.LightningDataModule):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    def _compute_norm_stats(
+        self,
+        df: pd.DataFrame,
+        feature_cols: list[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute per-channel mean and std for normalization."""
+        features = df[feature_cols].to_numpy(dtype='float32')
+        mean = np.mean(features, axis=0, keepdims=True).copy()
+        std = np.std(features, axis=0, keepdims=True).copy()
+        std = np.where(std < 1e-8, 1.0, std)
+        return mean, std
+
     def _make_dataset(
         self,
         df: pd.DataFrame,
         sample_ids: list[int] | None = None,
         feature_cols: list[str] | None = None,
+        normalize: bool | tuple[np.ndarray, np.ndarray] = True,
     ) -> MHealthDataset:
         cols = feature_cols if feature_cols is not None else self.feature_cols
         available_cols = [c for c in cols if c in df.columns]
@@ -532,6 +564,7 @@ class MHealthDataModule(l.LightningDataModule):
             window_size=self.window_size,
             stride=self.stride,
             sample_ids=sample_ids,
+            normalize=normalize,
         )
 
     def _select(self, df: pd.DataFrame, indices: list[int]) -> pd.DataFrame:
@@ -558,10 +591,21 @@ class MHealthDataModule(l.LightningDataModule):
         val_df: pd.DataFrame,
         test_df: pd.DataFrame,
     ) -> None:
+        norm_stats_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for i in range(self.n_agents):
+            fcols = self._agent_feature_cols.get(i)
+            norm_stats_cache[i] = self._compute_norm_stats(train_df, fcols)
+
         if self.n_agents == 1:
-            self.train_datasets[0] = self._make_dataset(train_df)
-            self.val_datasets[0] = self._make_dataset(val_df)
-            self.test_datasets[0] = self._make_dataset(test_df)
+            self.train_datasets[0] = self._make_dataset(
+                train_df, normalize=norm_stats_cache[0]
+            )
+            self.val_datasets[0] = self._make_dataset(
+                val_df, normalize=norm_stats_cache[0]
+            )
+            self.test_datasets[0] = self._make_dataset(
+                test_df, normalize=norm_stats_cache[0]
+            )
             return
 
         gen = torch.Generator().manual_seed(self.seed)
@@ -576,6 +620,7 @@ class MHealthDataModule(l.LightningDataModule):
                 target[i] = self._make_dataset(
                     self._select(split_df, chunks[i].tolist()),
                     feature_cols=self._agent_feature_cols.get(i),
+                    normalize=norm_stats_cache[i],
                 )
 
     def _split_data_class_partition(
@@ -589,6 +634,11 @@ class MHealthDataModule(l.LightningDataModule):
                 "split_strategy='class_partition' requires agent_classes or "
                 'shared_classes to be provided'
             )
+        norm_stats_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for i in range(self.n_agents):
+            fcols = self._agent_feature_cols.get(i)
+            norm_stats_cache[i] = self._compute_norm_stats(train_df, fcols)
+
         for split_df, target in [
             (train_df, self.train_datasets),
             (val_df, self.val_datasets),
@@ -608,6 +658,7 @@ class MHealthDataModule(l.LightningDataModule):
                 target[i] = self._make_dataset(
                     self._select(split_df, partition[i]),
                     feature_cols=self._agent_feature_cols.get(i),
+                    normalize=norm_stats_cache[i],
                 )
 
     def _split_data_non_iid(
@@ -625,6 +676,11 @@ class MHealthDataModule(l.LightningDataModule):
             return_agent_classes=True,
         )
         self.agent_classes = sampled_classes
+
+        norm_stats_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for i in range(self.n_agents):
+            fcols = self._agent_feature_cols.get(i)
+            norm_stats_cache[i] = self._compute_norm_stats(train_df, fcols)
 
         for split_df, target, seed_offset in [
             (train_df, self.train_datasets, 0),
@@ -646,6 +702,7 @@ class MHealthDataModule(l.LightningDataModule):
                 target[i] = self._make_dataset(
                     self._select(split_df, partition[i]),
                     feature_cols=self._agent_feature_cols.get(i),
+                    normalize=norm_stats_cache[i],
                 )
 
     def _split_data_subject(self, df: pd.DataFrame) -> None:
@@ -672,14 +729,20 @@ class MHealthDataModule(l.LightningDataModule):
                 pilot_num_samples=None,
             )
             fcols = self._agent_feature_cols.get(i)
+            train_df = self._select(subj_df, idxs['train'])
+            norm_stats = self._compute_norm_stats(train_df, fcols)
             self.train_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['train']), feature_cols=fcols
+                train_df, feature_cols=fcols, normalize=norm_stats
             )
             self.val_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['val']), feature_cols=fcols
+                self._select(subj_df, idxs['val']),
+                feature_cols=fcols,
+                normalize=norm_stats,
             )
             self.test_datasets[i] = self._make_dataset(
-                self._select(subj_df, idxs['test']), feature_cols=fcols
+                self._select(subj_df, idxs['test']),
+                feature_cols=fcols,
+                normalize=norm_stats,
             )
 
     # ── LightningDataModule interface ─────────────────────────────────────────
@@ -827,7 +890,9 @@ class MHealthDataModule(l.LightningDataModule):
         # input size.
         if self.agent_modalities:
             self.input_dims: dict[str, int] = {
-                str(i): len(MHEALTH_SENSOR_MODALITIES[self.agent_modalities[i]])
+                str(i): len(
+                    MHEALTH_SENSOR_MODALITIES[self.agent_modalities[i]]
+                )
                 for i in self.models
                 if i in self.agent_modalities
             }
@@ -880,24 +945,36 @@ class MHealthDataModule(l.LightningDataModule):
                 for ds in datasets.values()
             )
             if self.comm_data == 'private_pilots':
-                loaders.update({
-                    f'pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
-                    for i, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}': self._make_pilot_loader(
+                            ds, target_num_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'shared_global_pilots':
-                loaders.update({
-                    f'global_pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
-                    for i, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'global_pilot_{i}': self._make_pilot_loader(
+                            ds, target_num_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'pairwise_pilots':
-                loaders.update({
-                    f'pilot_{i}_{j}': self._make_pilot_loader(
-                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
-                        target_num_batches,
-                    )
-                    for i in range(self.n_agents)
-                    for j in range(i + 1, self.n_agents)
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}_{j}': self._make_pilot_loader(
+                            PairwiseDataset(
+                                self.pilot_datasets[i], self.pilot_datasets[j]
+                            ),
+                            target_num_batches,
+                        )
+                        for i in range(self.n_agents)
+                        for j in range(i + 1, self.n_agents)
+                    }
+                )
 
         return CombinedLoader(loaders, mode=self.mode)
 

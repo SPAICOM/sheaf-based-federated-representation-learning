@@ -1,59 +1,51 @@
 """
-ComFed: Communication-efficient Federated Representation Learning orchestrator.
+CoMFed: Communication-Efficient Multi-Modal Federated Learning via Latent-Space Consensus.
 
-This module implements the ComFed framework where learnable projection matrices
-align class-conditional mean latent representations between neighboring agents.
-Unlike SheafFRL, which updates Stiefel matrices in closed form at epoch end,
-ComFed learns its projection matrices end-to-end via backpropagation, jointly
-with all other agent parameters.
-
-Reference: https://arxiv.org/pdf/2603.19067
+Reference: Badi et al., "Communication-Efficient and Robust Multi-Modal Federated
+Learning via Latent-Space Consensus", IEEE Wireless Communications Letters, 2026.
 """
 
 import torch
 import torch.nn as nn
+from hydra.utils import instantiate
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
 class ComFed(BaseOrchestrator):
-    """ComFed: Federated learning with learnable projection matrices.
+    """CoMFed: per-agent projection matrices align class prototypes in a shared latent space.
 
-    Implements the ComFed framework where per-edge projection matrices P_{ij}
-    align class-conditional mean latent representations between neighboring
-    agents. The projection matrices are standard nn.Parameters optimized
-    jointly with the encoders and decoders via the same optimizer.
+    Each agent i owns Pi ∈ R^{proj_dim × d_i} that maps local features to a common
+    d-dimensional space. Training alternates between two steps per batch:
 
-    For each edge (i, j) and each class c observed by both agents:
+      1. wi-step  — minimize  L_task(wi) + λ · L_align(wi; Pi fixed)
+      2. Pi-step  — minimize  L_align(Pi; wi fixed)  ×  proj_steps times
 
-        L_align += || mu_i^c - mu_j^c @ P_{ij}.T ||_F^2
+    Alignment loss for agent i (squared Frobenius / L2 consensus from the paper):
 
-    where mu_i^c is the mean latent representation of class c at agent i.
+        L_align_i = Σ_m  ‖Pi v̄_{i,m}  −  mean_{j∈N_i}(Pj v̄_{j,m})‖²_F
+
+    where v̄_{i,m} is the class-m conditional mean of agent i's encoder output.
+    Neighbor projected means are treated as fixed targets (detached) during both steps.
+
+    Communication payload per round: one proj_dim-dimensional vector per class per agent.
 
     Parameters
     ----------
     agents : dict[int, nn.Module]
-        Dictionary mapping agent indices to their model instances.
     neighbors : dict[int, set[int]]
-        Dictionary mapping each agent index to the set of its neighbor indices.
     optimizer : hydra config
-        Optimizer configuration for training.
+        Shared optimizer config; instantiated separately for wi and Pi.
     max_lmb : float
-        Maximum weight coefficient for the alignment penalty in the total loss.
-    lambda_schedule : str or None
-        Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
+        Regularization weight λ.
     latent_dims : dict
-        Dictionary mapping agent indices to their latent space dimensions.
-
-    Notes
-    -----
-    - Projection matrices are initialized as (rectangular) identity matrices
-      and updated via autodiff — no closed-form epoch-end step is needed.
-    - Edge ordering follows the same convention as SheafFRL: the agent with
-      the higher latent dimension is designated node_i; ties are broken by
-      taking the larger index as node_i.
-    - Communication cost is recorded per training batch (class-conditional
-      mean vectors sent to each neighbor).
+        Mapping from agent index to local encoder output dimension d_i.
+    proj_dim : int
+        Shared latent space dimension d.
+    proj_steps : int
+        Number of Pi gradient steps per training batch (paper uses 10).
+    lambda_schedule : str or None
+        Scheduling strategy: None (constant), 'cosine', or 'exp'.
     """
 
     def __init__(
@@ -63,118 +55,182 @@ class ComFed(BaseOrchestrator):
         optimizer,
         max_lmb: float,
         latent_dims: dict,
+        proj_dim: int,
+        proj_steps: int = 10,
         lambda_schedule: str | None = None,
         **kwargs,
     ):
-        super().__init__(
-            agents=agents,
-            neighbors=neighbors,
-            optimizer=optimizer,
-        )
+        super().__init__(agents=agents, neighbors=neighbors, optimizer=optimizer)
         self.save_hyperparameters()
+        self.automatic_optimization = False
 
-        self.projection_matrices = nn.ParameterDict()
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
-        for i_raw, neighborset in neighbors.items():
-            for j_raw in neighborset:
-                i = int(i_raw)
-                j = int(j_raw)
+        # Per-agent projection matrices Pi: R^{proj_dim × d_i}
+        self.projection_matrices = nn.ParameterDict()
+        for i, d_i in latent_dims_int.items():
+            Pi = torch.empty(proj_dim, d_i)
+            nn.init.xavier_uniform_(Pi)
+            self.projection_matrices[str(i)] = nn.Parameter(Pi)
 
-                # Consistent edge ordering: higher-dimensional node is node_i.
-                # Ties broken by max index to match SheafFRL convention.
-                if latent_dims_int[i] > latent_dims_int[j]:
-                    node_i, node_j = i, j
-                elif latent_dims_int[i] < latent_dims_int[j]:
-                    node_i, node_j = j, i
-                else:
-                    node_i, node_j = max(i, j), min(i, j)
+    # ------------------------------------------------------------------
+    # Optimizers — separate for wi and Pi so each step only touches one
+    # ------------------------------------------------------------------
 
-                edge_key = f'{node_i}_{node_j}'
-
-                if edge_key not in self.projection_matrices:
-                    d_i = latent_dims_int[node_i]
-                    d_j = latent_dims_int[node_j]
-
-                    # Initialize as rectangular identity; requires_grad=True so
-                    # the matrix is updated jointly via autodiff.
-                    proj_matrix = torch.eye(d_i, d_j)
-                    self.projection_matrices[edge_key] = nn.Parameter(
-                        proj_matrix, requires_grad=True
-                    )
+    def configure_optimizers(self) -> list:
+        model_opt = instantiate(
+            self.hparams.optimizer,
+            params=self.agents.parameters(),
+        )
+        proj_opt = instantiate(
+            self.hparams.optimizer,
+            params=self.projection_matrices.parameters(),
+        )
+        return [model_opt, proj_opt]
 
     def on_train_epoch_end(self) -> None:
-        """Flush accumulated communication metrics; no parameter aggregation needed."""
-        self._record_communication_round(prefix='train')
         self._finalize_train_epoch_communication()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_neighbor_indices(self, idx: int) -> set[int]:
+        neighbors = self.hparams.neighbors
+        raw = neighbors.get(idx, neighbors.get(str(idx), set()))
+        return {int(j) for j in raw}
 
     def _compute_class_means(
         self,
         latents: torch.Tensor,
         labels: torch.Tensor,
     ) -> dict[int, torch.Tensor]:
-        """Compute class-conditional mean latent representations.
-
-        Parameters
-        ----------
-        latents : torch.Tensor
-            Latent representations of shape (N, D).
-        labels : torch.Tensor
-            Class labels of shape (N,).
-
-        Returns
-        -------
-        dict[int, torch.Tensor]
-            Mapping from class index to mean latent vector of shape (D,).
-            Gradients are preserved for backpropagation through the alignment
-            loss.
-        """
+        """Class-conditional mean latent vectors."""
         class_means: dict[int, torch.Tensor] = {}
         for c in torch.unique(labels):
             mask = labels == c
             class_means[int(c.item())] = latents[mask].mean(dim=0)
         return class_means
 
-    def _shared_eval(
+    def _project_class_means(
         self,
-        batch: dict[int, list[torch.Tensor]],
-        batch_idx: int,
-        prefix: str,
-    ):
-        """Compute losses and metrics for train/validation/test steps.
+        class_means: dict[int, torch.Tensor],
+        Pi: nn.Parameter,
+    ) -> dict[int, torch.Tensor]:
+        """Compute û_{i,m} = Pi @ v̄_{i,m} for each class m."""
+        return {c: Pi @ mu for c, mu in class_means.items()}
 
-        Task loss is evaluated on the full mini-batch. The ComFed alignment
-        penalty is computed from class-conditional mean latent representations
-        and backpropagated through both the encoders and the projection
-        matrices.
-
-        Parameters
-        ----------
-        batch : dict[int, list[torch.Tensor]]
-            Dictionary mapping agent indices to (input, label) pairs.
-        batch_idx : int
-            Index of the current batch.
-        prefix : str
-            Prefix for logging (e.g., 'train', 'validation', 'test').
-
-        Returns
-        -------
-        tuple[dict, torch.Tensor]
-            Tuple of (outputs, total_loss) where outputs maps agent indices to
-            (prediction, label) pairs and total_loss includes both task and
-            alignment terms.
+    def _alignment_loss(
+        self,
+        proj_means: dict[int, dict[int, torch.Tensor]],
+    ) -> torch.Tensor:
         """
+        Squared Frobenius alignment loss.
+
+        For each (agent i, class m) pair where at least one neighbor also
+        observed class m, accumulates:
+            ‖û_{i,m} − mean_{j∈N_i}(û_{j,m}.detach())‖²
+        """
+        loss = torch.tensor(0.0, device=self.device)
+        n_terms = 0
+
+        for idx_str in self.agents:
+            idx = int(idx_str)
+            proj_i = proj_means.get(idx, {})
+            if not proj_i:
+                continue
+
+            neighbor_indices = self._get_neighbor_indices(idx)
+
+            for c, u_i_c in proj_i.items():
+                neighbor_projs = [
+                    proj_means[j][c].detach()
+                    for j in neighbor_indices
+                    if j in proj_means and c in proj_means[j]
+                ]
+                if not neighbor_projs:
+                    continue
+
+                # Arithmetic mean of neighbors' projected prototypes (L2 consensus)
+                target = torch.stack(neighbor_projs).mean(dim=0)
+                diff = u_i_c - target
+                loss = loss + (diff ** 2).sum()
+                n_terms += 1
+
+        return loss / max(n_terms, 1)
+
+    # ------------------------------------------------------------------
+    # Pi gradient step: encoder weights frozen, only Pi receives gradient
+    # ------------------------------------------------------------------
+
+    def _proj_loss(self, batch: dict) -> torch.Tensor:
+        """Recompute projected class means with frozen encoder; gradient flows to Pi only."""
+        class_means_per_agent: dict[int, dict[int, torch.Tensor]] = {}
+
+        with torch.no_grad():
+            for idx_str, agent in self.agents.items():
+                idx = int(idx_str)
+                key = str(idx) if str(idx) in batch else idx
+                x, y = batch[key]
+                z = agent.encode(x)
+                class_means_per_agent[idx] = self._compute_class_means(z, y)
+
+        proj_means = {
+            idx: self._project_class_means(
+                class_means, self.projection_matrices[str(idx)]
+            )
+            for idx, class_means in class_means_per_agent.items()
+        }
+        return self._alignment_loss(proj_means)
+
+    # ------------------------------------------------------------------
+    # Training step: alternating wi / Pi updates
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx: int) -> torch.Tensor:
+        model_opt, proj_opt = self.optimizers()
+
         if isinstance(batch, tuple):
             batch = batch[0]
 
-        outputs = {}
-        agent_losses = {}
-        agent_performances = {}
-        raw_latents: dict[int, torch.Tensor] = {}
-        labels_per_agent: dict[int, torch.Tensor] = {}
+        # Step 1 — wi update (task loss + alignment loss; Pi untouched by model_opt)
+        model_opt.zero_grad()
+        proj_opt.zero_grad()
+        outputs, total_loss = self._shared_eval(batch, batch_idx, 'train')
+        self.manual_backward(total_loss)
+        model_opt.step()
+
+        # Step 2 — Pi update (alignment loss only, encoder weights frozen)
+        for _ in range(self.hparams.proj_steps):
+            proj_opt.zero_grad()
+            proj_loss = self._proj_loss(batch)
+            self.manual_backward(proj_loss)
+            proj_opt.step()
+
+        self.log(
+            'train/total_loss_step',
+            total_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            batch_size=self._resolve_batch_size(batch),
+        )
+        return total_loss
+
+    # ------------------------------------------------------------------
+    # Shared evaluation (train / val / test)
+    # ------------------------------------------------------------------
+
+    def _shared_eval(self, batch, batch_idx: int, prefix: str):
+        if isinstance(batch, tuple):
+            batch = batch[0]
+
+        outputs: dict = {}
+        agent_losses: dict[int, torch.Tensor] = {}
+        agent_performances: dict[int, torch.Tensor] = {}
+        class_means_per_agent: dict[int, dict[int, torch.Tensor]] = {}
 
         def _resolve_key(i: int):
-            """Return the key used for agent i in the batch dict."""
             str_key = str(i)
             return str_key if str_key in batch else i
 
@@ -182,78 +238,40 @@ class ComFed(BaseOrchestrator):
             idx = int(idx_str)
             x, y = batch[_resolve_key(idx)]
 
-            # Single encoder forward pass reused for task loss and alignment.
             z = agent.encode(x)
             y_hat = agent.decoder(z)
 
             outputs[idx] = (y_hat.detach(), y)
-            raw_latents[idx] = z
-            labels_per_agent[idx] = y
+            # class means preserve gradient so alignment loss reaches encoder (wi step)
+            class_means_per_agent[idx] = self._compute_class_means(z, y)
 
-            task_loss = agent.compute_loss(y_hat, y)
-            task_performance = agent.task_performance(y_hat, y)
+            agent_losses[idx] = agent.compute_loss(y_hat, y)
+            agent_performances[idx] = agent.task_performance(y_hat, y)
 
-            agent_losses[idx] = task_loss
-            agent_performances[idx] = task_performance
-
-        # Compute class-conditional means once per agent (reused below).
-        class_means_per_agent: dict[int, dict[int, torch.Tensor]] = {}
-        for idx, z in raw_latents.items():
-            class_means_per_agent[idx] = self._compute_class_means(
-                z, labels_per_agent[idx]
+        proj_means = {
+            idx: self._project_class_means(
+                class_means, self.projection_matrices[str(idx)]
             )
+            for idx, class_means in class_means_per_agent.items()
+        }
 
-        # Record communication: each agent broadcasts its class means to
-        # all neighbors once per batch.
+        alignment_loss = self._alignment_loss(proj_means)
+
         if prefix == 'train':
+            self._record_communication_round(n_rounds=1, prefix=prefix)
             for idx_str in self.agents:
                 idx = int(idx_str)
-                means = class_means_per_agent.get(idx, {})
-                if not means:
+                p_means = proj_means.get(idx, {})
+                if not p_means:
                     continue
-                means_tensor = torch.stack(list(means.values())).detach()
-                n_neighbors = len(
-                    self.hparams.neighbors.get(
-                        idx, self.hparams.neighbors.get(str(idx), set())
-                    )
-                )
+                means_tensor = torch.stack(list(p_means.values())).detach()
+                n_neighbors = len(self._get_neighbor_indices(idx))
                 self._record_communication(
-                    means_tensor,
-                    n_transmissions=n_neighbors,
+                    means_tensor, n_transmissions=n_neighbors
                 )
-
-        # ComFed alignment penalty over all edges.
-        alignment_penalty: torch.Tensor | float = 0.0
-
-        for edge_key, P in self.projection_matrices.items():
-            node_i, node_j = map(int, edge_key.split('_'))
-
-            if (
-                node_i not in class_means_per_agent
-                or node_j not in class_means_per_agent
-            ):
-                continue
-
-            means_i = class_means_per_agent[node_i]
-            means_j = class_means_per_agent[node_j]
-
-            shared_classes = sorted(set(means_i) & set(means_j))
-            if not shared_classes:
-                continue
-
-            # Shape: (C, d_i) and (C, d_j) respectively.
-            mu_i = torch.stack([means_i[c] for c in shared_classes])
-            mu_j = torch.stack([means_j[c] for c in shared_classes])
-
-            # Project j's means into i's latent space via P (d_i x d_j).
-            # mu_j @ P.T has shape (C, d_i), same as mu_i.
-            diff = mu_i - torch.matmul(mu_j, P.T)
-            alignment_penalty = alignment_penalty + (diff**2).sum(dim=1).mean()
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
-        total_loss = (
-            total_task_loss + self._effective_lambda_reg() * alignment_penalty
-        )
+        total_loss = total_task_loss + self._effective_lambda_reg() * alignment_loss
 
         self._log_shared_metrics(
             prefix=prefix,
@@ -262,7 +280,7 @@ class ComFed(BaseOrchestrator):
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
-            extra_metrics={f'{prefix}/alignment_penalty': alignment_penalty},
+            extra_metrics={f'{prefix}/alignment_loss': alignment_loss},
             prog_bar=False,
             per_agent_loss_name='task_loss',
         )
