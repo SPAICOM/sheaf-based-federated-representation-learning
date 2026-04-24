@@ -374,7 +374,6 @@ class HeteroConvLayer(nn.Module):
         # Defining the blocks of the layer
         layers = [
             nn.Conv2d(in_ch, out_ch, **conv_kwargs),
-            Scaler(rate),
         ]
 
         if use_batchnorm:
@@ -551,9 +550,7 @@ class HeteroMLP(nn.Module):
 
             # Optional batch normalization after linear transformation
             if use_batchnorm:
-                layers.append(
-                    nn.BatchNorm1d(scaled_h_dim, track_running_stats=False)
-                )
+                layers.append(nn.BatchNorm1d(scaled_h_dim))
 
             # Activation function (handle both class and instance)
             layers.append(

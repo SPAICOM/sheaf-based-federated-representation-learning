@@ -1,17 +1,18 @@
 defaults:
-  - dataset: cifar10
+  - dataset: mnist
   - model: hetero_cnn_classifier
-  - orchestrator: sheaf_frl
+  - orchestrator: heterofl
   - optimizer: sgd
   - _self_
 
 seed: 42
-study_name: "HeteroRate CIFAR10 30agents"
+study_name: "HeteroRate MNIST 30agents"
 
 # Three complexity tiers, 10 agents each:
 #   rate=1.00  → agents  0-9   (full-width, most complex)
 #   rate=0.50  → agents 10-19  (half-width)
 #   rate=0.25  → agents 20-29  (quarter-width, simplest)
+
 agents:
   0:  {rate: 1.0}
   1:  {rate: 1.0}
@@ -53,14 +54,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__hetero-rate-30agents
+  project: sheaf-repr-learning__hetero-rate-30agents-mnist
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   log_model: false
 
 trainer:
   # 200 rounds × 5 local epochs = 1000 epochs max; orchestrator stops early
-  max_epochs: 1000
+  max_epochs: 200
   accelerator: auto
   devices: 1
   deterministic: true
@@ -92,29 +93,32 @@ dataset:
   classes_per_agent: 10
   alpha: 0.5
   monitor_test_during_fit: true
-  batch_size: 256
+  batch_size: 10
   num_workers: 0
   mode: min_size
   pilot_split: 0.05
-  pilot_batch_size: 64
+  pilot_num_samples: 64
   comm_data: shared_global_pilots
 
 model:
   encoder_hidden_dims: [32, 64, 128]
-  decoder_hidden_dims: [256]
+  decoder_hidden_dims: [64]
   dropout: 0.1
   use_batchnorm: true
 
+
 orchestrator:
-  # sheaf_frl defaults (active when orchestrator=sheaf_frl)
+  # sheaf_frl params (active when orchestrator=sheaf_frl)
   lambda_sheaf: 0.05
   parseval_normalization: false
   l2_normalization: false
   filter_unseen_classes: true
   use_prototypes: true
-  # Sync schedule matching heterofl: 5 local epochs per round, 200 rounds
-  local_epochs: 5
+  local_epochs: 1
   max_global_rounds: 200
+  local_steps: null
+  # heterofl params (active when orchestrator=heterofl)
+  sync_on_train_start: true
   # sheaf_fmtl defaults (active when orchestrator=sheaf_fmtl)
   gamma: 0.001
   lambda_reg: 0.001

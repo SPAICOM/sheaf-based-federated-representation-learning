@@ -47,6 +47,10 @@ class HeteroFL(BaseOrchestrator):
     No central server or global encoder exists.  Decoders are never
     aggregated and remain local to each node.
 
+    Per-agent metrics are suppressed (``_LOG_PER_AGENT_METRICS = False``);
+    only global aggregates are emitted to avoid flooding WandB with one
+    series per agent.
+
     Parameters
     ----------
     agents : dict[int, nn.Module]
@@ -86,6 +90,8 @@ class HeteroFL(BaseOrchestrator):
         first local update so that neighbors start from a common basis
         (default: ``True``).
     """
+
+    _LOG_PER_AGENT_METRICS: bool = False
 
     def __init__(
         self,
@@ -294,8 +300,10 @@ class HeteroFL(BaseOrchestrator):
            - j's slice within that overlap is added to i's accumulator
              weighted by j's sample count.
            - The weight accumulator ``weight_sum`` is tracked per
-             output-channel position (dim 0) so that the normalisation
-             denominator varies with neighborhood coverage.
+             position (same shape as the tensor) so that the denominator
+             at each position only counts neighbors that actually reached
+             that position — critical for deeper Conv layers where both
+             output and input channels scale with rate.
 
         3. Loads the normalised result back into node i's encoder.
 
@@ -342,10 +350,12 @@ class HeteroFL(BaseOrchestrator):
             for name in param_names:
                 tensor_i = snap_i[name]  # shape owned by node i
                 accum = torch.zeros_like(tensor_i, dtype=torch.float32)
-                # Per-output-channel weight accumulator (dim 0).
-                weight_sum = torch.zeros(
-                    tensor_i.shape[0], dtype=torch.float32
-                )
+                # Per-position weight accumulator (same shape as tensor_i) so
+                # that positions only reachable by high-rate neighbors are not
+                # diluted by the weights of low-rate neighbors that didn't
+                # contribute to those positions (e.g. in_channels > rate * C
+                # in deeper Conv layers where both dims scale with rate).
+                weight_sum = torch.zeros_like(tensor_i, dtype=torch.float32)
 
                 for j in neighborhood:
                     if j not in agents:
@@ -357,17 +367,14 @@ class HeteroFL(BaseOrchestrator):
                         slice(min(s_i, s_j))
                         for s_i, s_j in zip(tensor_i.shape, tensor_j.shape)
                     )
-                    covered_out = slices[0].stop
-                    if covered_out == 0:
+                    if not slices or any(s.stop == 0 for s in slices):
                         continue
 
                     raw_w = float(counts.get(j, 1))
                     accum[slices] += tensor_j[slices] * raw_w
-                    weight_sum[:covered_out] += raw_w
+                    weight_sum[slices] += raw_w
 
-                norm = weight_sum.view(-1, *([1] * (tensor_i.ndim - 1))).clamp(
-                    min=1e-8
-                )
+                norm = weight_sum.clamp(min=1e-8)
                 dtype = agent.encoder.state_dict()[name].dtype
                 new_state[name] = (accum / norm).to(dtype=dtype)
 
@@ -407,9 +414,7 @@ class HeteroFL(BaseOrchestrator):
             or self._global_aggregation_count < int(max_rounds)
         ):
             return
-        trainer = getattr(self, '_trainer', None)
-        if trainer is not None:
-            trainer.should_stop = True
+        self.trainer.should_stop = True
 
     def on_train_epoch_end(self) -> None:
         """Aggregate neighborhood encoders on the epoch schedule."""
@@ -423,9 +428,29 @@ class HeteroFL(BaseOrchestrator):
                 and completed != self._last_aggregated_epoch
                 and completed % interval == 0
             ):
+                kb_before = self._communication_by_split['train']['kilobytes']
                 self._synchronize()
+                kb_this_round = (
+                    self._communication_by_split['train']['kilobytes'] - kb_before
+                )
                 self._last_aggregated_epoch = completed
                 self._global_aggregation_count += 1
+                self.log(
+                    'global_round',
+                    float(self._global_aggregation_count),
+                    logger=True,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                )
+                self.log(
+                    'train/communication_kb_per_round',
+                    kb_this_round,
+                    logger=True,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                )
                 self._maybe_stop_after_global_aggregation()
 
         self._finalize_train_epoch_communication()

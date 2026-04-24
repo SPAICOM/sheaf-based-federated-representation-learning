@@ -1,4 +1,8 @@
 _target_: src.agents.HeteroCNNClassifier
+
+in_features: null
+num_classes: null
+
 encoder_hidden_dims: [32, 64, 128]
 decoder_hidden_dims: [256]
 rate: 1.0
