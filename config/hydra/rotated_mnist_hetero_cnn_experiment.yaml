@@ -1,0 +1,142 @@
+defaults:
+  - dataset: mnist
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - _self_
+  - optional hpo: null
+
+
+seed: 42
+study_name: "Rotated MNIST Hetero CNN"
+
+agent_rotation_groups:
+  group_values: [0, 90, 180, 270]
+  seed: ${seed}
+
+graph:
+  neighbors_mode: "erdos_renyi"
+  seed: 42
+  p: 0.3
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: rotated_mnist_hetero_cnn
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 20
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 5
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+  checkpoint:
+    _target_: lightning.pytorch.callbacks.ModelCheckpoint
+    monitor: validation/avg_task_performance_epoch
+    mode: max
+    save_top_k: 1
+    save_last: true
+
+  early_stopping:
+    _target_: lightning.pytorch.callbacks.EarlyStopping
+    monitor: validation/avg_task_performance_epoch
+    patience: 10
+    mode: max
+
+dataset:
+  split_strategy: uniform
+  n_agents: 40
+  batch_size: 256
+  num_workers: 0
+  monitor_test_during_fit: false
+  mode: min_size
+  starve_clients: true
+  pilot_split: 0.05
+  pilot_batch_size: 128
+  comm_data: shared_global_pilots
+  pilot_apply_agent_rotations: true
+
+model:
+  encoder_hidden_dims: [32, 64, 128]
+  decoder_hidden_dims: [256]
+  dropout: 0.1
+  use_batchnorm: true
+  l1_reg: 0.0
+
+agents:
+  0: &small_half
+    encoder_hidden_dims: [16, 32]
+    decoder_hidden_dims: [64]
+  1: *small_half
+  2: *small_half
+  3: *small_half
+  4: *small_half
+  5: *small_half
+  6: *small_half
+  7: *small_half
+  8: *small_half
+  9: *small_half
+  10: &small
+    encoder_hidden_dims: [32, 64]
+    decoder_hidden_dims: [128]
+  11: *small
+  12: *small
+  13: *small
+  14: *small
+  15: *small
+  16: *small
+  17: *small
+  18: *small
+  19: *small
+  20: &medium_half
+    encoder_hidden_dims: [16, 32, 64]
+    decoder_hidden_dims: [128]
+  21: *medium_half
+  22: *medium_half
+  23: *medium_half
+  24: *medium_half
+  25: *medium_half
+  26: *medium_half
+  27: *medium_half
+  28: *medium_half
+  29: *medium_half
+  30: &medium
+    encoder_hidden_dims: [32, 64, 128]
+    decoder_hidden_dims: [256]
+  31: *medium
+  32: *medium
+  33: *medium
+  34: *medium
+  35: *medium
+  36: *medium
+  37: *medium
+  38: *medium
+  39: *medium
+
+orchestrator:
+  max_lmb: 0.01
+  anchor_strategy: pilots
+  #num_anchors: 64
+  parseval_normalization: true
+  l2_normalization: false
+  #local_steps: 1
+  update_v_every_n_epochs: 1
+  use_prototypes: false
+  sparse_communication: False
+  sparse_epsilon: 1e-6
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

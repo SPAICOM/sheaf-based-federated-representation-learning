@@ -41,6 +41,8 @@ class PersonalizedClassifier(BaseAgent):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
     """
 
     def __init__(
@@ -52,6 +54,7 @@ class PersonalizedClassifier(BaseAgent):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         super().__init__()
 
@@ -60,6 +63,7 @@ class PersonalizedClassifier(BaseAgent):
 
         self._encoder = encoder
         self._pool = nn.AdaptiveAvgPool2d((1, 1))
+        self._last_latent = None
         self._decoder = MLP(
             input_dim=latent_dim,
             output_dim=num_classes,
@@ -70,6 +74,7 @@ class PersonalizedClassifier(BaseAgent):
         )
 
         self.accuracy = MulticlassAccuracy(num_classes=num_classes)
+        self.l1_reg = l1_reg
 
     @property
     def encoder(self) -> nn.Module:
@@ -98,18 +103,38 @@ class PersonalizedClassifier(BaseAgent):
         if features.ndim == 4:
             features = self._pool(features)
 
-        return features.flatten(1)
+        latent = features.flatten(1)
+        self._last_latent = latent
+        return latent
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass: encode then decode to class logits."""
         return self._decoder(self.encode(x))
 
-    # TODO: add l2 regularization to loss 
     def compute_loss(
         self, y_hat: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
-        """Compute cross-entropy loss."""
-        return F.cross_entropy(y_hat, y.long())
+        """Compute cross-entropy loss plus optional latent sparsity penalty."""
+        loss = F.cross_entropy(y_hat, y.long())
+        return loss + self.latent_sparsity_penalty()
+
+    def latent_sparsity_penalty(self, latents: torch.Tensor | None = None ) -> torch.Tensor:
+        """Return the L1 sparsity penalty on encoder latents."""
+        reference = latents if latents is not None else self._last_latent
+        if latents is None:
+          self._last_latent = None
+
+        if reference is None:
+          if self.l1_reg <= 0.0:
+              param = next(self.parameters(), None)
+              return torch.tensor(0.0) if param is None else param.new_zeros(())
+          raise RuntimeError(
+              'Latent sparsity penalty requires encoder latents. '
+              'Call encode/forward first or pass latents explicitly.'
+          )
+        if self.l1_reg <= 0.0 or reference.numel() == 0:
+          return reference.new_zeros(())
+        return self.l1_reg * reference.abs().sum(dim=1).mean()
 
     def task_performance(
         self, y_hat: torch.Tensor, y: torch.Tensor

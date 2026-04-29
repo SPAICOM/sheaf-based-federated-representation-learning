@@ -4,8 +4,8 @@ Sheaf-based Federated Representation Learning orchestrator.
 This module implements the proposed federated learning framework with
 Sheaf regularization that maintains aligned latent spaces across agents
 through Stiefel manifold optimization of cross-covariance matrices. 
-Anchor strategies are implemented with explicit semantic correspondence 
-keys or shared pilot batches so neighboring agents are aligned accurately.
+Shared pilot batches provide the semantic correspondence needed to align
+neighboring agents accurately.
 """
 
 from typing import Any
@@ -35,11 +35,14 @@ class SheafFRL(BaseOrchestrator):
         parseval_normalization: bool,
         l2_normalization: bool,
         parseval_eps: float = 1e-4,
-        local_steps: int = 1,
+        #local_steps: int = 1,
         anchor_strategy: str = 'pilots',
-        num_anchors: int = 64,
+        num_anchors: int = 128,
         use_prototypes: bool = False,
         lambda_schedule: str | None = None,
+        sparse_communication: bool = False,
+        sparse_epsilon: float = 1e-5,
+        update_v_every_n_epochs: int = 1,
         **kwargs,
     ):
         super().__init__(
@@ -48,11 +51,16 @@ class SheafFRL(BaseOrchestrator):
             optimizer=optimizer,
         )
 
-        if anchor_strategy not in {'pilots', 'batch_anchors'}:
+        anchor_strategy = str(anchor_strategy)
+        update_v_every_n_epochs = int(update_v_every_n_epochs)
+
+        if anchor_strategy != 'pilots':
             raise ValueError(
                 f'Unknown anchor_strategy: {anchor_strategy}. '
-                "Valid options: ['batch_anchors', 'pilots']"
+                "Valid options: ['pilots']"
             )
+        if update_v_every_n_epochs < 1:
+            raise ValueError('update_v_every_n_epochs must be at least 1')
 
         self.save_hyperparameters()
         self.anchor_config = AnchorConfig(
@@ -60,11 +68,10 @@ class SheafFRL(BaseOrchestrator):
             l2_normalization=bool(l2_normalization),
             parseval_eps=float(parseval_eps),
             use_prototypes=bool(use_prototypes),
+            sparse_communication=bool(sparse_communication),
+            sparse_epsilon=float(sparse_epsilon),
         )
-
-        self.epoch_latents_cache: dict[int, list[torch.Tensor]] = {int(k): [] for k in agents.keys()}
-        self.epoch_labels_cache: dict[int, list[torch.Tensor]] = {int(k): [] for k in agents.keys()}
-
+        self._latest_pilots: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
         self.stiefel_matrices = nn.ParameterDict()
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
@@ -92,21 +99,16 @@ class SheafFRL(BaseOrchestrator):
     def _resolve_key(self, batch: dict, idx: int) -> int | str:
         str_key = str(idx)
         return str_key if str_key in batch else idx
-    
+
     def _extract_pilot_batch(self, batch: dict, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Extract pilot data for an agent, handling global, private, or pairwise keys."""
         if f'pilot_{idx}' in batch:
             return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
         if f'global_pilot_{idx}' in batch:
             return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
         if 'global_pilot' in batch:
             return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
-        """Extract pilot data for an agent, handling global, private, or pairwise keys."""
-        if f'global_pilot_{idx}' in batch:
-            return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
-            
-        if f'pilot_{idx}' in batch:
-            return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
-            
+
         for key, value in batch.items():
             if isinstance(key, str) and key.startswith('pilot_'):
                 parts = key.split('_')
@@ -114,7 +116,7 @@ class SheafFRL(BaseOrchestrator):
                     i, j = int(parts[1]), int(parts[2])
                     if i == idx:
                         return value[0], value[1], value[2]
-                    elif j == idx:
+                    if j == idx:
                         return value[3], value[4], value[5]
                         
         raise ValueError(f"Pilot batch missing for agent {idx}.")
@@ -143,6 +145,32 @@ class SheafFRL(BaseOrchestrator):
         return torch.stack(prototypes, dim=0), torch.tensor(
             prototype_labels, device=labels.device, dtype=labels.dtype,
         )
+
+    def _pilot_match_keys(self, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None) -> torch.Tensor:
+        if sample_ids is not None:
+            return sample_ids
+        return y_pilot
+
+    def _normalize_pilot_latents(self, pilot_latents: torch.Tensor, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None,) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.anchor_config.use_prototypes:
+            step_latents, step_keys = self._compute_class_prototypes(
+                pilot_latents,
+                y_pilot,
+            )
+        else:
+            step_latents = pilot_latents
+            step_keys = self._pilot_match_keys(y_pilot, sample_ids)
+
+        return normalize_anchor_matrix(step_latents, self.anchor_config), step_keys
+
+    @torch.no_grad()
+    def _encode_pilots_eval(self, agent: nn.Module, x_pilot: torch.Tensor) -> torch.Tensor:
+        was_training = agent.training
+        agent.eval()
+        try:
+            return agent.encode(x_pilot)
+        finally:
+            agent.train(was_training)
 
     def _match_keys(
         self,
@@ -215,47 +243,67 @@ class SheafFRL(BaseOrchestrator):
 
     def on_train_start(self) -> None:
         super().on_train_start()
-        self._train_local_step_count = 0
-        for idx in self.epoch_latents_cache:
-            self.epoch_latents_cache[idx].clear()
-            self.epoch_labels_cache[idx].clear()
+        self._latest_pilots.clear()
+
+    def on_train_epoch_start(self) -> None:
+        self._latest_pilots.clear()
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
+        if self.current_epoch % self.hparams.update_v_every_n_epochs != 0:
+            self._latest_pilots.clear()
+            self._finalize_train_epoch_communication()
+            return
+
         epoch_latents: dict[int, torch.Tensor] = {}
         epoch_keys: dict[int, torch.Tensor] = {}
+        payloads_per_agent: dict[int, Any] = {}
 
         for idx_str in self.agents.keys():
             idx = int(idx_str)
-            if self.epoch_latents_cache.get(idx):
-                raw_A = torch.cat(self.epoch_latents_cache[idx], dim=0).to(self.device)
-                raw_keys = torch.cat(self.epoch_labels_cache[idx], dim=0).to(self.device)
+            latest_pilots = self._latest_pilots.get(idx)
+            if latest_pilots is None:
+                continue
 
-                if self.anchor_config.use_prototypes:
-                    final_A, final_keys = self._compute_class_prototypes(raw_A, raw_keys)
-                elif self.hparams.num_anchors < raw_A.shape[0]:
-                    # Global Uniform Subsampling
-                    g = torch.Generator(device=self.device).manual_seed(self.current_epoch)
-                    indices = torch.randperm(
-                        raw_A.shape[0],
-                        generator=g,
-                        device=raw_A.device,
-                    )[: self.hparams.num_anchors]
-                    final_A = raw_A[indices]
-                    final_keys = raw_keys[indices]
-                else:
-                    final_A, final_keys = raw_A, raw_keys
+            x_pilot, y_pilot, sample_ids = latest_pilots
+            x_pilot = x_pilot.to(self.device)
+            y_pilot = y_pilot.to(self.device)
+            if sample_ids is not None:
+                sample_ids = sample_ids.to(self.device)
 
-                epoch_latents[idx] = normalize_anchor_matrix(final_A, self.anchor_config)
-                epoch_keys[idx] = final_keys
+            raw_A = self._encode_pilots_eval(self.agents[idx_str], x_pilot)
+            final_A, final_keys = self._normalize_pilot_latents(
+                raw_A,
+                y_pilot,
+                sample_ids,
+            )
+
+            epoch_latents[idx] = final_A
+            epoch_keys[idx] = final_keys
+            payloads_per_agent[idx] = communication_anchor_payload(
+                anchor_matrix=final_A,
+                labels=final_keys,
+                config=self.anchor_config,
+            )
 
         if epoch_latents:
+            self._record_communication_round(n_rounds=1, prefix='train')
+            for idx, payload in payloads_per_agent.items():
+                n_neighbors = len(
+                    self.hparams.neighbors.get(
+                        idx,
+                        self.hparams.neighbors.get(str(idx), set()),
+                    )
+                )
+                if n_neighbors > 0:
+                    self._record_communication(
+                        payload,
+                        n_transmissions=n_neighbors,
+                        prefix='train',
+                    )
             self._update_stiefel_matrices(epoch_latents, epoch_keys)
 
-        for idx in self.epoch_latents_cache:
-            self.epoch_latents_cache[idx].clear()
-            self.epoch_labels_cache[idx].clear()
-
+        self._latest_pilots.clear()
         self._finalize_train_epoch_communication()
 
     def _shared_eval(
@@ -272,10 +320,8 @@ class SheafFRL(BaseOrchestrator):
         agent_performances = {}
 
         latents_per_agent: dict[int, torch.Tensor] = {}
+        payloads_per_agent: dict[int, Any] = {}
         keys_per_agent: dict[int, torch.Tensor] = {}
-        task_latents_cache: dict[int, torch.Tensor] = {}
-        task_labels_cache: dict[int, torch.Tensor] = {}
-        anchor_config = self._effective_anchor_config()
 
         # Compute task loss
         for idx_str, agent in self.agents.items():
@@ -285,83 +331,43 @@ class SheafFRL(BaseOrchestrator):
             latent_task = agent.encode(x_task)
             y_hat = agent.decoder(latent_task)
 
-            task_latents_cache[idx] = latent_task
-            task_labels_cache[idx] = y_task
-
             outputs[idx_str] = (y_hat.detach(), y_task)
             agent_losses[idx] = agent.compute_loss(y_hat, y_task)
             agent_performances[idx] = agent.task_performance(y_hat, y_task)
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
 
-        is_communication_step = True
-        if prefix == 'train':
-            self._train_local_step_count += 1
-            is_communication_step = (
-                self._train_local_step_count % int(self.hparams.local_steps) == 0
-            )
-
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            
-            # Extract anchors
-            if self.hparams.anchor_strategy == 'batch_anchors':
-                raw_latents = task_latents_cache[idx]
-                raw_keys = task_labels_cache[idx]
-                class_labels = task_labels_cache[idx]
-            elif self.hparams.anchor_strategy == 'pilots':
-                x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
-                raw_latents = agent.encode(x_pilot)
-                raw_keys = sample_ids if sample_ids is not None else y_pilot
-                class_labels = y_pilot
-            else:
-                raise ValueError(f'Unknown anchor_strategy: {self.hparams.anchor_strategy}')
+            x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
+            self._latest_pilots[idx] = (x_pilot, y_pilot, sample_ids)
 
-            # Caching (ensuring SVD groups by class if prototype, else by sample ID for pilots)
-            if prefix == 'train':
-                self.epoch_latents_cache[idx].append(raw_latents.detach().cpu())
-                keys_to_cache = class_labels if anchor_config.use_prototypes else raw_keys
-                self.epoch_labels_cache[idx].append(keys_to_cache.detach().cpu())
+            pilot_latents = agent.encode(x_pilot)
+            step_latents, step_keys = self._normalize_pilot_latents(
+                pilot_latents,
+                y_pilot,
+                sample_ids,
+            )
 
-            # Apply strategy to current step
-            if anchor_config.use_prototypes:
-                step_latents, step_keys = self._compute_class_prototypes(raw_latents, class_labels)
-            elif self.hparams.num_anchors < raw_latents.shape[0]:
-                step_latents = raw_latents[:self.hparams.num_anchors]
-                step_keys = raw_keys[:self.hparams.num_anchors]
-            else:
-                step_latents, step_keys = raw_latents, raw_keys
-
-            latents_per_agent[idx] = normalize_anchor_matrix(step_latents, anchor_config)
+            latents_per_agent[idx] = step_latents
             keys_per_agent[idx] = step_keys
 
-        # Early exit for local training steps
-        if prefix == 'train' and not is_communication_step:
-            sheaf_penalty = torch.tensor(0.0, device=self.device)
-            self._log_shared_metrics(
-                prefix=prefix,
-                agent_losses=agent_losses,
-                agent_performances=agent_performances,
-                batch_size=self._resolve_batch_size(batch),
-                agent_sample_counts=self._resolve_agent_sample_counts(batch),
-                total_loss=total_task_loss,
-                extra_metrics={f'{prefix}/sheaf_penalty': sheaf_penalty},
-                prog_bar=False,
-                per_agent_loss_name='task_loss',
+            payloads_per_agent[idx] = communication_anchor_payload(
+                anchor_matrix=step_latents,
+                labels=step_keys,
+                config=self.anchor_config,
             )
-            return outputs, total_loss
 
-        # Communication Payload
-        if prefix in {'train', 'test', 'test_monitor'}:
+        if prefix in self._COMMUNICATION_SPLITS:
             self._record_communication_round(n_rounds=1, prefix=prefix)
-            for idx, latents in latents_per_agent.items():
-                n_neighbors = len(self.hparams.neighbors.get(idx, self.hparams.neighbors.get(str(idx), set())))
-                if n_neighbors > 0:
-                    payload = communication_anchor_payload(
-                        anchor_matrix=latents,
-                        labels=keys_per_agent[idx],
-                        config=anchor_config,
+            for idx, payload in payloads_per_agent.items():
+                n_neighbors = len(
+                    self.hparams.neighbors.get(
+                        idx,
+                        self.hparams.neighbors.get(str(idx), set()),
                     )
+                )
+                if n_neighbors > 0:
                     self._record_communication(
                         payload, n_transmissions=n_neighbors, prefix=prefix,
                     )

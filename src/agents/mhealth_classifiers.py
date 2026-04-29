@@ -37,6 +37,8 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
 
     Notes
     -----
@@ -51,6 +53,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = MHealthAccelerometerEncoder(output_dim=output_dim)
         super().__init__(
@@ -61,6 +64,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
 
@@ -84,7 +88,8 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
-
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
     Notes
     -----
     Expects inputs of shape ``(B, 3)`` (point-wise) or ``(B, T, 3)`` (windowed).
@@ -98,6 +103,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = MHealthGyroscopeEncoder(output_dim=output_dim)
         super().__init__(
@@ -108,6 +114,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
 
@@ -131,6 +138,8 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
 
     Notes
     -----
@@ -145,6 +154,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = MHealthMagnetometerEncoder(output_dim=output_dim)
         super().__init__(
@@ -155,6 +165,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
 
@@ -178,6 +189,8 @@ class MHealthECGClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
 
     Notes
     -----
@@ -192,6 +205,7 @@ class MHealthECGClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = MHealthECGEncoder(output_dim=output_dim)
         super().__init__(
@@ -202,4 +216,5 @@ class MHealthECGClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )

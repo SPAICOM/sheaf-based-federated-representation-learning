@@ -38,6 +38,8 @@ class DeepSenseRGBClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
 
     Notes
     -----
@@ -55,6 +57,7 @@ class DeepSenseRGBClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = DeepSenseRGBEncoder(
             input_channels=input_channels,
@@ -68,6 +71,7 @@ class DeepSenseRGBClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
 
@@ -94,6 +98,8 @@ class DeepSenseLiDARClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
     """
 
     def __init__(
@@ -105,6 +111,7 @@ class DeepSenseLiDARClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = DeepSenseLiDAREncoder(
             input_channels=input_channels,
@@ -118,6 +125,7 @@ class DeepSenseLiDARClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
 
@@ -143,6 +151,8 @@ class DeepSenseMMWaveClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
 
     Notes
     -----
@@ -158,6 +168,7 @@ class DeepSenseMMWaveClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = DeepSenseMMWaveEncoder(
             input_channels=input_channels,
@@ -171,4 +182,5 @@ class DeepSenseMMWaveClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )

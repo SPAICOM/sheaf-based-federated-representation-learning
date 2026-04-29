@@ -22,6 +22,7 @@ Each orchestrator:
 """
 
 from .comfed import ComFed
+from .comm_efficient_frl import CommEfficientFRL
 from .sheaf_align import SheafAlign
 from .dfedu import DFedU
 from .dpsgd import DPSGD
@@ -49,4 +50,5 @@ __all__ = [
     "NonCooperativeLearning",
     "SheafFMTL",
     "SheafFRL",
+    "CommEfficientFRL",
 ]

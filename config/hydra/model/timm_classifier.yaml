@@ -9,6 +9,7 @@ freeze_encoder: false
 decoder_hidden_dims: [256]
 
 dropout: 0.1
+l1_reg: 0.0
 
 activation:
   _target_: torch.nn.ReLU

@@ -43,6 +43,7 @@ class LatentClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         encoder = MLP(
             input_dim=in_features,
@@ -51,6 +52,7 @@ class LatentClassifier(PersonalizedClassifier):
             activation=activation,
             dropout=dropout,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
 
         super().__init__(
@@ -61,4 +63,5 @@ class LatentClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )

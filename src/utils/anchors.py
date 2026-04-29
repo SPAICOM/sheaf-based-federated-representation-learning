@@ -22,7 +22,7 @@ VALID_ANCHOR_STRATEGIES = {
 
 @dataclass(frozen=True)
 class AnchorConfig:
-    """Configuration for anchor construction and normalization."""
+    """Configuration for anchor construction, communication and normalization."""
     # strategy: str
     # num_anchors: int
     parseval_normalization: bool
@@ -30,6 +30,8 @@ class AnchorConfig:
     parseval_eps: float = 1e-4
     filter_unseen_classes: bool = False
     use_prototypes: bool = False
+    sparse_communication: bool = False
+    sparse_epsilon: float = 1e-5
 
 '''
 def supported_anchor_strategy(anchor_strategy: str) -> str:
@@ -41,9 +43,7 @@ def supported_anchor_strategy(anchor_strategy: str) -> str:
             f'{sorted(VALID_ANCHOR_STRATEGIES)}'
         )
     return strategy
-'''
 
-'''
 def parseval_normalize(
     anchor_matrix: torch.Tensor,
     *,
@@ -133,7 +133,6 @@ def parseval_normalize(
         )
     )
     return parseval_rows.to(dtype=original_dtype)
-
 
 def l2_normalize(anchor_matrix: torch.Tensor) -> torch.Tensor:
     """Apply row-wise L2 normalization to anchor features."""
@@ -233,32 +232,49 @@ def communication_anchor_payload(
     anchor_matrix: torch.Tensor,
     labels: torch.Tensor,
     config: AnchorConfig,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Return the communicated anchor payload for one exchange step.
 
     Communication cost ignores unseen-class filtering because agents do not
     know which classes their neighbors have observed before exchanging pilot
     features. When prototype mode is enabled, each agent sends one prototype
     per class present in its local pilot batch; otherwise it sends the full
-    pilot embedding matrix.
+    pilot embedding matrix. When sparse communication is enabled, the helper
+    compares the dense payload against a masked sparse representation made of
+    the surviving values plus their coordinate indices, and returns whichever
+    is smaller.
     """
     if not config.use_prototypes:
-        return anchor_matrix
+        payload = anchor_matrix
+    else:
+        unique_classes = torch.unique(labels, sorted=True)
+        if unique_classes.numel() == 0:
+            return anchor_matrix[:0]
+        else:
+            prototypes = []
+            for class_label in unique_classes.tolist():
+                mask = labels == class_label
+                if mask.any():
+                    prototypes.append(anchor_matrix[mask].mean(dim=0))
+            payload = torch.stack(prototypes, dim=0) if prototypes else anchor_matrix[:0]
 
-    unique_classes = torch.unique(labels, sorted=True)
-    if unique_classes.numel() == 0:
-        return anchor_matrix[:0]
+    if config.sparse_communication and payload.numel() > 0:
+        # mask elements that survive the threshold
+        sparse_mask = payload.abs() > config.sparse_epsilon
+        # 1D tensor of non-zero values after sparsification
+        values = payload[sparse_mask]
+        
+        # coordinate rows of the surviving entries in the original payload
+        indices = torch.nonzero(sparse_mask, as_tuple=False).to(torch.int32)
+        
+        # theoretical bytes of dense vs. sparse representation
+        dense_bytes = payload.numel() * payload.element_size()
+        sparse_bytes = (values.numel() * values.element_size()) + (indices.numel() * indices.element_size())
+        
+        if sparse_bytes < dense_bytes:
+            return (values, indices)
 
-    prototypes = []
-    for class_label in unique_classes.tolist():
-        mask = labels == class_label
-        if mask.any():
-            prototypes.append(anchor_matrix[mask].mean(dim=0))
-
-    if not prototypes:
-        return anchor_matrix[:0]
-
-    return torch.stack(prototypes, dim=0)
+    return payload
 
 
 '''

@@ -27,7 +27,8 @@ def _payload_num_bits(
       the tensor dtype.
     - ``int``: interpreted as a scalar-count, using ``bits_per_scalar`` or the
       default 32-bit floating-point convention.
-    - nested ``Mapping`` / ``Iterable`` containers of the types above.
+    - nested ``Mapping`` / ``Iterable`` containers of the types above, such as
+      sparse payload tuples ``(values, indices)``.
     """
     if isinstance(payload, torch.Tensor):
         return int(payload.numel()) * int(payload.element_size()) * 8
@@ -72,7 +73,8 @@ def calculate_communication_cost(
     payload : Any
         Tensor-like payload, scalar-count, or nested container of payloads.
         When an integer is provided it is interpreted as the number of
-        transmitted scalar values.
+        transmitted scalar values. Nested containers support theoretical sparse
+        payloads such as ``(values, indices)``.
     n_transmissions : int, optional
         Number of times the payload is sent. Count directed sends here, so
         bidirectional exchange over one edge corresponds to ``2``.

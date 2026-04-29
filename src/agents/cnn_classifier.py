@@ -33,6 +33,8 @@ class CNNClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use batch normalisation (default: False).
+    l1_reg : float, optional
+        L1 regularization strength (default: 0.0) for embedding sparsification.
     """
 
     def __init__(
@@ -44,6 +46,7 @@ class CNNClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        l1_reg: float = 0.0,
     ):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
@@ -64,4 +67,5 @@ class CNNClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
         )
