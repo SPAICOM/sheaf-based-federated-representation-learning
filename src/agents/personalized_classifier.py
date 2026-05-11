@@ -13,6 +13,8 @@ from torchmetrics.classification import MulticlassAccuracy
 from .base_agent import BaseAgent
 from .utils import MLP
 
+_SPARSITY_TYPES = {'l1', 'sae-l1', 'l21'}
+
 
 class PersonalizedClassifier(BaseAgent):
     """Classifier agent with an injected encoder backbone.
@@ -42,7 +44,17 @@ class PersonalizedClassifier(BaseAgent):
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
     l1_reg : float, optional
-        L1 regularization strength (default: 0.0) for embedding sparsification.
+        Regularization strength (default: 0.0).
+    sparsity_type : str, optional
+        Which sparsity penalty to apply on the encoder latents. One of:
+        - ``"l1"``    : mean over the batch of per-sample L1 norms.
+        - ``"sae-l1"``: sparse auto-encoder variant — applies a learned
+          linear projection followed by ReLU on the latents to obtain
+          Z' = ReLU(W Z + b), then computes the L1 penalty on Z'.
+        - ``"l21"``   : batch L21 norm — for each feature dimension d the
+          L2 norm over the batch is computed, then summed across dimensions:
+          sum_d ||Z[:, d]||_2.
+        Defaults to ``"l1"``.
     """
 
     def __init__(
@@ -55,8 +67,14 @@ class PersonalizedClassifier(BaseAgent):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         super().__init__()
+
+        if sparsity_type not in _SPARSITY_TYPES:
+            raise ValueError(
+                f"sparsity_type must be one of {_SPARSITY_TYPES}, got '{sparsity_type}'"
+            )
 
         if decoder_hidden_dims is None:
             decoder_hidden_dims = [256]
@@ -73,8 +91,16 @@ class PersonalizedClassifier(BaseAgent):
             use_batchnorm=use_batchnorm,
         )
 
+        # SAE projection: Z' = ReLU(W Z + b), same dimension as latent space
+        self._sae_proj = (
+            nn.Linear(latent_dim, latent_dim)
+            if sparsity_type == 'sae-l1'
+            else None
+        )
+
         self.accuracy = MulticlassAccuracy(num_classes=num_classes)
         self.l1_reg = l1_reg
+        self.sparsity_type = sparsity_type
 
     @property
     def encoder(self) -> nn.Module:
@@ -118,23 +144,42 @@ class PersonalizedClassifier(BaseAgent):
         loss = F.cross_entropy(y_hat, y.long())
         return loss + self.latent_sparsity_penalty()
 
-    def latent_sparsity_penalty(self, latents: torch.Tensor | None = None ) -> torch.Tensor:
-        """Return the L1 sparsity penalty on encoder latents."""
+    def latent_sparsity_penalty(
+        self, latents: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Return the sparsity penalty on encoder latents.
+
+        The penalty type is controlled by ``self.sparsity_type``:
+        - ``"l1"``    : mean over batch of per-sample L1 norms.
+        - ``"sae-l1"``: L1 penalty on Z' = ReLU(W Z + b).
+        - ``"l21"``   : sum_d ||Z[:, d]||_2  (batch L21 norm).
+        """
         reference = latents if latents is not None else self._last_latent
         if latents is None:
-          self._last_latent = None
+            self._last_latent = None
 
         if reference is None:
-          if self.l1_reg <= 0.0:
-              param = next(self.parameters(), None)
-              return torch.tensor(0.0) if param is None else param.new_zeros(())
-          raise RuntimeError(
-              'Latent sparsity penalty requires encoder latents. '
-              'Call encode/forward first or pass latents explicitly.'
-          )
+            if self.l1_reg <= 0.0:
+                param = next(self.parameters(), None)
+                return (
+                    torch.tensor(0.0) if param is None else param.new_zeros(())
+                )
+            raise RuntimeError(
+                'Latent sparsity penalty requires encoder latents. '
+                'Call encode/forward first or pass latents explicitly.'
+            )
         if self.l1_reg <= 0.0 or reference.numel() == 0:
-          return reference.new_zeros(())
-        return self.l1_reg * reference.abs().sum(dim=1).mean()
+            return reference.new_zeros(())
+
+        if self.sparsity_type == 'l1':
+            return self.l1_reg * reference.abs().sum(dim=1).mean()
+
+        if self.sparsity_type == 'sae-l1':
+            z_prime = F.relu(self._sae_proj(reference))
+            return self.l1_reg * z_prime.abs().sum(dim=1).mean()
+
+        # l21: for each feature dimension d, L2 norm over the batch, summed over d
+        return self.l1_reg * reference.norm(p=2, dim=0).sum()
 
     def task_performance(
         self, y_hat: torch.Tensor, y: torch.Tensor
