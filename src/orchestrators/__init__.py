@@ -22,8 +22,6 @@ Each orchestrator:
 """
 
 from .comfed import ComFed
-from .comm_efficient_frl import CommEfficientFRL
-from .sheaf_align import SheafAlign
 from .dfedu import DFedU
 from .dpsgd import DPSGD
 from .epochend_dpsgd import EpochEndDPSGD
@@ -33,22 +31,25 @@ from .fedper import FedPer
 from .fedproto import FedProto
 from .heterofl import HeteroFL
 from .non_cooperative import NonCooperativeLearning
+
+# from .comm_efficient_frl import CommEfficientFRL
+from .sheaf_align import SheafAlign
 from .sheaf_fmtl import SheafFMTL
 from .sheaf_frl import SheafFRL
 
 __all__ = [
-    "ComFed",
-    "SheafAlign",
-    "DFedU",
-    "DPSGD",
-    "EpochEndDPSGD",
-    "FedMuscle",
-    "FedPer",
-    "FedProto",
-    "FederatedLearning",
-    "HeteroFL",
-    "NonCooperativeLearning",
-    "SheafFMTL",
-    "SheafFRL",
-    "CommEfficientFRL",
+    'ComFed',
+    'SheafAlign',
+    'DFedU',
+    'DPSGD',
+    'EpochEndDPSGD',
+    'FedMuscle',
+    'FedPer',
+    'FedProto',
+    'FederatedLearning',
+    'HeteroFL',
+    'NonCooperativeLearning',
+    'SheafFMTL',
+    'SheafFRL',
+    'CommEfficientFRL',
 ]

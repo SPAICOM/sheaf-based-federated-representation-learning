@@ -54,6 +54,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = MHealthAccelerometerEncoder(output_dim=output_dim)
         super().__init__(
@@ -65,6 +66,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
 
 
@@ -104,6 +106,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = MHealthGyroscopeEncoder(output_dim=output_dim)
         super().__init__(
@@ -115,6 +118,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
 
 
@@ -155,6 +159,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = MHealthMagnetometerEncoder(output_dim=output_dim)
         super().__init__(
@@ -166,6 +171,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
 
 
@@ -206,6 +212,7 @@ class MHealthECGClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = MHealthECGEncoder(output_dim=output_dim)
         super().__init__(
@@ -217,4 +224,5 @@ class MHealthECGClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )

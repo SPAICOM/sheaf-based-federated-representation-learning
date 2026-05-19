@@ -1,0 +1,38 @@
+_target_: src.datamodules.MFeatDataModule
+
+data_path: ./data/MFeat
+gdrive_file_id: 1g7IXFh7FS5V_kVJvZyZLoTh9d3hhx_V_
+
+# Split / sampling settings
+# n_agents and agent_modalities are declared in the main experiment yaml
+# under dataset: so they can be changed together with model.agents without
+# touching this file.
+
+# Each agent draws an independent random 80% subset of the training pool so
+# that the collaborative setup is doubly heterogeneous: agents differ in both
+# the modality they observe AND the training examples they see.
+split_strategy: random_subset
+
+# Fraction of the training split each agent samples independently.
+subset_fraction: 0.8
+
+# Set class_imbalance: true to also give every agent a different random
+# class distribution (Dirichlet(imbalance_alpha)).  Lower imbalance_alpha
+# → more skewed distributions (e.g. 0.1 = very imbalanced, 1.0 = uniform).
+class_imbalance: false
+imbalance_alpha: 0.5
+
+exclude_null_activity: true
+window_size: null
+stride: 1
+
+batch_size: 64
+num_workers: 0
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.1
+pilot_num_samples: null
+comm_data: shared_global_pilots
+seed: 42

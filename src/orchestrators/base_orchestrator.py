@@ -54,6 +54,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
+        log_latent_diagnostics: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=['agents', 'cfg'])
@@ -64,6 +65,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             {str(idx): agent for idx, agent in agents.items()}
         )
         self._validation_prefixes_seen: set[str] = set()
+        self._latent_buffer: dict[int, list[torch.Tensor]] = {}
         self._reset_communication_state()
 
     def _empty_communication_state(self) -> dict[str, float]:
@@ -89,6 +91,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._validation_prefixes_seen = set()
         self._reset_split_communication('validation')
         self._reset_split_communication('test_monitor')
+        self._reset_latent_buffer()
 
     def on_test_start(self) -> None:
         """Reset test communication accounting at test start."""
@@ -99,6 +102,84 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._communication_by_split[prefix] = (
             self._empty_communication_state()
         )
+
+    # ── Latent diagnostics ────────────────────────────────────────────────────
+
+    def _reset_latent_buffer(self) -> None:
+        self._latent_buffer = {}
+
+    def _record_val_latent(self, idx: int, latent: torch.Tensor) -> None:
+        """Append one batch of latents for agent ``idx`` to the validation buffer."""
+        if idx not in self._latent_buffer:
+            self._latent_buffer[idx] = []
+        self._latent_buffer[idx].append(latent.detach().cpu())
+
+    @staticmethod
+    def _latent_sparsity(Z: torch.Tensor, epsilon: float) -> float:
+        """Mean number of entries with |z| > epsilon per sample."""
+        return float((Z.abs() > epsilon).float().sum(dim=1).mean().item())
+
+    @staticmethod
+    def _effective_rank(Z: torch.Tensor) -> float:
+        """Roy-Vetterli effective rank: exp(H(p)) where p are normalised singular values."""
+        if Z.ndim != 2 or Z.shape[0] < 2 or Z.shape[1] < 1:
+            return 1.0
+        try:
+            s = torch.linalg.svdvals(Z.float())
+            s = s[s > 1e-10]
+            if s.numel() < 1:
+                return 1.0
+            p = s / s.sum()
+            return float(torch.exp(-(p * p.log()).sum()).item())
+        except RuntimeError:
+            return float('nan')
+
+    def _collect_val_latents(
+        self,
+        batch: dict | tuple,
+    ) -> None:
+        """Encode validation batch through each agent and buffer the latents."""
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        for idx_str, agent in self.agents.items():
+            idx = int(idx_str)
+            key = idx if idx in batch else idx_str
+            if key not in batch:
+                continue
+            values = batch[key]
+            if not isinstance(values, (list, tuple)) or not values:
+                continue
+            x = values[0]
+            if not isinstance(x, torch.Tensor) or x.ndim == 0:
+                continue
+            if hasattr(agent, 'encode'):
+                latent = agent.encode(x)
+                self._record_val_latent(idx, latent)
+
+    def _log_latent_diagnostics(self) -> None:
+        """Compute and log per-agent sparsity and effective rank over buffered latents."""
+        if not self._latent_buffer:
+            return
+        epsilon = float(getattr(self.hparams, 'sparse_epsilon', 1e-2))
+        logs: dict[str, float] = {}
+        for idx, chunks in self._latent_buffer.items():
+            Z = torch.cat(chunks, dim=0)
+            logs[f'validation/latent_sparsity_agent_{idx}'] = (
+                self._latent_sparsity(Z, epsilon)
+            )
+            logs[f'validation/latent_effective_rank_agent_{idx}'] = (
+                self._effective_rank(Z)
+            )
+        self.log_dict(
+            logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            add_dataloader_idx=False,
+        )
+        self._reset_latent_buffer()
+
+    # ── Lambda schedule ───────────────────────────────────────────────────────
 
     def _effective_lambda_reg(self) -> float:
         """Return the current regularization coefficient, applying schedule if configured.
@@ -285,6 +366,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     prefix,
                     source_prefix='train',
                 )
+        if getattr(self.hparams, 'log_latent_diagnostics', False):
+            self._log_latent_diagnostics()
 
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
@@ -306,7 +389,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         total_loss: torch.Tensor | None = None,
         extra_metrics: dict[str, Any] | None = None,
         prog_bar: bool = True,
-        per_agent_loss_name: str = 'loss',
+        per_agent_loss_name: str = 'task_loss',
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Log per-agent and aggregate metrics for val/test reporting."""
         normalized_losses = {
@@ -322,11 +405,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         for idx in sorted(normalized_losses):
             loss = normalized_losses[idx]
             performance = normalized_performances[idx]
-            per_agent_logs[f'{prefix}/loss_agent_{idx}'] = loss
-            if per_agent_loss_name != 'loss':
-                per_agent_logs[
-                    f'{prefix}/{per_agent_loss_name}_agent_{idx}'
-                ] = loss
+            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = loss
             per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
                 performance
             )
@@ -618,6 +697,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             batch_idx=batch_idx,
             prefix=prefix,
         )
+        if prefix == 'validation' and getattr(
+            self.hparams, 'log_latent_diagnostics', False
+        ):
+            self._collect_val_latents(batch)
         return output
 
     def predict_step(

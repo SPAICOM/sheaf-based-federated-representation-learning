@@ -33,6 +33,7 @@ from src.datamodules.utils import (
     PairwiseDataset,
     compute_split_indices,
     repeat_dataset_to_num_samples,
+    sample_random_subset,
 )
 from src.utils.data_partitioner import (
     build_shared_class_partition,
@@ -438,6 +439,9 @@ class MHealthDataModule(l.LightningDataModule):
         shared_classes: int | None = None,
         classes_per_agent: int = 3,
         alpha: float = 0.5,
+        subset_fraction: float = 0.8,
+        class_imbalance: bool = False,
+        imbalance_alpha: float = 0.5,
         batch_size: int = 64,
         num_workers: int = 4,
         mode: str = 'min_size',
@@ -466,6 +470,9 @@ class MHealthDataModule(l.LightningDataModule):
         self.shared_classes = shared_classes
         self.classes_per_agent = classes_per_agent
         self.alpha = alpha
+        self.subset_fraction = subset_fraction
+        self.class_imbalance = class_imbalance
+        self.imbalance_alpha = imbalance_alpha
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -745,6 +752,45 @@ class MHealthDataModule(l.LightningDataModule):
                 normalize=norm_stats,
             )
 
+    def _split_data_random_subset(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+    ) -> None:
+        """Each agent draws an independent random subset of training rows.
+
+        Subsets can overlap across agents.  Val and test DataFrames are
+        shared.  When ``self.class_imbalance`` is ``True`` each agent's
+        subset is drawn with a Dirichlet-sampled class distribution.
+        """
+        train_idx = list(range(len(train_df)))
+        subset_size = max(1, int(round(len(train_idx) * self.subset_fraction)))
+        labels_arr = train_df[self.label_col].to_numpy()
+
+        for i in range(self.n_agents):
+            fcols = self._agent_feature_cols.get(i)
+
+            agent_train_idx = sample_random_subset(
+                indices=train_idx,
+                subset_size=subset_size,
+                seed=self.seed + i * 100,
+                labels=labels_arr if self.class_imbalance else None,
+                alpha=self.imbalance_alpha if self.class_imbalance else None,
+            )
+
+            agent_train_df = self._select(train_df, agent_train_idx)
+            norm_stats = self._compute_norm_stats(agent_train_df, fcols or self.feature_cols)
+            self.train_datasets[i] = self._make_dataset(
+                agent_train_df, feature_cols=fcols, normalize=norm_stats
+            )
+            self.val_datasets[i] = self._make_dataset(
+                val_df, feature_cols=fcols, normalize=norm_stats
+            )
+            self.test_datasets[i] = self._make_dataset(
+                test_df, feature_cols=fcols, normalize=norm_stats
+            )
+
     # ── LightningDataModule interface ─────────────────────────────────────────
 
     def setup(self, stage: str | None = None) -> None:
@@ -867,11 +913,13 @@ class MHealthDataModule(l.LightningDataModule):
                 self._split_data_class_partition(train_df, val_df, test_df)
             elif self.split_strategy == 'non_iid':
                 self._split_data_non_iid(train_df, val_df, test_df)
+            elif self.split_strategy == 'random_subset':
+                self._split_data_random_subset(train_df, val_df, test_df)
             else:
                 raise ValueError(
                     f'Unknown split_strategy: {self.split_strategy!r}. '
                     "Valid options: 'subject', 'uniform', "
-                    "'class_partition', 'non_iid'"
+                    "'class_partition', 'non_iid', 'random_subset'"
                 )
 
         # Global label space (used by classifier heads)

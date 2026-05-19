@@ -41,6 +41,7 @@ from src.datamodules.utils import (
     PairwiseDataset,
     compute_split_indices,
     repeat_dataset_to_num_samples,
+    sample_random_subset,
 )
 from src.utils.data_partitioner import partition_non_iid
 
@@ -320,6 +321,9 @@ class DeepSenseDataModule(l.LightningDataModule):
         split_strategy: str = 'full',
         agent_modalities: dict[int, list[int]] | None = None,
         n_agents: int = 3,
+        subset_fraction: float = 0.8,
+        class_imbalance: bool = False,
+        imbalance_alpha: float = 0.5,
         batch_size: int = 32,
         num_workers: int = 4,
         mode: str = 'min_size',
@@ -338,6 +342,9 @@ class DeepSenseDataModule(l.LightningDataModule):
         self.scenario = scenario
         self.split_strategy = split_strategy
         self.n_agents = n_agents
+        self.subset_fraction = subset_fraction
+        self.class_imbalance = class_imbalance
+        self.imbalance_alpha = imbalance_alpha
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.mode = mode
@@ -664,6 +671,52 @@ class DeepSenseDataModule(l.LightningDataModule):
             self.val_datasets[agent_id] = val_mods
             self.test_datasets[agent_id] = test_mods
 
+    def _split_data_random_subset(
+        self,
+        split_indices: dict[str, list[int]],
+        all_labels: np.ndarray,
+    ) -> None:
+        """Each agent draws an independent random subset of training samples.
+
+        Subsets can overlap across agents.  Val and test indices are shared
+        so that evaluation remains comparable.  When ``self.class_imbalance``
+        is ``True`` each agent draws with a Dirichlet-sampled class
+        distribution.
+        """
+        train_idx = split_indices['train']
+        subset_size = max(1, int(round(len(train_idx) * self.subset_fraction)))
+
+        for agent_id in range(self.n_agents):
+            agent_train_idx = sample_random_subset(
+                indices=train_idx,
+                subset_size=subset_size,
+                seed=self.seed + agent_id * 100,
+                labels=all_labels if self.class_imbalance else None,
+                alpha=self.imbalance_alpha if self.class_imbalance else None,
+            )
+
+            train_mods, val_mods, test_mods = [], [], []
+            for mod_idx in self.agent_modalities[agent_id]:
+                train_mods.append(
+                    DeepSenseModalityDataset(
+                        self._base_dataset, mod_idx, agent_train_idx
+                    )
+                )
+                val_mods.append(
+                    DeepSenseModalityDataset(
+                        self._base_dataset, mod_idx, split_indices['val']
+                    )
+                )
+                test_mods.append(
+                    DeepSenseModalityDataset(
+                        self._base_dataset, mod_idx, split_indices['test']
+                    )
+                )
+
+            self.train_datasets[agent_id] = train_mods
+            self.val_datasets[agent_id] = val_mods
+            self.test_datasets[agent_id] = test_mods
+
     def setup(self, stage: str | None = None) -> None:
         if stage == 'test' or stage is None:
             self._base_dataset = DeepSenseDataset(
@@ -701,9 +754,13 @@ class DeepSenseDataModule(l.LightningDataModule):
                 self._split_data_class_partition(split_indices, all_labels)
             elif self.split_strategy == 'non_iid':
                 self._split_data_non_iid(split_indices, all_labels)
+            elif self.split_strategy == 'random_subset':
+                self._split_data_random_subset(split_indices, all_labels)
             else:
                 raise ValueError(
-                    f'Unknown split_strategy: {self.split_strategy}'
+                    f'Unknown split_strategy: {self.split_strategy!r}. '
+                    "Valid options: 'full', 'uniform', 'class_partition', "
+                    "'non_iid', 'random_subset'"
                 )
 
             if self.starve_clients:

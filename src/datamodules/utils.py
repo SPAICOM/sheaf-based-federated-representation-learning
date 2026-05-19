@@ -7,6 +7,7 @@ used by all datamodule classes.
 from math import ceil
 from typing import TypeVar
 
+import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
@@ -247,3 +248,62 @@ def repeat_dataset_to_num_samples(
 
     repeat_factor = ceil(target_num_samples / len(dataset))
     return ConcatDataset([dataset] * repeat_factor)
+
+
+def sample_random_subset(
+    indices: list[int],
+    subset_size: int,
+    seed: int,
+    labels: np.ndarray | None = None,
+    alpha: float | None = None,
+) -> list[int]:
+    """Sample a random subset with optional per-agent class imbalance.
+
+    Parameters
+    ----------
+    indices : list[int]
+        Pool of global sample indices to draw from.
+    subset_size : int
+        Target number of samples.  Clamped to ``len(indices)``.
+    seed : int
+        Per-agent seed — pass a different value for each agent to get
+        decorrelated subsets.
+    labels : np.ndarray or None
+        Full label array indexed by the *values* in ``indices``
+        (i.e. ``labels[idx]`` gives the class of sample ``idx``).
+        Required when ``alpha`` is not None.
+    alpha : float or None
+        Dirichlet concentration for class proportions.  ``None`` → uniform
+        random sampling without replacement (balanced).  Smaller values
+        produce more skewed distributions (e.g. 0.1 = very imbalanced,
+        1.0 = uniform on the simplex, 10.0 ≈ equal class counts).
+
+    Returns
+    -------
+    list[int]
+        Sampled indices (unordered subset of ``indices``).
+    """
+    rng = np.random.default_rng(seed)
+    n = min(subset_size, len(indices))
+
+    if alpha is None or labels is None:
+        return rng.choice(indices, size=n, replace=False).tolist()
+
+    idx_arr = np.array(indices)
+    label_vals = labels[idx_arr]
+    unique_classes = np.unique(label_vals)
+    class_weights = rng.dirichlet(np.ones(len(unique_classes)) * alpha)
+
+    result: list[int] = []
+    for cls, w in zip(unique_classes, class_weights):
+        cls_pool = idx_arr[label_vals == cls].tolist()
+        n_cls = max(1, int(round(n * w)))
+        n_cls = min(n_cls, len(cls_pool))
+        sampled = rng.choice(cls_pool, size=n_cls, replace=False).tolist()
+        result.extend(sampled)
+
+    # Rounding can push above n — trim with a fresh draw to stay uniform
+    if len(result) > n:
+        result = rng.choice(result, size=n, replace=False).tolist()
+
+    return result

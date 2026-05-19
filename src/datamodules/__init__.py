@@ -7,6 +7,7 @@ This package provides PyTorch Lightning data modules for three dataset types:
 - HeteroClassificationDataModule: Client-first non-IID classification splits
 - SemanticDataModule: For pre-computed embeddings with semantic attributes
 - MHealthDataModule: For MHEALTH wearable-sensor activity recognition
+- MFeatDataModule: For UCI MFeat multi-view digit recognition
 
 All support:
 - Splitting data across multiple agents
@@ -18,6 +19,7 @@ All support:
 from .classification_datamodule import ClassificationDataModule
 from .deepsense_datamodule import DeepSenseDataModule
 from .hetero_datamodule import HeteroClassificationDataModule
+from .mfeat_datamodule import MFEAT_MODALITIES, MFeatDataModule
 from .mhealth_datamodule import MHEALTH_SENSOR_MODALITIES, MHealthDataModule
 from .semantic_datamodule import SemanticDataModule
 
@@ -26,6 +28,8 @@ __all__ = [
     'HeteroClassificationDataModule',
     'MHealthDataModule',
     'MHEALTH_SENSOR_MODALITIES',
+    'MFeatDataModule',
+    'MFEAT_MODALITIES',
     'SemanticDataModule',
     'DeepSenseDataModule',
 ]

@@ -58,6 +58,7 @@ class DeepSenseRGBClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = DeepSenseRGBEncoder(
             input_channels=input_channels,
@@ -72,6 +73,7 @@ class DeepSenseRGBClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
 
 
@@ -112,6 +114,7 @@ class DeepSenseLiDARClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = DeepSenseLiDAREncoder(
             input_channels=input_channels,
@@ -126,6 +129,7 @@ class DeepSenseLiDARClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
 
 
@@ -169,6 +173,7 @@ class DeepSenseMMWaveClassifier(PersonalizedClassifier):
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
         l1_reg: float = 0.0,
+        sparsity_type: str = 'l1',
     ):
         encoder = DeepSenseMMWaveEncoder(
             input_channels=input_channels,
@@ -183,4 +188,5 @@ class DeepSenseMMWaveClassifier(PersonalizedClassifier):
             activation=activation,
             use_batchnorm=use_batchnorm,
             l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )

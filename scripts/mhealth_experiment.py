@@ -127,7 +127,11 @@ def main(cfg: DictConfig) -> None:
     latent_dims = {}
 
     output_dim = cfg.model.get('output_dim', 64)
-    decoder_hidden_dims = cfg.model.get('decoder_hidden_dims', [256])
+    decoder_hidden_dims = list(cfg.model.get('decoder_hidden_dims', [256]))
+    dropout = cfg.model.get('dropout', 0.0)
+    use_batchnorm = cfg.model.get('use_batchnorm', False)
+    l1_reg = cfg.model.get('l1_reg', 0.0)
+    sparsity_type = cfg.model.get('sparsity_type', 'l1')
 
     for agent_id, classifier_type in agent_classifier_types.items():
         cls = MODALITY_CLASSIFIER[classifier_type]
@@ -137,6 +141,10 @@ def main(cfg: DictConfig) -> None:
             num_classes=num_classes,
             output_dim=output_dim,
             decoder_hidden_dims=decoder_hidden_dims,
+            dropout=dropout,
+            use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
         agents[agent_id] = agent
         latent_dims[agent_id] = agent.encoder.output_dim
@@ -171,6 +179,7 @@ def main(cfg: DictConfig) -> None:
     callbacks = [instantiate(cb) for cb in cfg.callbacks.values()]
     run_name = f'{cfg.logger.name}__{type(orchestrator).__name__}'
     logger = instantiate(cfg.logger, name=run_name)
+    logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     trainer = Trainer(**cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(orchestrator, datamodule=datamodule)
     trainer.test(orchestrator, datamodule=datamodule)

@@ -1,6 +1,6 @@
 defaults:
   - dataset: deepsense
-  - model: cnn_classifier
+  - model: deepsense_classifier
   - orchestrator: non_cooperative
   - optimizer: adam
   - _self_
@@ -18,18 +18,8 @@ model:
   decoder_hidden_dims: [256]
   dropout: 0.1
   use_batchnorm: true
-  # Per-modality overrides: keys are modality indices (0=RGB, 1=mmWave, 2=LiDAR).
-  # Any key omitted here falls back to the global values above.
-  per_modality:
-    0:  # RGB (3, 64, 64)
-      output_dim: 128
-      decoder_hidden_dims: [512, 256]
-    1:  # mmWave (1, 16, 64)
-      output_dim: 64
-      decoder_hidden_dims: [256]
-    2:  # LiDAR (2, 32, 32)
-      output_dim: 64
-      decoder_hidden_dims: [128]
+  l1_reg: 0.0
+  sparsity_type: l1
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger

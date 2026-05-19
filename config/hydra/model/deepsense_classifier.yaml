@@ -1,0 +1,27 @@
+# DeepSense modality-specific CNN classifier.
+# No _target_: the experiment script resolves the class from agent_modalities.
+
+# Encoder (DeepSenseRGB/LiDAR/MMWaveEncoder)
+output_dim: 64
+
+# Decoder (MLP head shared across modalities)
+decoder_hidden_dims: [256]
+dropout: 0.1
+use_batchnorm: true
+
+# Latent regularization (PersonalizedClassifier)
+l1_reg: 0.0
+sparsity_type: l1            # l1 | sae-l1 | l21
+
+# Per-modality overrides: keys are modality indices (0=RGB, 1=mmWave, 2=LiDAR).
+# Any key omitted here falls back to the global values above.
+per_modality:
+  0:  # RGB (3, 64, 64)
+    output_dim: 128
+    decoder_hidden_dims: [512, 256]
+  1:  # mmWave (1, 16, 64)
+    output_dim: 64
+    decoder_hidden_dims: [256]
+  2:  # LiDAR (2, 32, 32)
+    output_dim: 64
+    decoder_hidden_dims: [128]

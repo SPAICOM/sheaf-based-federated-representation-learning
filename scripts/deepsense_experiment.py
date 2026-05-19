@@ -72,6 +72,8 @@ def main(cfg: DictConfig) -> None:
     global_decoder_hidden_dims = cfg.model.get('decoder_hidden_dims', [256])
     global_dropout = cfg.model.get('dropout', 0.0)
     global_use_batchnorm = cfg.model.get('use_batchnorm', False)
+    global_l1_reg = cfg.model.get('l1_reg', 0.0)
+    global_sparsity_type = cfg.model.get('sparsity_type', 'l1')
     per_modality_cfg = cfg.model.get('per_modality', {})
 
     for agent_id, mod_list in datamodule.agent_modalities.items():
@@ -81,9 +83,11 @@ def main(cfg: DictConfig) -> None:
 
         mod_cfg = per_modality_cfg.get(primary_modality, {})
         output_dim = mod_cfg.get('output_dim', global_output_dim)
-        decoder_hidden_dims = mod_cfg.get('decoder_hidden_dims', global_decoder_hidden_dims)
+        decoder_hidden_dims = list(mod_cfg.get('decoder_hidden_dims', global_decoder_hidden_dims))
         dropout = mod_cfg.get('dropout', global_dropout)
         use_batchnorm = mod_cfg.get('use_batchnorm', global_use_batchnorm)
+        l1_reg = mod_cfg.get('l1_reg', global_l1_reg)
+        sparsity_type = mod_cfg.get('sparsity_type', global_sparsity_type)
 
         agent = cls(
             num_classes=num_classes,
@@ -92,6 +96,8 @@ def main(cfg: DictConfig) -> None:
             decoder_hidden_dims=decoder_hidden_dims,
             dropout=dropout,
             use_batchnorm=use_batchnorm,
+            l1_reg=l1_reg,
+            sparsity_type=sparsity_type,
         )
         agents[agent_id] = agent
         latent_dims[agent_id] = agent.encoder.output_dim  # BaseEncoder attr
@@ -131,6 +137,7 @@ def main(cfg: DictConfig) -> None:
     callbacks = [instantiate(cb) for cb in cfg.callbacks.values()]
     run_name = f'{cfg.logger.name}__{type(orchestrator).__name__}'
     logger = instantiate(cfg.logger, name=run_name)
+    logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     trainer = Trainer(**cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(orchestrator, datamodule=datamodule)
     trainer.test(orchestrator, datamodule=datamodule)

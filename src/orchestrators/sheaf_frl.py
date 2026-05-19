@@ -41,14 +41,16 @@ class SheafFRL(BaseOrchestrator):
         use_prototypes: bool = False,
         lambda_schedule: str | None = None,
         sparse_communication: bool = False,
-        sparse_epsilon: float = 1e-5,
+        sparse_epsilon: float = 1e-2,
         update_v_every_n_epochs: int = 1,
+        log_latent_diagnostics: bool = False,
         **kwargs,
     ):
         super().__init__(
             agents=agents,
             neighbors=neighbors,
             optimizer=optimizer,
+            log_latent_diagnostics=log_latent_diagnostics,
         )
 
         anchor_strategy = str(anchor_strategy)
@@ -305,6 +307,29 @@ class SheafFRL(BaseOrchestrator):
 
         self._latest_pilots.clear()
         self._finalize_train_epoch_communication()
+
+    def on_validation_epoch_end(self) -> None:
+        super().on_validation_epoch_end()
+        if not getattr(self.hparams, 'log_latent_diagnostics', False):
+            return
+        logs: dict[str, float] = {}
+        for edge_key, V in self.stiefel_matrices.items():
+            node_i, node_j = edge_key.split('_')
+            v = V.detach().float().cpu()
+            logs[f'validation/alignment_rank_edge_{node_i}_{node_j}'] = float(
+                torch.linalg.matrix_rank(v).item()
+            )
+            logs[f'validation/alignment_effective_rank_edge_{node_i}_{node_j}'] = (
+                self._effective_rank(v)
+            )
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
     def _shared_eval(
         self,

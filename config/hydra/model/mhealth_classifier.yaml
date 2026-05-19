@@ -1,0 +1,14 @@
+# mHealth modality-specific CNN classifier.
+# No _target_: the experiment script resolves the class from agent_modalities.
+
+# Encoder (MHealthAccelerometer/Gyroscope/Magnetometer/ECGEncoder)
+output_dim: 64
+
+# Decoder (MLP head shared across modalities)
+decoder_hidden_dims: [256]
+dropout: 0.1
+use_batchnorm: true
+
+# Latent regularization (PersonalizedClassifier)
+l1_reg: 0.0
+sparsity_type: l1            # l1 | sae-l1 | l21

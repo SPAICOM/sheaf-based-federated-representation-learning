@@ -8,6 +8,7 @@ This package provides agent classes for federated learning scenarios:
 - DeepSenseRGBClassifier: RGB camera classifier for the DeepSense dataset
 - DeepSenseLiDARClassifier: LiDAR classifier for the DeepSense dataset
 - DeepSenseMMWaveClassifier: mmWave classifier for the DeepSense dataset
+- MFeatMLPClassifier: single MLP classifier for all MFeat modalities
 
 Each agent implements:
 - forward: Standard forward pass returning predictions (logits)
@@ -31,6 +32,8 @@ from .deepsense_encoders import (
 from .fmtl_classifier import FMTLCNNClassifier
 from .hetero_cnn_classifier import HeteroCNNClassifier
 from .latent_classifier import LatentClassifier
+from .mfeat_classifiers import MFeatMLPClassifier
+from .mfeat_encoders import MFeatMLPEncoder
 from .mhealth_classifiers import (
     MHealthAccelerometerClassifier,
     MHealthECGClassifier,
@@ -63,6 +66,8 @@ __all__ = [
     'HeteroCNNClassifier',
     'HeteroMLP',
     'LatentClassifier',
+    'MFeatMLPClassifier',
+    'MFeatMLPEncoder',
     'MHealthAccelerometerClassifier',
     'MHealthAccelerometerEncoder',
     'MHealthECGClassifier',
