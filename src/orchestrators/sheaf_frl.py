@@ -362,9 +362,14 @@ class SheafFRL(BaseOrchestrator):
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
 
+        pilots_available = True
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
+            try:
+                x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
+            except ValueError:
+                pilots_available = False
+                break
             self._latest_pilots[idx] = (x_pilot, y_pilot, sample_ids)
 
             pilot_latents = agent.encode(x_pilot)
@@ -383,7 +388,7 @@ class SheafFRL(BaseOrchestrator):
                 config=self.anchor_config,
             )
 
-        if prefix in self._COMMUNICATION_SPLITS:
+        if pilots_available and prefix in self._COMMUNICATION_SPLITS:
             self._record_communication_round(n_rounds=1, prefix=prefix)
             for idx, payload in payloads_per_agent.items():
                 n_neighbors = len(

@@ -66,6 +66,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         )
         self._validation_prefixes_seen: set[str] = set()
         self._latent_buffer: dict[int, list[torch.Tensor]] = {}
+        self._global_pilot_buffer: dict[int, list[torch.Tensor]] = {}
         self._reset_communication_state()
 
     def _empty_communication_state(self) -> dict[str, float]:
@@ -92,6 +93,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._reset_split_communication('validation')
         self._reset_split_communication('test_monitor')
         self._reset_latent_buffer()
+        self._reset_global_pilot_buffer()
 
     def on_test_start(self) -> None:
         """Reset test communication accounting at test start."""
@@ -107,6 +109,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     def _reset_latent_buffer(self) -> None:
         self._latent_buffer = {}
+
+    def _reset_global_pilot_buffer(self) -> None:
+        self._global_pilot_buffer = {}
 
     def _record_val_latent(self, idx: int, latent: torch.Tensor) -> None:
         """Append one batch of latents for agent ``idx`` to the validation buffer."""
@@ -178,6 +183,50 @@ class BaseOrchestrator(l.LightningModule, ABC):
             add_dataloader_idx=False,
         )
         self._reset_latent_buffer()
+
+    def _collect_global_pilot_latents(self, batch: dict) -> None:
+        """Encode the global_pilot batch through every agent and buffer latents."""
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        if 'global_pilot' not in batch:
+            return
+        pilot_data = batch['global_pilot']
+        if not isinstance(pilot_data, (list, tuple)) or not pilot_data:
+            return
+        x = pilot_data[0]
+        if not isinstance(x, torch.Tensor) or x.ndim == 0:
+            return
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            latent = agent.encode(x)
+            if idx not in self._global_pilot_buffer:
+                self._global_pilot_buffer[idx] = []
+            self._global_pilot_buffer[idx].append(latent.detach().cpu())
+
+    def _log_global_pilot_diagnostics(self) -> None:
+        """Compute and log sparsity and effective rank of global-pilot latents."""
+        if not self._global_pilot_buffer:
+            return
+        epsilon = float(getattr(self.hparams, 'sparse_epsilon', 1e-2))
+        logs: dict[str, float] = {}
+        for idx, chunks in self._global_pilot_buffer.items():
+            Z = torch.cat(chunks, dim=0)
+            logs[f'validation/global_pilot_sparsity_agent_{idx}'] = (
+                self._latent_sparsity(Z, epsilon)
+            )
+            logs[f'validation/global_pilot_effective_rank_agent_{idx}'] = (
+                self._effective_rank(Z)
+            )
+        self.log_dict(
+            logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            add_dataloader_idx=False,
+        )
+        self._reset_global_pilot_buffer()
 
     # ── Lambda schedule ───────────────────────────────────────────────────────
 
@@ -368,6 +417,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 )
         if getattr(self.hparams, 'log_latent_diagnostics', False):
             self._log_latent_diagnostics()
+            self._log_global_pilot_diagnostics()
 
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
@@ -701,6 +751,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             self.hparams, 'log_latent_diagnostics', False
         ):
             self._collect_val_latents(batch)
+            self._collect_global_pilot_latents(batch)
         return output
 
     def predict_step(

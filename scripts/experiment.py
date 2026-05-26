@@ -369,7 +369,9 @@ def main(cfg: DictConfig) -> float:
     RESULTS_PATH.mkdir(exist_ok=True, parents=True)
 
     _finish_active_wandb_run()
-    logger = instantiate(cfg.logger)
+    orchestrator_class_name = get_class(str(cfg.orchestrator._target_)).__name__
+    run_name = f'{cfg.logger.name}__{orchestrator_class_name}'
+    logger = instantiate(cfg.logger, name=run_name)
     _update_logger_config(logger, OmegaConf.to_container(cfg, resolve=True))
     if best_params_metadata is not None:
         _update_logger_config(logger, best_params_metadata)
