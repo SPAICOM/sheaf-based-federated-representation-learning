@@ -2,8 +2,7 @@
 
 import pytest
 import torch
-from lightning.pytorch import Trainer
-from lightning.pytorch import LightningDataModule
+from lightning.pytorch import LightningDataModule, Trainer
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.agents.cnn_classifier import CNNClassifier

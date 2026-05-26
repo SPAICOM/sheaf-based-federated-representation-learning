@@ -69,7 +69,9 @@ def test_invalid_anchor_strategy_raises() -> None:
         _build_orchestrator('dynamic')
 
 
-def test_batch_anchors_reuses_cached_task_latents_without_extra_encoding() -> None:
+def test_batch_anchors_reuses_cached_task_latents_without_extra_encoding() -> (
+    None
+):
     orchestrator, agent = _build_orchestrator(
         'batch_anchors',
         use_prototypes=False,
@@ -136,7 +138,9 @@ def test_extract_pilot_batch_prefers_agent_specific_global_pilot() -> None:
     _x_pilot, y_pilot, sample_ids = orchestrator._extract_pilot_batch(batch, 0)
 
     assert torch.equal(y_pilot, torch.tensor([1, 2, 3], dtype=torch.long))
-    assert torch.equal(sample_ids, torch.tensor([10, 11, 12], dtype=torch.long))
+    assert torch.equal(
+        sample_ids, torch.tensor([10, 11, 12], dtype=torch.long)
+    )
 
 
 def test_pilots_uniform_caches_raw_latents_and_sample_ids() -> None:
@@ -299,7 +303,9 @@ def test_uniform_strategy_respects_num_anchors_budget() -> None:
     assert all(len(keys) <= 2 for keys in anchor_keys.values())
 
 
-def test_epoch_end_updates_stiefel_from_cached_anchor_cross_covariance() -> None:
+def test_epoch_end_updates_stiefel_from_cached_anchor_cross_covariance() -> (
+    None
+):
     orchestrator = SheafFRL(
         agents={0: _CountingAgent(), 1: _CountingAgent()},
         neighbors={0: {1}, 1: {0}},
@@ -325,9 +331,11 @@ def test_epoch_end_updates_stiefel_from_cached_anchor_cross_covariance() -> None
     orchestrator.epoch_labels_cache[0].append(labels)
     orchestrator.epoch_labels_cache[1].append(labels.clone())
 
-    epoch_anchor_tensors, epoch_anchor_keys = orchestrator._build_anchor_bundles(
-        {0: A_0, 1: A_1},
-        {0: labels, 1: labels.clone()},
+    epoch_anchor_tensors, epoch_anchor_keys = (
+        orchestrator._build_anchor_bundles(
+            {0: A_0, 1: A_1},
+            {0: labels, 1: labels.clone()},
+        )
     )
     shared_rows = orchestrator._match_bundle_rows(
         A_i=epoch_anchor_tensors[1],

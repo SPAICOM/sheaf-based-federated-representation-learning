@@ -126,11 +126,13 @@ class SheafFMTL(BaseOrchestrator):
 
                 for j in self.hparams.neighbors.get(i, set()):
                     P_ij = self.projection_matrices[f'{i}_{j}']
-                    diff_ij = projected_vectors[f'{i}_{j}'] - projected_vectors[
-                        f'{j}_{i}'
-                    ]
-                    sheaf_penalty_i += self._effective_lambda_reg() * torch.matmul(
-                        P_ij.t(), diff_ij
+                    diff_ij = (
+                        projected_vectors[f'{i}_{j}']
+                        - projected_vectors[f'{j}_{i}']
+                    )
+                    sheaf_penalty_i += (
+                        self._effective_lambda_reg()
+                        * torch.matmul(P_ij.t(), diff_ij)
                     )
 
                 updated_agent_vectors[i] = theta_i - lr * sheaf_penalty_i
@@ -154,7 +156,7 @@ class SheafFMTL(BaseOrchestrator):
             )
 
             projection_updates = {}
-            for edge_key, _P_ij in self.projection_matrices.items():
+            for edge_key in self.projection_matrices:
                 i_str, j_str = edge_key.split('_')
                 i, j = int(i_str), int(j_str)
                 theta_i = updated_agent_vectors[i]

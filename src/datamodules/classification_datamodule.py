@@ -257,7 +257,7 @@ class ClassificationDataModule(l.LightningDataModule):
         val_split: float = 0.1,
         test_split: float = 0.1,
         monitor_test_during_fit: bool = False,
-        #include_pilot_loaders: bool = True,
+        # include_pilot_loaders: bool = True,
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
@@ -324,8 +324,7 @@ class ClassificationDataModule(l.LightningDataModule):
             sample_ids = None
             if train_dataset.sample_ids is not None:
                 sample_ids = [
-                    train_dataset.sample_ids[idx]
-                    for idx in selected_indices
+                    train_dataset.sample_ids[idx] for idx in selected_indices
                 ]
 
             self.train_datasets[client_idx] = ClassificationDataset(
@@ -607,15 +606,13 @@ class ClassificationDataModule(l.LightningDataModule):
         partitioning logic is consistent across all partitions before the
         optional train-only starvation step.
         """
-        train_partition, sampled_agent_classes = (
-            partition_non_iid_with_margin(
-                labels=train[label_key],
-                n_agents=self.n_agents,
-                classes_per_agent=self.classes_per_agent,
-                seed=self.seed,
-                alpha=self.alpha,
-                return_agent_classes=True,
-            )
+        train_partition, sampled_agent_classes = partition_non_iid_with_margin(
+            labels=train[label_key],
+            n_agents=self.n_agents,
+            classes_per_agent=self.classes_per_agent,
+            seed=self.seed,
+            alpha=self.alpha,
+            return_agent_classes=True,
         )
         self.agent_classes = sampled_agent_classes
 
@@ -749,7 +746,7 @@ class ClassificationDataModule(l.LightningDataModule):
 
         if self.starve_clients:
             self._starve_training_datasets(label_key)
-        '''
+        """
         if not self.pilot_datasets and self.pilot_batch_size > 0:
             for i in range(self.n_agents):
                 local_train_ds = self.train_datasets[i].dataset
@@ -767,7 +764,7 @@ class ClassificationDataModule(l.LightningDataModule):
                     # Provide local dummy IDs to satisfy the dataset __getitem__
                     sample_ids=list(range(n_samples)) 
                 )
-        '''
+        """
 
         # Determine input shape from first sample
         # Handle both PIL Images (need conversion) and pre-converted tensors
@@ -823,7 +820,9 @@ class ClassificationDataModule(l.LightningDataModule):
                 f'Unknown split {split!r}. Valid options: {list(split_map)}'
             )
         datasets, shuffle = split_map[split]
-        loaders: dict = {i: self._make_loader(ds, shuffle) for i, ds in datasets.items()}
+        loaders: dict = {
+            i: self._make_loader(ds, shuffle) for i, ds in datasets.items()
+        }
 
         if self.pilot_datasets:
             target_num_batches = max(
@@ -831,23 +830,31 @@ class ClassificationDataModule(l.LightningDataModule):
                 for ds in datasets.values()
             )
             if self.comm_data == 'private_pilots':
-                loaders.update({
-                    f'pilot_{i}': self._make_pilot_loader(ds, target_num_batches)
-                    for i, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}': self._make_pilot_loader(
+                            ds, target_num_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'shared_global_pilots':
                 loaders['global_pilot'] = self._make_pilot_loader(
                     self.pilot_datasets[0], target_num_batches
                 )
             elif self.comm_data == 'pairwise_pilots':
-                loaders.update({
-                    f'pilot_{i}_{j}': self._make_pilot_loader(
-                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
-                        target_num_batches,
-                    )
-                    for i in range(self.n_agents)
-                    for j in range(i + 1, self.n_agents)
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}_{j}': self._make_pilot_loader(
+                            PairwiseDataset(
+                                self.pilot_datasets[i], self.pilot_datasets[j]
+                            ),
+                            target_num_batches,
+                        )
+                        for i in range(self.n_agents)
+                        for j in range(i + 1, self.n_agents)
+                    }
+                )
 
         return CombinedLoader(loaders, mode=self.mode)
 

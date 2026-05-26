@@ -142,10 +142,16 @@ class DeepSenseMMWaveEncoder(BaseEncoder):
 
         self.width_reducer = nn.Sequential(
             nn.Conv2d(
-                input_channels, 32, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)
+                input_channels,
+                32,
+                kernel_size=(1, 3),
+                stride=(1, 2),
+                padding=(0, 1),
             ),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)),
+            nn.Conv2d(
+                32, 64, kernel_size=(1, 3), stride=(1, 2), padding=(0, 1)
+            ),
             nn.ReLU(),
         )
 

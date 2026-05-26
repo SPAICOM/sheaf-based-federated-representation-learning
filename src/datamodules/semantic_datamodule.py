@@ -497,7 +497,9 @@ class SemanticDataModule(l.LightningDataModule):
                 f'Unknown split {split!r}. Valid options: {list(split_map)}'
             )
         datasets, shuffle = split_map[split]
-        loaders: dict = {m: self._make_loader(ds, shuffle) for m, ds in datasets.items()}
+        loaders: dict = {
+            m: self._make_loader(ds, shuffle) for m, ds in datasets.items()
+        }
 
         if self.include_pilot_loaders and self.pilot_datasets:
             target_num_batches = max(
@@ -506,26 +508,32 @@ class SemanticDataModule(l.LightningDataModule):
             )
             agent_keys = list(self.pilot_datasets.keys())
             if self.comm_data == 'private_pilots':
-                loaders.update({
-                    f'pilot_{m}': self._make_pilot_loader(ds, target_num_batches)
-                    for m, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'pilot_{m}': self._make_pilot_loader(
+                            ds, target_num_batches
+                        )
+                        for m, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'shared_global_pilots':
                 loaders['global_pilot'] = self._make_pilot_loader(
                     self.pilot_datasets[agent_keys[0]], target_num_batches
                 )
             elif self.comm_data == 'pairwise_pilots':
-                loaders.update({
-                    f'pilot_{agent_keys[i]}_{agent_keys[j]}': self._make_pilot_loader(
-                        PairwiseDataset(
-                            self.pilot_datasets[agent_keys[i]],
-                            self.pilot_datasets[agent_keys[j]],
-                        ),
-                        target_num_batches,
-                    )
-                    for i in range(len(agent_keys))
-                    for j in range(i + 1, len(agent_keys))
-                })
+                loaders.update(
+                    {
+                        f'pilot_{agent_keys[i]}_{agent_keys[j]}': self._make_pilot_loader(
+                            PairwiseDataset(
+                                self.pilot_datasets[agent_keys[i]],
+                                self.pilot_datasets[agent_keys[j]],
+                            ),
+                            target_num_batches,
+                        )
+                        for i in range(len(agent_keys))
+                        for j in range(i + 1, len(agent_keys))
+                    }
+                )
 
         return CombinedLoader(loaders, mode=self.mode)  # type: ignore[arg-type]
 

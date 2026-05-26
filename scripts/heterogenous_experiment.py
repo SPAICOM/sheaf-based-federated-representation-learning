@@ -315,17 +315,15 @@ def main(cfg: DictConfig) -> float:
 
     for i in range(n_agents):
         model_cfg = copy.deepcopy(cfg.model)
+        OmegaConf.set_struct(model_cfg, False)
 
         # Apply per-agent overrides (rate, encoder_hidden_dims, etc.).
         if i in per_agents_cfg:
             for key, value in per_agents_cfg[i].items():
-                if hasattr(model_cfg, key) or key in model_cfg:
-                    setattr(model_cfg, key, value)
+                setattr(model_cfg, key, value)
 
         model_cfg.num_classes = num_classes
-
-        if hasattr(model_cfg, 'in_features') or 'in_features' in model_cfg:
-            model_cfg.in_features = datamodule.input_dims[str(i)]
+        model_cfg.in_features = datamodule.input_dims[str(i)]
 
         agents[i] = instantiate(model_cfg)
 

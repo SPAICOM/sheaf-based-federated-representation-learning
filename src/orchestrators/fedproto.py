@@ -201,7 +201,7 @@ class FedProto(BaseOrchestrator):
         inputs = {}
         labels = {}
 
-        for idx_str, agent in self.agents.items():
+        for idx_str in self.agents:
             idx = int(idx_str)
             key = idx if idx in batch else idx_str
 
@@ -282,8 +282,12 @@ class FedProto(BaseOrchestrator):
                 # Each agent sends its local class prototypes to the server (1 hop).
                 for idx, local_proto in local_prototypes.items():
                     if local_proto:
-                        proto_tensor = torch.stack(list(local_proto.values())).detach()
-                        self._record_communication(proto_tensor, n_transmissions=1)
+                        proto_tensor = torch.stack(
+                            list(local_proto.values())
+                        ).detach()
+                        self._record_communication(
+                            proto_tensor, n_transmissions=1
+                        )
 
                 self._record_communication_round(n_rounds=1, prefix='train')
 
@@ -304,7 +308,9 @@ class FedProto(BaseOrchestrator):
                     ).mean()
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
-        total_loss = total_task_loss + self._effective_lambda_reg() * proto_loss
+        total_loss = (
+            total_task_loss + self._effective_lambda_reg() * proto_loss
+        )
 
         self._log_shared_metrics(
             prefix=prefix,

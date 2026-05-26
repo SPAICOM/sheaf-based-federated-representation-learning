@@ -52,7 +52,6 @@ class LatentClassifier(PersonalizedClassifier):
             activation=activation,
             dropout=dropout,
             use_batchnorm=use_batchnorm,
-            l1_reg=l1_reg,
         )
 
         super().__init__(

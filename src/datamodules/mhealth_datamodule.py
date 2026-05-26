@@ -510,7 +510,7 @@ class MHealthDataModule(l.LightningDataModule):
         dest.mkdir(parents=True, exist_ok=True)
         zip_path = dest / 'mhealth_dataset.zip'
 
-        print(f'[prepare_data] Downloading mhealth_dataset.zip …')
+        print('[prepare_data] Downloading mhealth_dataset.zip …')
         gdown.download(
             id=self.gdrive_file_id, output=str(zip_path), quiet=False
         )
@@ -780,7 +780,9 @@ class MHealthDataModule(l.LightningDataModule):
             )
 
             agent_train_df = self._select(train_df, agent_train_idx)
-            norm_stats = self._compute_norm_stats(agent_train_df, fcols or self.feature_cols)
+            norm_stats = self._compute_norm_stats(
+                agent_train_df, fcols or self.feature_cols
+            )
             self.train_datasets[i] = self._make_dataset(
                 agent_train_df, feature_cols=fcols, normalize=norm_stats
             )

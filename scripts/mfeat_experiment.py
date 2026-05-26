@@ -60,7 +60,11 @@ def main(cfg: DictConfig) -> None:
 
     for agent_id, modality in datamodule.agent_modalities.items():
         agent_cfg = cfg.model.agents[agent_id]
-        hidden_dims = list(agent_cfg.hidden_dims) if agent_cfg.get('hidden_dims') else None
+        hidden_dims = (
+            list(agent_cfg.hidden_dims)
+            if agent_cfg.get('hidden_dims')
+            else None
+        )
         agent = MFeatMLPClassifier(
             input_dim=agent_cfg.input_dim,
             num_classes=num_classes,

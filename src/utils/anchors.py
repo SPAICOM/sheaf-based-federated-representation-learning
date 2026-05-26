@@ -10,7 +10,7 @@ import torch.nn.functional as F
 AnchorKeys = dict[int, list[tuple[int, int]]]
 AnchorTensors = dict[int, torch.Tensor]
 
-'''
+"""
 VALID_ANCHOR_STRATEGIES = {
     'prototype',
     'uniform',
@@ -18,11 +18,13 @@ VALID_ANCHOR_STRATEGIES = {
     'semantic_pilots',
     'clustering',
 }
-'''
+"""
+
 
 @dataclass(frozen=True)
 class AnchorConfig:
     """Configuration for anchor construction, communication and normalization."""
+
     # strategy: str
     # num_anchors: int
     parseval_normalization: bool
@@ -32,6 +34,7 @@ class AnchorConfig:
     use_prototypes: bool = False
     sparse_communication: bool = False
     sparse_epsilon: float = 1e-5
+
 
 '''
 def supported_anchor_strategy(anchor_strategy: str) -> str:
@@ -80,6 +83,7 @@ def parseval_normalize(
     )
     return torch.matmul(anchor_matrix, covariance_inv)
 '''
+
 
 def parseval_normalize(
     anchor_matrix: torch.Tensor,
@@ -134,6 +138,7 @@ def parseval_normalize(
     )
     return parseval_rows.to(dtype=original_dtype)
 
+
 def l2_normalize(anchor_matrix: torch.Tensor) -> torch.Tensor:
     """Apply row-wise L2 normalization to anchor features."""
     return F.normalize(anchor_matrix, p=2, dim=1)
@@ -145,10 +150,13 @@ def normalize_anchor_matrix(
 ) -> torch.Tensor:
     """Apply the configured anchor normalization to a full anchor matrix."""
     if config.parseval_normalization:
-        return parseval_normalize(anchor_matrix, eps=float(config.parseval_eps))
+        return parseval_normalize(
+            anchor_matrix, eps=float(config.parseval_eps)
+        )
     if config.l2_normalization:
         return l2_normalize(anchor_matrix)
     return anchor_matrix
+
 
 '''
 def sorted_global_classes(labels_per_agent: dict[int, torch.Tensor]) -> list[int]:
@@ -169,6 +177,8 @@ def _global_class_counts(labels_per_agent: dict[int, torch.Tensor]) -> dict[int,
             counts[class_idx] = counts.get(class_idx, 0) + int(count)
     return counts
 '''
+
+
 def shared_anchor_rows(
     A_i: torch.Tensor,
     A_j: torch.Tensor,
@@ -219,9 +229,8 @@ def shared_anchor_rows(
 
     selected_labels_i = labels_i[mask_i]
     selected_labels_j = labels_j[mask_j]
-    if (
-        selected_labels_i.shape != selected_labels_j.shape
-        or not torch.equal(selected_labels_i, selected_labels_j)
+    if selected_labels_i.shape != selected_labels_j.shape or not torch.equal(
+        selected_labels_i, selected_labels_j
     ):
         return None
 
@@ -256,21 +265,27 @@ def communication_anchor_payload(
                 mask = labels == class_label
                 if mask.any():
                     prototypes.append(anchor_matrix[mask].mean(dim=0))
-            payload = torch.stack(prototypes, dim=0) if prototypes else anchor_matrix[:0]
+            payload = (
+                torch.stack(prototypes, dim=0)
+                if prototypes
+                else anchor_matrix[:0]
+            )
 
     if config.sparse_communication and payload.numel() > 0:
         # mask elements that survive the threshold
         sparse_mask = payload.abs() > config.sparse_epsilon
         # 1D tensor of non-zero values after sparsification
         values = payload[sparse_mask]
-        
+
         # coordinate rows of the surviving entries in the original payload
         indices = torch.nonzero(sparse_mask, as_tuple=False).to(torch.int32)
-        
+
         # theoretical bytes of dense vs. sparse representation
         dense_bytes = payload.numel() * payload.element_size()
-        sparse_bytes = (values.numel() * values.element_size()) + (indices.numel() * indices.element_size())
-        
+        sparse_bytes = (values.numel() * values.element_size()) + (
+            indices.numel() * indices.element_size()
+        )
+
         if sparse_bytes < dense_bytes:
             return (values, indices)
 

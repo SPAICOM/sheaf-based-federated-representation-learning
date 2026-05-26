@@ -109,7 +109,10 @@ class FedPer(BaseOrchestrator):
     ) -> tuple[int, str, int | None]:
         """Resolve the configured FedPer aggregation schedule."""
         if local_steps is not None:
-            if aggregation_interval is not None or aggregation_unit is not None:
+            if (
+                aggregation_interval is not None
+                or aggregation_unit is not None
+            ):
                 raise ValueError(
                     'Specify either aggregation_interval/aggregation_unit or '
                     'the legacy local_steps alias, not both.'
@@ -164,8 +167,7 @@ class FedPer(BaseOrchestrator):
 
         ref_encoder_state = ref.encoder.state_dict()
         ref_encoder_shapes = {
-            name: tensor.shape
-            for name, tensor in ref_encoder_state.items()
+            name: tensor.shape for name, tensor in ref_encoder_state.items()
         }
 
         for i, agent in enumerate(agents[1:], start=1):
@@ -193,9 +195,13 @@ class FedPer(BaseOrchestrator):
             return dict(self._client_sample_counts)
 
         trainer = getattr(self, '_trainer', None)
-        datamodule = None if trainer is None else getattr(trainer, 'datamodule', None)
+        datamodule = (
+            None if trainer is None else getattr(trainer, 'datamodule', None)
+        )
         train_datasets = (
-            None if datamodule is None else getattr(datamodule, 'train_datasets', None)
+            None
+            if datamodule is None
+            else getattr(datamodule, 'train_datasets', None)
         )
 
         counts = {}
@@ -223,7 +229,7 @@ class FedPer(BaseOrchestrator):
         total = float(sum(counts.values()))
         if total <= 0:
             uniform = 1.0 / max(len(counts), 1)
-            return {idx: uniform for idx in counts}
+            return dict.fromkeys(counts, uniform)
         return {idx: float(count) / total for idx, count in counts.items()}
 
     @torch.no_grad()

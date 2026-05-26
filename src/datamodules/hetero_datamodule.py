@@ -25,6 +25,7 @@ from src.datamodules.classification_datamodule import (
 )
 from src.datamodules.utils import compute_split_indices
 from src.utils.data_partitioner import (
+    partition_grouped_non_iid,
     partition_non_iid,
     partition_non_iid_fair,
     partition_non_iid_with_margin,
@@ -42,11 +43,34 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         'non_iid',
         'non_iid_with_margin',
         'non_iid_fair',
+        'grouped_non_iid',
     }
 
-    def __init__(self, *args, safety_margin: int = 10, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        safety_margin: int = 10,
+        groups: dict | None = None,
+        shift_strength: float = 0.0,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.safety_margin = int(safety_margin)
+        self.shift_strength = float(shift_strength)
+
+        # groups accepts two formats:
+        #   {0: [agents], 1: [agents], ...}
+        #   {0: {agents: [...], target_classes: [...]}, ...}
+        self.groups: dict[int, list[int]] = {}
+        self.group_target_classes: dict[int, list[int]] = {}
+        for k, v in (groups or {}).items():
+            gid = int(k)
+            if isinstance(v, (list, tuple)):
+                self.groups[gid] = list(v)
+            else:
+                self.groups[gid] = list(v['agents'])
+                if 'target_classes' in v:
+                    self.group_target_classes[gid] = list(v['target_classes'])
 
     def _partition_client_indices(
         self,
@@ -85,9 +109,59 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 safety_margin=self.safety_margin,
             )
 
+        if self.split_strategy == 'grouped_non_iid':
+            if not self.groups:
+                raise ValueError(
+                    'split_strategy="grouped_non_iid" requires a non-empty '
+                    '"groups" mapping in the dataset config.'
+                )
+            return partition_grouped_non_iid(
+                labels=labels,
+                n_agents=self.n_agents,
+                groups=self.groups,
+                group_target_classes=self.group_target_classes or None,
+                classes_per_agent=self.classes_per_agent,
+                shift_strength=self.shift_strength,
+                seed=self.seed,
+                return_agent_classes=True,
+            )
+
         raise ValueError(
             f'Unsupported hetero split_strategy: {self.split_strategy}'
         )
+
+    def _filter_pilots_to_agent_classes(
+        self,
+        pilot_data,
+        pilot_indices: list[int],
+        label_key: str,
+    ) -> None:
+        """Replace shared pilot datasets with per-agent views filtered to trained classes.
+
+        Called after train_datasets are built so we know each agent's actual
+        classes. Pilot samples from classes an agent never trained on are dropped,
+        preventing the anchor builder from receiving unseen-class embeddings.
+        Falls back to keeping at least one pilot sample if an agent trained on
+        no classes present in the global pilot pool.
+        """
+        pilot_labels = pilot_data[label_key]
+        for i in range(self.n_agents):
+            seen_classes = set(self.train_datasets[i].dataset[label_key])
+            keep = [
+                idx
+                for idx, lbl in enumerate(pilot_labels)
+                if lbl in seen_classes
+            ]
+            if not keep:
+                keep = [0]
+            filtered_pilot = pilot_data.select(keep)
+            filtered_ids = [pilot_indices[idx] for idx in keep]
+            self.pilot_datasets[i] = ClassificationDataset(
+                filtered_pilot,
+                self.data_key,
+                label_key,
+                sample_ids=filtered_ids,
+            )
 
     def _local_stratified_split_indices(
         self,
@@ -181,6 +255,9 @@ class HeteroClassificationDataModule(ClassificationDataModule):
 
         label_key = self.attributes[0]
 
+        pilot_data = None
+        pilot_indices: list[int] = []
+
         if self.pilot_split > 0 or self.pilot_num_samples:
             pilot_split_indices = compute_split_indices(
                 total_size=len(all_data),
@@ -212,7 +289,8 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             self.safety_margin
             if (
                 self.starve_clients
-                and self.split_strategy in {'non_iid_with_margin', 'non_iid_fair'}
+                and self.split_strategy
+                in {'non_iid_with_margin', 'non_iid_fair'}
             )
             else 0
         )
@@ -251,6 +329,15 @@ class HeteroClassificationDataModule(ClassificationDataModule):
 
         if self.starve_clients:
             self._starve_training_datasets(label_key)
+
+        if (
+            self.split_strategy == 'grouped_non_iid'
+            and pilot_data is not None
+            and pilot_indices
+        ):
+            self._filter_pilots_to_agent_classes(
+                pilot_data, pilot_indices, label_key
+            )
 
         sample, _ = self.train_datasets[0][0]
         if isinstance(sample, Image.Image):

@@ -50,7 +50,9 @@ def _resolve_agent_overrides(
     overrides = {agent_idx: {} for agent_idx in range(n_agents)}
     for agent_idx, values in per_agents_cfg.items():
         overrides[int(agent_idx)] = (
-            {} if values is None else OmegaConf.to_container(values, resolve=True)
+            {}
+            if values is None
+            else OmegaConf.to_container(values, resolve=True)
         )
     return overrides
 
@@ -73,21 +75,17 @@ def _sanitize_instantiation_config(config: Any) -> Any:
     if accepts_var_kwargs:
         return config
 
-    allowed_keys = {
-        name
-        for name in signature.parameters
-        if name != 'self'
-    }
+    allowed_keys = {name for name in signature.parameters if name != 'self'}
     allowed_keys.update({'_target_', '_recursive_', '_convert_', '_partial_'})
     sanitized = {
-        key: value
-        for key, value in config_dict.items()
-        if key in allowed_keys
+        key: value for key, value in config_dict.items() if key in allowed_keys
     }
     return OmegaConf.create(sanitized)
 
 
-def _filter_supported_init_kwargs(config: Any, **kwargs: Any) -> dict[str, Any]:
+def _filter_supported_init_kwargs(
+    config: Any, **kwargs: Any
+) -> dict[str, Any]:
     """Keep only kwargs accepted by the target constructor."""
     if not isinstance(config, (dict, DictConfig)):
         return kwargs
@@ -105,16 +103,8 @@ def _filter_supported_init_kwargs(config: Any, **kwargs: Any) -> dict[str, Any]:
     if accepts_var_kwargs:
         return kwargs
 
-    allowed_keys = {
-        name
-        for name in signature.parameters
-        if name != 'self'
-    }
-    return {
-        key: value
-        for key, value in kwargs.items()
-        if key in allowed_keys
-    }
+    allowed_keys = {name for name in signature.parameters if name != 'self'}
+    return {key: value for key, value in kwargs.items() if key in allowed_keys}
 
 
 def _extract_objective_metric(
