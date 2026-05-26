@@ -384,7 +384,9 @@ class DeepSenseDataModule(l.LightningDataModule):
             keep_count = max(1, int(round(len(current_ids) * 0.2)))
             perm = torch.randperm(
                 len(current_ids),
-                generator=torch.Generator().manual_seed(self.seed + client_idx),
+                generator=torch.Generator().manual_seed(
+                    self.seed + client_idx
+                ),
             ).tolist()
             new_ids = [current_ids[i] for i in sorted(perm[:keep_count])]
 
@@ -744,7 +746,9 @@ class DeepSenseDataModule(l.LightningDataModule):
                     for i in range(len(self._base_dataset))
                 ]
             )
-            self.num_classes['label'] = 2  # DeepSense is binary: LOS (0) / NLOS (1)
+            self.num_classes['label'] = (
+                2  # DeepSense is binary: LOS (0) / NLOS (1)
+            )
 
             if self.split_strategy == 'full':
                 self._split_data_full(split_indices)
@@ -844,24 +848,36 @@ class DeepSenseDataModule(l.LightningDataModule):
                 for ds in self.pilot_datasets.values()
             )
             if self.comm_data == 'private_pilots':
-                loaders.update({
-                    f'pilot_{i}': self._make_pilot_loader(ds, target_batches)
-                    for i, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}': self._make_pilot_loader(
+                            ds, target_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'shared_global_pilots':
-                loaders.update({
-                    f'global_pilot_{i}': self._make_pilot_loader(ds, target_batches)
-                    for i, ds in self.pilot_datasets.items()
-                })
+                loaders.update(
+                    {
+                        f'global_pilot_{i}': self._make_pilot_loader(
+                            ds, target_batches
+                        )
+                        for i, ds in self.pilot_datasets.items()
+                    }
+                )
             elif self.comm_data == 'pairwise_pilots':
-                loaders.update({
-                    f'pilot_{i}_{j}': self._make_pilot_loader(
-                        PairwiseDataset(self.pilot_datasets[i], self.pilot_datasets[j]),
-                        target_batches,
-                    )
-                    for i in range(self.n_agents)
-                    for j in range(i + 1, self.n_agents)
-                })
+                loaders.update(
+                    {
+                        f'pilot_{i}_{j}': self._make_pilot_loader(
+                            PairwiseDataset(
+                                self.pilot_datasets[i], self.pilot_datasets[j]
+                            ),
+                            target_batches,
+                        )
+                        for i in range(self.n_agents)
+                        for j in range(i + 1, self.n_agents)
+                    }
+                )
 
         return CombinedLoader(loaders, mode=self.mode)
 

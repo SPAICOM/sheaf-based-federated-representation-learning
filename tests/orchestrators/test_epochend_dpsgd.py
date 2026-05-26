@@ -2,8 +2,7 @@
 
 import torch
 import torch.nn as nn
-from lightning.pytorch import LightningDataModule
-from lightning.pytorch import Trainer
+from lightning.pytorch import LightningDataModule, Trainer
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.agents.latent_classifier import LatentClassifier
@@ -88,8 +87,7 @@ def test_epochend_matches_dpsgd_parameter_mixing_and_preserves_buffers():
 
     initial_epoch_buffers = {
         idx: {
-            name: buf.detach().clone()
-            for name, buf in agent.named_buffers()
+            name: buf.detach().clone() for name, buf in agent.named_buffers()
         }
         for idx, agent in epoch_agents.items()
     }

@@ -1,17 +1,16 @@
 defaults:
-  - dataset: cifar10
+  - dataset: hetero_cifar10
   - model: hetero_cnn_classifier
-  - orchestrator: sheaf_frl
+  - orchestrator: non_cooperative
   - optimizer: sgd
   - _self_
 
 seed: 42
 study_name: "HeteroRate CIFAR10 30agents"
 
-# Three complexity tiers, 10 agents each:
-#   rate=1.00  → agents  0-9   (full-width, most complex)
-#   rate=0.50  → agents 10-19  (half-width)
-#   rate=0.25  → agents 20-29  (quarter-width, simplest)
+# All agents use full-width architecture by default (rate=1.0).
+# Override individual rates to reintroduce architectural heterogeneity, e.g.:
+#   --multirun 'agents.10.rate=0.5,agents.20.rate=0.25'
 agents:
   0:  {rate: 1.0}
   1:  {rate: 1.0}
@@ -23,29 +22,14 @@ agents:
   7:  {rate: 1.0}
   8:  {rate: 1.0}
   9:  {rate: 1.0}
-  10: {rate: 0.5}
-  11: {rate: 0.5}
-  12: {rate: 0.5}
-  13: {rate: 0.5}
-  14: {rate: 0.5}
-  15: {rate: 0.5}
-  16: {rate: 0.5}
-  17: {rate: 0.5}
-  18: {rate: 0.5}
-  19: {rate: 0.5}
-  20: {rate: 0.25}
-  21: {rate: 0.25}
-  22: {rate: 0.25}
-  23: {rate: 0.25}
-  24: {rate: 0.25}
-  25: {rate: 0.25}
-  26: {rate: 0.25}
-  27: {rate: 0.25}
-  28: {rate: 0.25}
-  29: {rate: 0.25}
+  10: {rate: 1.0}
+  11: {rate: 1.0}
+  12: {rate: 1.0}
+  13: {rate: 1.0}
+  14: {rate: 1.0}
 
 graph:
-  neighbors_mode: "erdos_renyi"
+  neighbors_mode: "fully_connected"
   seed: 42
   p: 0.15
   m: 3
@@ -86,17 +70,27 @@ callbacks:
     mode: max
 
 dataset:
-  split_strategy: non_iid
-  n_agents: 30
-  classes_per_agent: 5
-  alpha: -1
+  split_strategy: grouped_non_iid
+  n_agents: 15
+  classes_per_agent: 10   # set < 10 to restrict which classes every agent sees
+  shift_strength: 0.8     # 0.0 = uniform, 1.0 = fully on target_classes
   monitor_test_during_fit: true
   batch_size: 256
   num_workers: 0
   mode: min_size
   pilot_split: 0.05
   pilot_batch_size: 64
-  comm_data: shared_global_pilots
+  comm_data: private_pilots  # per-agent filtered pilots (handles distribution shift)
+  groups:
+    0:
+      agents: [0, 1, 2, 3, 4]
+      target_classes: [0, 1, 2, 3, 4, 5]  # intersects group 1 on {2,3,4,5}, group 2 on {4,5}
+    1:
+      agents: [5, 6, 7, 8, 9]
+      target_classes: [2, 3, 4, 5, 6, 7]  # intersects group 0 on {2,3,4,5}, group 2 on {4,5,6,7}
+    2:
+      agents: [10, 11, 12, 13, 14]
+      target_classes: [4, 5, 6, 7, 8, 9]  # intersects group 0 on {4,5}, group 1 on {4,5,6,7}
 
 model:
   encoder_hidden_dims: [32, 64, 128]

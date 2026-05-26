@@ -3,13 +3,13 @@ Sheaf-based Federated Representation Learning orchestrator.
 
 This module implements the proposed federated learning framework with
 Sheaf regularization that maintains aligned latent spaces across agents
-through Stiefel manifold optimization of cross-covariance matrices. 
+through Stiefel manifold optimization of cross-covariance matrices.
 Shared pilot batches provide the semantic correspondence needed to align
 neighboring agents accurately.
 """
 
-from typing import Any
 from dataclasses import replace
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -35,7 +35,7 @@ class SheafFRL(BaseOrchestrator):
         parseval_normalization: bool,
         l2_normalization: bool,
         parseval_eps: float = 1e-4,
-        #local_steps: int = 1,
+        # local_steps: int = 1,
         anchor_strategy: str = 'pilots',
         num_anchors: int = 128,
         use_prototypes: bool = False,
@@ -73,7 +73,9 @@ class SheafFRL(BaseOrchestrator):
             sparse_communication=bool(sparse_communication),
             sparse_epsilon=float(sparse_epsilon),
         )
-        self._latest_pilots: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        self._latest_pilots: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = {}
         self.stiefel_matrices = nn.ParameterDict()
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
 
@@ -102,14 +104,28 @@ class SheafFRL(BaseOrchestrator):
         str_key = str(idx)
         return str_key if str_key in batch else idx
 
-    def _extract_pilot_batch(self, batch: dict, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def _extract_pilot_batch(
+        self, batch: dict, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Extract pilot data for an agent, handling global, private, or pairwise keys."""
         if f'pilot_{idx}' in batch:
-            return batch[f'pilot_{idx}'][0], batch[f'pilot_{idx}'][1], batch[f'pilot_{idx}'][2]
+            return (
+                batch[f'pilot_{idx}'][0],
+                batch[f'pilot_{idx}'][1],
+                batch[f'pilot_{idx}'][2],
+            )
         if f'global_pilot_{idx}' in batch:
-            return batch[f'global_pilot_{idx}'][0], batch[f'global_pilot_{idx}'][1], batch[f'global_pilot_{idx}'][2]
+            return (
+                batch[f'global_pilot_{idx}'][0],
+                batch[f'global_pilot_{idx}'][1],
+                batch[f'global_pilot_{idx}'][2],
+            )
         if 'global_pilot' in batch:
-            return batch['global_pilot'][0], batch['global_pilot'][1], batch['global_pilot'][2]
+            return (
+                batch['global_pilot'][0],
+                batch['global_pilot'][1],
+                batch['global_pilot'][2],
+            )
 
         for key, value in batch.items():
             if isinstance(key, str) and key.startswith('pilot_'):
@@ -120,8 +136,8 @@ class SheafFRL(BaseOrchestrator):
                         return value[0], value[1], value[2]
                     if j == idx:
                         return value[3], value[4], value[5]
-                        
-        raise ValueError(f"Pilot batch missing for agent {idx}.")
+
+        raise ValueError(f'Pilot batch missing for agent {idx}.')
 
     def _effective_anchor_config(self) -> AnchorConfig:
         return replace(self.anchor_config)
@@ -145,15 +161,24 @@ class SheafFRL(BaseOrchestrator):
             return anchor_matrix[:0], labels[:0]
 
         return torch.stack(prototypes, dim=0), torch.tensor(
-            prototype_labels, device=labels.device, dtype=labels.dtype,
+            prototype_labels,
+            device=labels.device,
+            dtype=labels.dtype,
         )
 
-    def _pilot_match_keys(self, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None) -> torch.Tensor:
+    def _pilot_match_keys(
+        self, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None
+    ) -> torch.Tensor:
         if sample_ids is not None:
             return sample_ids
         return y_pilot
 
-    def _normalize_pilot_latents(self, pilot_latents: torch.Tensor, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None,) -> tuple[torch.Tensor, torch.Tensor]:
+    def _normalize_pilot_latents(
+        self,
+        pilot_latents: torch.Tensor,
+        y_pilot: torch.Tensor,
+        sample_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.anchor_config.use_prototypes:
             step_latents, step_keys = self._compute_class_prototypes(
                 pilot_latents,
@@ -163,10 +188,14 @@ class SheafFRL(BaseOrchestrator):
             step_latents = pilot_latents
             step_keys = self._pilot_match_keys(y_pilot, sample_ids)
 
-        return normalize_anchor_matrix(step_latents, self.anchor_config), step_keys
+        return normalize_anchor_matrix(
+            step_latents, self.anchor_config
+        ), step_keys
 
     @torch.no_grad()
-    def _encode_pilots_eval(self, agent: nn.Module, x_pilot: torch.Tensor) -> torch.Tensor:
+    def _encode_pilots_eval(
+        self, agent: nn.Module, x_pilot: torch.Tensor
+    ) -> torch.Tensor:
         was_training = agent.training
         agent.eval()
         try:
@@ -204,7 +233,7 @@ class SheafFRL(BaseOrchestrator):
     def _update_stiefel_matrices(
         self,
         latents_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor]
+        keys_per_agent: dict[int, torch.Tensor],
     ) -> None:
         if not self.stiefel_matrices:
             return
@@ -214,7 +243,10 @@ class SheafFRL(BaseOrchestrator):
         for edge_key, V_param in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
 
-            if node_i not in latents_per_agent or node_j not in latents_per_agent:
+            if (
+                node_i not in latents_per_agent
+                or node_j not in latents_per_agent
+            ):
                 continue
 
             shared_rows = self._match_keys(
@@ -227,8 +259,8 @@ class SheafFRL(BaseOrchestrator):
                 continue
 
             A_i, A_j = shared_rows
-            #A_i = A_i - A_i.mean(dim=0, keepdim=True)
-            #A_j = A_j - A_j.mean(dim=0, keepdim=True)
+            # A_i = A_i - A_i.mean(dim=0, keepdim=True)
+            # A_j = A_j - A_j.mean(dim=0, keepdim=True)
 
             C = torch.matmul(A_i.T, A_j)
             C = C + torch.randn_like(C) * 1e-6
@@ -237,10 +269,14 @@ class SheafFRL(BaseOrchestrator):
                 U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
             except RuntimeError:
                 C_cpu = C.cpu()
-                U_cpu, _, W_T_cpu = torch.linalg.svd(C_cpu, full_matrices=False)
+                U_cpu, _, W_T_cpu = torch.linalg.svd(
+                    C_cpu, full_matrices=False
+                )
                 U, W_T = U_cpu.to(param_device), W_T_cpu.to(param_device)
-            
-            V_new = torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
+
+            V_new = torch.matmul(U, W_T).to(
+                dtype=V_param.dtype, device=param_device
+            )
             V_param.copy_(V_new)
 
     def on_train_start(self) -> None:
@@ -261,7 +297,7 @@ class SheafFRL(BaseOrchestrator):
         epoch_keys: dict[int, torch.Tensor] = {}
         payloads_per_agent: dict[int, Any] = {}
 
-        for idx_str in self.agents.keys():
+        for idx_str in self.agents:
             idx = int(idx_str)
             latest_pilots = self._latest_pilots.get(idx)
             if latest_pilots is None:
@@ -319,9 +355,9 @@ class SheafFRL(BaseOrchestrator):
             logs[f'validation/alignment_rank_edge_{node_i}_{node_j}'] = float(
                 torch.linalg.matrix_rank(v).item()
             )
-            logs[f'validation/alignment_effective_rank_edge_{node_i}_{node_j}'] = (
-                self._effective_rank(v)
-            )
+            logs[
+                f'validation/alignment_effective_rank_edge_{node_i}_{node_j}'
+            ] = self._effective_rank(v)
         if logs:
             self.log_dict(
                 logs,
@@ -366,7 +402,9 @@ class SheafFRL(BaseOrchestrator):
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             try:
-                x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(batch, idx)
+                x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(
+                    batch, idx
+                )
             except ValueError:
                 pilots_available = False
                 break
@@ -399,7 +437,9 @@ class SheafFRL(BaseOrchestrator):
                 )
                 if n_neighbors > 0:
                     self._record_communication(
-                        payload, n_transmissions=n_neighbors, prefix=prefix,
+                        payload,
+                        n_transmissions=n_neighbors,
+                        prefix=prefix,
                     )
 
         sheaf_penalty = torch.tensor(0.0, device=self.device)
@@ -407,7 +447,10 @@ class SheafFRL(BaseOrchestrator):
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
 
-            if node_i not in latents_per_agent or node_j not in latents_per_agent:
+            if (
+                node_i not in latents_per_agent
+                or node_j not in latents_per_agent
+            ):
                 continue
 
             shared_rows = self._match_keys(
@@ -421,10 +464,12 @@ class SheafFRL(BaseOrchestrator):
 
             A_i_shared, A_j_shared = shared_rows
             diff = A_i_shared - torch.matmul(A_j_shared, V.T)
-            
+
             sheaf_penalty += (diff**2).sum(dim=1).mean()
 
-        total_loss = total_task_loss + self._effective_lambda_reg() * sheaf_penalty
+        total_loss = (
+            total_task_loss + self._effective_lambda_reg() * sheaf_penalty
+        )
 
         self._log_shared_metrics(
             prefix=prefix,

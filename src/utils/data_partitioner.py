@@ -51,9 +51,7 @@ def build_shared_class_partition(
     shared = shuffled_classes[:shared_classes]
     residual = shuffled_classes[shared_classes:]
 
-    assignments = {
-        agent_id: list(shared) for agent_id in range(n_agents)
-    }
+    assignments = {agent_id: list(shared) for agent_id in range(n_agents)}
     agent_order = torch.randperm(n_agents, generator=generator).tolist()
 
     for offset, class_label in enumerate(residual):
@@ -132,9 +130,12 @@ def _draw_dirichlet_proportions(
     """
 
     # If alpha is negative, use the exact pFedHN logic
-    # to guarantee the tight sample bounds [1325, 2000] 
+    # to guarantee the tight sample bounds [1325, 2000]
     if alpha < 0:
-        probs = torch.rand(n_parts, generator=generator, dtype=torch.float32) * 0.2 + 0.4
+        probs = (
+            torch.rand(n_parts, generator=generator, dtype=torch.float32) * 0.2
+            + 0.4
+        )
         probs_sum = probs.sum()
         if probs_sum <= 0:
             return torch.full((n_parts,), 1 / n_parts, dtype=torch.float32)
@@ -240,9 +241,7 @@ def _sample_exact_k_class_assignments(
 
     shuffled_classes = [
         resolved_classes[idx]
-        for idx in torch.randperm(
-            num_classes, generator=generator
-        ).tolist()
+        for idx in torch.randperm(num_classes, generator=generator).tolist()
     ]
     shuffled_agents = torch.randperm(n_agents, generator=generator).tolist()
 
@@ -628,9 +627,7 @@ def partition_non_iid_with_margin(
 
         cursor = 0
         for agent_id in assigned_agents:
-            safety_indices = shuffled_indices[
-                cursor : cursor + safety_margin
-            ]
+            safety_indices = shuffled_indices[cursor : cursor + safety_margin]
             agent_indices[agent_id].extend(safety_indices)
             cursor += safety_margin
 
@@ -828,9 +825,9 @@ def partition_non_iid_fair(
     if torch.any(class_counts < class_margin_counts):
         failing_classes = [
             unique_classes[pos]
-            for pos in torch.where(
-                class_counts < class_margin_counts
-            )[0].tolist()
+            for pos in torch.where(class_counts < class_margin_counts)[
+                0
+            ].tolist()
         ]
         raise ValueError(
             'At least one class has too few samples for the requested safety '
@@ -838,10 +835,9 @@ def partition_non_iid_fair(
         )
 
     count_matrix = margin_counts.clone()
-    remaining_agent_capacity = (
-        torch.full((n_agents,), samples_per_agent, dtype=torch.long)
-        - margin_counts.sum(dim=1)
-    )
+    remaining_agent_capacity = torch.full(
+        (n_agents,), samples_per_agent, dtype=torch.long
+    ) - margin_counts.sum(dim=1)
     remaining_class_counts = class_counts - class_margin_counts
     pending_classes = set(range(len(unique_classes)))
 
@@ -956,4 +952,212 @@ def partition_non_iid_fair(
 
     if return_agent_classes:
         return agent_indices, resolved_agent_classes
+    return agent_indices
+
+
+def _group_class_distribution(
+    selected_classes: list[int],
+    target_classes: list[int] | None,
+    shift_strength: float,
+) -> torch.Tensor:
+    """Compute the class distribution for one group.
+
+    Linearly interpolates between the uniform distribution (shift_strength=0)
+    and a distribution concentrated on ``target_classes`` (shift_strength=1):
+
+        θ[k] = (1 - s) / K  +  s * (1/|T| if k ∈ T else 0)
+
+    When ``target_classes`` is None or empty the distribution is always uniform.
+
+    Parameters
+    ----------
+    selected_classes : list[int]
+        Ordered list of all classes visible to agents.
+    target_classes : list[int] or None
+        Classes this group is biased towards.
+    shift_strength : float
+        Interpolation weight in [0, 1].  0 → uniform, 1 → fully on targets.
+    """
+    K = len(selected_classes)
+    uniform = torch.full((K,), 1.0 / K, dtype=torch.float32)
+
+    if not target_classes or shift_strength == 0.0:
+        return uniform
+
+    class_to_idx = {c: i for i, c in enumerate(selected_classes)}
+    targets_in_selected = [c for c in target_classes if c in class_to_idx]
+
+    if not targets_in_selected:
+        return uniform
+
+    concentrated = torch.zeros(K, dtype=torch.float32)
+    w = 1.0 / len(targets_in_selected)
+    for c in targets_in_selected:
+        concentrated[class_to_idx[c]] = w
+
+    dist = (1.0 - shift_strength) * uniform + shift_strength * concentrated
+    return dist / dist.sum()
+
+
+def partition_grouped_non_iid(
+    labels: list[int],
+    n_agents: int,
+    groups: dict[int, list[int]],
+    group_target_classes: dict[int, list[int]] | None = None,
+    classes_per_agent: int = 10,
+    shift_strength: float = 0.0,
+    seed: int = 42,
+    return_agent_classes: bool = False,
+) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Partition data so agents share a distribution within their group.
+
+    Each group's class distribution is a linear interpolation between uniform
+    and a spike on the group's target classes, controlled by ``shift_strength``:
+
+        θ_g[k] = (1 - s) / K  +  s * (1/|T_g|  if k ∈ T_g  else 0)
+
+    All agents in the same group share θ_g (same expected class proportions);
+    agents in different groups have different targets → different distributions.
+    At shift_strength=0 every group is uniform; at shift_strength=1 each group
+    receives only samples from its target classes.
+
+    Parameters
+    ----------
+    labels : list[int]
+        Integer class labels, one per sample.
+    n_agents : int
+        Total number of agents (must equal the union of all group members).
+    groups : dict[int, list[int]]
+        Mapping from group id to list of agent indices in that group.
+        Must cover exactly the agents 0 .. n_agents-1 with no overlap.
+    group_target_classes : dict[int, list[int]] or None, optional
+        Mapping from group id to the classes that group is biased towards.
+        Groups without an entry default to uniform regardless of shift_strength.
+    classes_per_agent : int, optional
+        Number of classes visible to every agent. Default 10 (all classes).
+        When less than the total number of classes a random subset is chosen
+        and all agents see that same subset.
+    shift_strength : float, optional
+        Interpolation weight in [0, 1].  0 → uniform for all groups,
+        1 → fully concentrated on target_classes for each group.
+    seed : int, optional
+        Random seed for reproducibility.
+    return_agent_classes : bool, optional
+        If True, also return the agent-to-class mapping.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if not groups:
+        raise ValueError('groups must be non-empty')
+    if not 0.0 <= shift_strength <= 1.0:
+        raise ValueError('shift_strength must be in [0, 1]')
+
+    all_agent_ids = sorted(
+        {a for agent_list in groups.values() for a in agent_list}
+    )
+    if all_agent_ids != list(range(n_agents)):
+        raise ValueError(
+            'groups must cover exactly the agents 0..n_agents-1 with no overlap; '
+            f'got {all_agent_ids}'
+        )
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    if labels_tensor.numel() == 0:
+        empty: dict[int, list[int]] = {i: [] for i in range(n_agents)}
+        if return_agent_classes:
+            return empty, {i: [] for i in range(n_agents)}
+        return empty
+
+    unique_classes = sorted(torch.unique(labels_tensor).tolist())
+    num_classes = len(unique_classes)
+
+    if classes_per_agent < 1:
+        raise ValueError('classes_per_agent must be at least 1')
+    if classes_per_agent > num_classes:
+        raise ValueError(
+            f'classes_per_agent={classes_per_agent} must be <= {num_classes} '
+            f'(number of unique classes in the dataset)'
+        )
+
+    generator = torch.Generator().manual_seed(seed)
+
+    if classes_per_agent < num_classes:
+        perm = torch.randperm(num_classes, generator=generator).tolist()
+        selected_classes: list[int] = sorted(
+            unique_classes[i] for i in perm[:classes_per_agent]
+        )
+    else:
+        selected_classes = unique_classes
+
+    agent_classes_map: dict[int, list[int]] = {
+        i: list(selected_classes) for i in range(n_agents)
+    }
+
+    resolved_targets = group_target_classes or {}
+    group_ids = sorted(groups.keys())
+    group_dists: dict[int, torch.Tensor] = {
+        g: _group_class_distribution(
+            selected_classes,
+            resolved_targets.get(g),
+            shift_strength,
+        )
+        for g in group_ids
+    }
+
+    agent_to_group: dict[int, int] = {
+        i: g for g, agent_list in groups.items() for i in agent_list
+    }
+
+    agent_indices: dict[int, list[int]] = {i: [] for i in range(n_agents)}
+
+    for k_idx, class_label in enumerate(selected_classes):
+        class_indices = torch.where(labels_tensor == class_label)[0]
+        class_indices = class_indices[
+            torch.randperm(len(class_indices), generator=generator)
+        ]
+        N_k = len(class_indices)
+
+        weights = torch.tensor(
+            [
+                group_dists[agent_to_group[i]][k_idx].item()
+                for i in range(n_agents)
+            ],
+            dtype=torch.float32,
+        )
+        w_sum = weights.sum()
+        weights = (
+            weights / w_sum
+            if w_sum > 0
+            else torch.full((n_agents,), 1.0 / n_agents)
+        )
+
+        draws = torch.multinomial(
+            weights, num_samples=N_k, replacement=True, generator=generator
+        )
+        counts = torch.bincount(draws, minlength=n_agents)
+
+        offset = 0
+        for i in range(n_agents):
+            count = int(counts[i].item())
+            agent_indices[i].extend(
+                class_indices[offset : offset + count].tolist()
+            )
+            offset += count
+
+    # Ensure no agent is completely empty.
+    empty_agents = [i for i, idxs in agent_indices.items() if not idxs]
+    for i in empty_agents:
+        donors = sorted(
+            (d for d, idxs in agent_indices.items() if len(idxs) > 1),
+            key=lambda d: -len(agent_indices[d]),
+        )
+        if donors:
+            moved = agent_indices[donors[0]].pop()
+            agent_indices[i].append(moved)
+
+    for i in range(n_agents):
+        agent_indices[i].sort()
+
+    if return_agent_classes:
+        return agent_indices, agent_classes_map
     return agent_indices

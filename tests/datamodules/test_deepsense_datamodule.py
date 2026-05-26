@@ -1,7 +1,6 @@
 """Tests for src.datamodules.deepsense_datamodule."""
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,7 +10,6 @@ from src.datamodules.deepsense_datamodule import (
     DeepSenseDataset,
     DeepSenseModalityDataset,
 )
-
 
 SCENARIO = '26'
 
@@ -119,7 +117,9 @@ class TestDeepSenseDataModule:
 
         def fake_download(id, output, **kwargs):
             with zf_mod.ZipFile(output, 'w') as zf:
-                zf.writestr(f'scenario{SCENARIO}.csv', 'unit1_rgb,unit1_blockage\n')
+                zf.writestr(
+                    f'scenario{SCENARIO}.csv', 'unit1_rgb,unit1_blockage\n'
+                )
 
         with patch(
             'src.datamodules.deepsense_datamodule.gdown.download',
@@ -138,7 +138,9 @@ class TestDeepSenseDataModule:
 
         zip_path = tmp_path / f'scenario{SCENARIO}.zip'
         with zf_mod.ZipFile(zip_path, 'w') as zf:
-            zf.writestr(f'scenario{SCENARIO}.csv', 'unit1_rgb,unit1_blockage\n')
+            zf.writestr(
+                f'scenario{SCENARIO}.csv', 'unit1_rgb,unit1_blockage\n'
+            )
 
         dm = DeepSenseDataModule(
             data_path=str(tmp_path),
@@ -146,7 +148,9 @@ class TestDeepSenseDataModule:
             gdrive_file_id='some_file_id',
         )
 
-        with patch('src.datamodules.deepsense_datamodule.gdown.download') as mock_dl:
+        with patch(
+            'src.datamodules.deepsense_datamodule.gdown.download'
+        ) as mock_dl:
             dm.prepare_data()
 
         mock_dl.assert_not_called()
@@ -160,9 +164,11 @@ class TestDeepSenseDataModule:
             gdrive_file_id='bad_id',
         )
 
-        with patch('src.datamodules.deepsense_datamodule.gdown.download'):
-            with pytest.raises(RuntimeError, match='Download failed'):
-                dm.prepare_data()
+        with (
+            patch('src.datamodules.deepsense_datamodule.gdown.download'),
+            pytest.raises(RuntimeError, match='Download failed'),
+        ):
+            dm.prepare_data()
 
     def test_prepare_data_creates_directory_if_missing(self, tmp_path):
         """data_path directory is created automatically when absent."""
@@ -175,9 +181,11 @@ class TestDeepSenseDataModule:
             gdrive_file_id='some_file_id',
         )
 
-        with patch('src.datamodules.deepsense_datamodule.gdown.download'):
-            with pytest.raises(RuntimeError):
-                dm.prepare_data()
+        with (
+            patch('src.datamodules.deepsense_datamodule.gdown.download'),
+            pytest.raises(RuntimeError),
+        ):
+            dm.prepare_data()
 
         assert new_dir.exists()
 

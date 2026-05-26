@@ -318,9 +318,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         """Accumulate protocol-level communication rounds."""
         if int(n_rounds) < 1:
             return None
-        self._communication_by_split[prefix]['rounds'] += float(
-            int(n_rounds)
-        )
+        self._communication_by_split[prefix]['rounds'] += float(int(n_rounds))
         return None
 
     def _communication_metrics(self, prefix: str) -> dict[str, float]:
@@ -354,12 +352,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
         source_state = self._communication_by_split[source_prefix]
         return {
             (
-                f'{prefix}/'
-                f'{source_prefix}_communication_kilobytes_cumulative'
+                f'{prefix}/{source_prefix}_communication_kilobytes_cumulative'
             ): source_state['kilobytes'],
             (
-                f'{prefix}/'
-                f'{source_prefix}_communication_rounds_cumulative'
+                f'{prefix}/{source_prefix}_communication_rounds_cumulative'
             ): source_state['rounds'],
         }
 
@@ -367,7 +363,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         """Log cumulative train communication metrics once per epoch."""
         communication_logs = self._communication_metrics('train')
         if hasattr(self.hparams, 'max_lmb'):
-            communication_logs['train/lambda_reg'] = self._effective_lambda_reg()
+            communication_logs['train/lambda_reg'] = (
+                self._effective_lambda_reg()
+            )
         self.log_dict(
             communication_logs,
             on_step=False,
@@ -455,7 +453,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         for idx in sorted(normalized_losses):
             loss = normalized_losses[idx]
             performance = normalized_performances[idx]
-            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = loss
+            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = (
+                loss
+            )
             per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
                 performance
             )

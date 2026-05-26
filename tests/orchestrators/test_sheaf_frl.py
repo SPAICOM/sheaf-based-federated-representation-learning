@@ -2,8 +2,7 @@
 
 import pytest
 import torch
-from lightning.pytorch import Trainer
-from lightning.pytorch import LightningDataModule
+from lightning.pytorch import LightningDataModule, Trainer
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.agents.cnn_classifier import CNNClassifier
@@ -53,8 +52,8 @@ class TestSheafFRL:
             optimizer=MockOptimizer(),
             max_lmb=0.1,
             latent_dims={0: 64},
-            #anchor_strategy='prototype',
-            #num_anchors=10,
+            # anchor_strategy='prototype',
+            # num_anchors=10,
             parseval_normalization=False,
             l2_normalization=False,
         )
@@ -270,11 +269,12 @@ class TestSheafFRL:
             > 0.0
         )
         assert (
-            float(trainer.callback_metrics['train/communication_rounds'])
-            > 0.0
+            float(trainer.callback_metrics['train/communication_rounds']) > 0.0
         )
 
-    def test_train_communication_is_recorded_per_step_and_stiefel_updates_at_epoch_end(self):
+    def test_train_communication_is_recorded_per_step_and_stiefel_updates_at_epoch_end(
+        self,
+    ):
         """Train communication happens per step; Stiefel refresh happens at epoch end."""
         orchestrator = SheafFRL(
             agents={
@@ -378,7 +378,9 @@ class TestSheafFRL:
         try:
             datamodule.prepare_data()
         except OSError as exc:
-            pytest.skip(f'Dataset cache is not writable in this environment: {exc}')
+            pytest.skip(
+                f'Dataset cache is not writable in this environment: {exc}'
+            )
         datamodule.setup('train')
 
         trainer = Trainer(

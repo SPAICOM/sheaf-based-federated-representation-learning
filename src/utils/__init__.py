@@ -11,15 +11,16 @@ This package provides helper functions for:
 
 from .anchors import (
     AnchorConfig,
-    #build_anchor_bundles,
-    #build_semantic_pilot_bundles,
+    # build_anchor_bundles,
+    # build_semantic_pilot_bundles,
     shared_anchor_rows,
-    #supported_anchor_strategy,
+    # supported_anchor_strategy,
 )
 from .communication import calculate_communication_cost
 from .data_partitioner import (
     build_shared_class_partition,
     partition_by_agent_classes,
+    partition_grouped_non_iid,
     partition_non_iid,
     partition_non_iid_fair,
     partition_non_iid_with_margin,
@@ -45,6 +46,7 @@ __all__ = [
     'calculate_communication_cost',
     'generate_neighbors',
     'partition_by_agent_classes',
+    'partition_grouped_non_iid',
     'partition_non_iid',
     'partition_non_iid_fair',
     'partition_non_iid_with_margin',

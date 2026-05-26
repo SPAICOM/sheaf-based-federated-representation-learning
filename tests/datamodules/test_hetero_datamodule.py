@@ -108,15 +108,19 @@ class TestHeteroClassificationDataModule:
             train_ratios = _label_ratios(
                 dm.train_datasets[client_idx].dataset['label']
             )
-            val_ratios = _label_ratios(dm.val_datasets[client_idx].dataset['label'])
+            val_ratios = _label_ratios(
+                dm.val_datasets[client_idx].dataset['label']
+            )
             test_ratios = _label_ratios(
                 dm.test_datasets[client_idx].dataset['label']
             )
 
             for class_label in dm.agent_classes[client_idx]:
-                assert abs(
-                    train_ratios[class_label] - val_ratios[class_label]
-                ) <= 0.08
-                assert abs(
-                    train_ratios[class_label] - test_ratios[class_label]
-                ) <= 0.08
+                assert (
+                    abs(train_ratios[class_label] - val_ratios[class_label])
+                    <= 0.08
+                )
+                assert (
+                    abs(train_ratios[class_label] - test_ratios[class_label])
+                    <= 0.08
+                )

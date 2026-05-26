@@ -148,7 +148,9 @@ class TestDPSGD:
 
         orchestrator.on_before_optimizer_step(None)
 
-    def test_on_before_optimizer_step_without_neighbors_records_no_rounds(self):
+    def test_on_before_optimizer_step_without_neighbors_records_no_rounds(
+        self,
+    ):
         """Isolated agents should not accrue communication rounds."""
         agent = LatentClassifier(
             in_features=128, num_classes=10, latent_dim=64

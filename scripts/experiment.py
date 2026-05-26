@@ -66,7 +66,9 @@ def _resolve_agent_overrides(
     overrides = {agent_idx: {} for agent_idx in range(n_agents)}
     for agent_idx, values in per_agents_cfg.items():
         overrides[int(agent_idx)] = (
-            {} if values is None else OmegaConf.to_container(values, resolve=True)
+            {}
+            if values is None
+            else OmegaConf.to_container(values, resolve=True)
         )
     return overrides
 
@@ -173,21 +175,17 @@ def _sanitize_instantiation_config(config: Any) -> Any:
     if accepts_var_kwargs:
         return config
 
-    allowed_keys = {
-        name
-        for name in signature.parameters
-        if name != 'self'
-    }
+    allowed_keys = {name for name in signature.parameters if name != 'self'}
     allowed_keys.update({'_target_', '_recursive_', '_convert_', '_partial_'})
     sanitized = {
-        key: value
-        for key, value in config_dict.items()
-        if key in allowed_keys
+        key: value for key, value in config_dict.items() if key in allowed_keys
     }
     return OmegaConf.create(sanitized)
 
 
-def _filter_supported_init_kwargs(config: Any, **kwargs: Any) -> dict[str, Any]:
+def _filter_supported_init_kwargs(
+    config: Any, **kwargs: Any
+) -> dict[str, Any]:
     """Keep only kwargs accepted by the target constructor."""
     if not isinstance(config, (dict, DictConfig)):
         return kwargs
@@ -205,16 +203,8 @@ def _filter_supported_init_kwargs(config: Any, **kwargs: Any) -> dict[str, Any]:
     if accepts_var_kwargs:
         return kwargs
 
-    allowed_keys = {
-        name
-        for name in signature.parameters
-        if name != 'self'
-    }
-    return {
-        key: value
-        for key, value in kwargs.items()
-        if key in allowed_keys
-    }
+    allowed_keys = {name for name in signature.parameters if name != 'self'}
+    return {key: value for key, value in kwargs.items() if key in allowed_keys}
 
 
 def _extract_objective_metric(
@@ -405,15 +395,14 @@ def main(cfg: DictConfig) -> float:
             cfg.agent_classes, resolve=True
         )
 
-    #anchor_strategy = str(
+        # anchor_strategy = str(
         cfg.get('orchestrator', {}).get('anchor_strategy', '')
-    #)
-    #requires_pilot_loaders = anchor_strategy == 'semantic_pilots'
-    #dataset_cfg['include_pilot_loaders'] = requires_pilot_loaders
-    #if not requires_pilot_loaders:
+    # )
+    # requires_pilot_loaders = anchor_strategy == 'semantic_pilots'
+    # dataset_cfg['include_pilot_loaders'] = requires_pilot_loaders
+    # if not requires_pilot_loaders:
     #    dataset_cfg['pilot_split'] = 0.0
     #    dataset_cfg['pilot_num_samples'] = None
-
 
     # Pass 'agents' config to datamodule only for SemanticDataModule
     # SemanticDataModule loads pre-computed embeddings from HuggingFace

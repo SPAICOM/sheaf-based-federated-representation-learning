@@ -83,7 +83,9 @@ def main(cfg: DictConfig) -> None:
 
         mod_cfg = per_modality_cfg.get(primary_modality, {})
         output_dim = mod_cfg.get('output_dim', global_output_dim)
-        decoder_hidden_dims = list(mod_cfg.get('decoder_hidden_dims', global_decoder_hidden_dims))
+        decoder_hidden_dims = list(
+            mod_cfg.get('decoder_hidden_dims', global_decoder_hidden_dims)
+        )
         dropout = mod_cfg.get('dropout', global_dropout)
         use_batchnorm = mod_cfg.get('use_batchnorm', global_use_batchnorm)
         l1_reg = mod_cfg.get('l1_reg', global_l1_reg)

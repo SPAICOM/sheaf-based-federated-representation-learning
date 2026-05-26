@@ -60,7 +60,9 @@ class ComFed(BaseOrchestrator):
         lambda_schedule: str | None = None,
         **kwargs,
     ):
-        super().__init__(agents=agents, neighbors=neighbors, optimizer=optimizer)
+        super().__init__(
+            agents=agents, neighbors=neighbors, optimizer=optimizer
+        )
         self.save_hyperparameters()
         self.automatic_optimization = False
 
@@ -154,7 +156,7 @@ class ComFed(BaseOrchestrator):
                 # Arithmetic mean of neighbors' projected prototypes (L2 consensus)
                 target = torch.stack(neighbor_projs).mean(dim=0)
                 diff = u_i_c - target
-                loss = loss + (diff ** 2).sum()
+                loss = loss + (diff**2).sum()
                 n_terms += 1
 
         return loss / max(n_terms, 1)
@@ -271,7 +273,9 @@ class ComFed(BaseOrchestrator):
                 )
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
-        total_loss = total_task_loss + self._effective_lambda_reg() * alignment_loss
+        total_loss = (
+            total_task_loss + self._effective_lambda_reg() * alignment_loss
+        )
 
         self._log_shared_metrics(
             prefix=prefix,

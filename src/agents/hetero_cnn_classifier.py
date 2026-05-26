@@ -38,7 +38,7 @@ class HeteroCNNClassifier(PersonalizedClassifier):
     use_batchnorm : bool, optional
         Whether to use batch normalisation (default: False).
     l1_reg : float, optional
-        L1 regularization strength (default: 0.0) for embedding sparsification.   
+        L1 regularization strength (default: 0.0) for embedding sparsification.
     """
 
     def __init__(

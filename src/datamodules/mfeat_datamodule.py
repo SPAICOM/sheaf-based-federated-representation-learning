@@ -89,9 +89,9 @@ def _load_mfeat_modality(data_path: Path, modality: str) -> np.ndarray:
 
 def _build_labels(n_total: int = _TOTAL_SAMPLES) -> np.ndarray:
     """Build integer labels from implicit row ordering (200 samples/class)."""
-    return np.repeat(np.arange(_NUM_CLASSES), _SAMPLES_PER_CLASS).astype('int64')[
-        :n_total
-    ]
+    return np.repeat(np.arange(_NUM_CLASSES), _SAMPLES_PER_CLASS).astype(
+        'int64'
+    )[:n_total]
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -316,7 +316,9 @@ class MFeatDataModule(l.LightningDataModule):
                 if k < n_agents
             }
         else:
-            self.agent_modalities = {int(k): v for k, v in agent_modalities.items()}
+            self.agent_modalities = {
+                int(k): v for k, v in agent_modalities.items()
+            }
 
         self.split_strategy = split_strategy
         self.agent_classes = agent_classes or {}
@@ -371,7 +373,9 @@ class MFeatDataModule(l.LightningDataModule):
         zip_path = dest / 'mfeat.zip'
 
         print('[prepare_data] Downloading mfeat.zip …')
-        gdown.download(id=self.gdrive_file_id, output=str(zip_path), quiet=False)
+        gdown.download(
+            id=self.gdrive_file_id, output=str(zip_path), quiet=False
+        )
 
         if not zip_path.exists():
             raise RuntimeError(f'Download failed, zip not found at {zip_path}')
@@ -391,7 +395,6 @@ class MFeatDataModule(l.LightningDataModule):
         if not top_level:
             import shutil
 
-            src_dir = data_files[0].parent
             for f in data_files:
                 shutil.copy2(f, dest / f.name)
 
@@ -463,7 +466,7 @@ class MFeatDataModule(l.LightningDataModule):
         train_idx = split_indices['train']
         perm = torch.randperm(len(train_idx), generator=gen).tolist()
         chunks = [
-            [train_idx[j] for j in perm[k::self.n_agents]]
+            [train_idx[j] for j in perm[k :: self.n_agents]]
             for k in range(self.n_agents)
         ]
 
@@ -483,7 +486,9 @@ class MFeatDataModule(l.LightningDataModule):
                 arr, labels, split_indices['test'], normalize=norm
             )
 
-    def _split_class_partition(self, split_indices: dict[str, list[int]]) -> None:
+    def _split_class_partition(
+        self, split_indices: dict[str, list[int]]
+    ) -> None:
         if not self.agent_classes:
             raise ValueError(
                 "split_strategy='class_partition' requires agent_classes or "
@@ -563,7 +568,9 @@ class MFeatDataModule(l.LightningDataModule):
                     arr, self._labels, agent_idx, normalize=norm_cache[i]
                 )
 
-    def _split_random_subset(self, split_indices: dict[str, list[int]]) -> None:
+    def _split_random_subset(
+        self, split_indices: dict[str, list[int]]
+    ) -> None:
         """Each agent draws an independent random subset of training samples.
 
         Subsets can overlap across agents.  Val and test indices are shared
@@ -610,7 +617,9 @@ class MFeatDataModule(l.LightningDataModule):
         }
 
         # Verify all arrays have the same number of rows
-        n_rows = {mod: arr.shape[0] for mod, arr in self._modality_arrays.items()}
+        n_rows = {
+            mod: arr.shape[0] for mod, arr in self._modality_arrays.items()
+        }
         if len(set(n_rows.values())) > 1:
             raise RuntimeError(
                 f'Inconsistent sample counts across modalities: {n_rows}'

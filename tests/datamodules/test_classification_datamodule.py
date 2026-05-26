@@ -120,9 +120,10 @@ class TestClassificationDataModule:
                     int(round(base_train_sizes[client_idx] * 0.8)),
                 )
             else:
-                assert starved_train_sizes[client_idx] == base_train_sizes[
-                    client_idx
-                ]
+                assert (
+                    starved_train_sizes[client_idx]
+                    == base_train_sizes[client_idx]
+                )
 
     def test_non_iid_with_margin_uses_exact_k_classes_and_train_margin(self):
         mock_dataset = _build_mock_dataset(num_samples=2000)
@@ -159,10 +160,9 @@ class TestClassificationDataModule:
             ):
                 split_labels = split_datasets[client_idx].dataset['label']
             for class_label in dm.agent_classes[client_idx]:
-                    assert (
-                        _count_label_occurrences(split_labels, class_label)
-                        >= 10
-                    )
+                assert (
+                    _count_label_occurrences(split_labels, class_label) >= 10
+                )
 
     def test_shared_global_pilots_expose_per_agent_views_with_shared_ids(self):
         mock_dataset = _build_mock_dataset(num_samples=200)
@@ -192,6 +192,8 @@ class TestClassificationDataModule:
         dm._add_pilot_loaders(loaders, target_num_batches=1)
 
         assert set(loaders) == {'global_pilot_0', 'global_pilot_1'}
-        assert dm.pilot_datasets[0].sample_ids == dm.pilot_datasets[1].sample_ids
+        assert (
+            dm.pilot_datasets[0].sample_ids == dm.pilot_datasets[1].sample_ids
+        )
         assert dm.pilot_datasets[0].rotation_angle == 0
         assert dm.pilot_datasets[1].rotation_angle == 90
