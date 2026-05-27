@@ -9,6 +9,7 @@ encoder_hidden_dims: []
 decoder_hidden_dims: [256]
 
 dropout: 0.1
+weight_decay: 0.0
 l1_reg: 0.0
 
 activation:

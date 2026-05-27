@@ -37,6 +37,8 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
 
@@ -53,6 +55,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -65,6 +68,7 @@ class MHealthAccelerometerClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
         )
@@ -90,6 +94,8 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
     Notes
@@ -105,6 +111,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -117,6 +124,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
         )
@@ -142,6 +150,8 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
 
@@ -158,6 +168,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -170,6 +181,7 @@ class MHealthMagnetometerClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
         )
@@ -195,6 +207,8 @@ class MHealthECGClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
 
@@ -211,6 +225,7 @@ class MHealthECGClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -223,6 +238,7 @@ class MHealthECGClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
         )

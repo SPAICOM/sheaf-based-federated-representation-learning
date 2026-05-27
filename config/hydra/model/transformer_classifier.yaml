@@ -1,0 +1,24 @@
+_target_: src.agents.TransformerClassifier
+
+in_features: null
+num_classes: null
+img_size: null        # must be set per-dataset (e.g. 32 for CIFAR-10, 28 for MNIST)
+
+# Encoder (ViTEncoder)
+patch_size: 4
+embed_dim: 128
+depth: 4
+num_heads: 4
+mlp_ratio: 4.0
+
+# Decoder (MLP head)
+decoder_hidden_dims: [256]
+
+dropout: 0.1
+weight_decay: 0.0
+l1_reg: 0.0
+
+activation:
+  _target_: torch.nn.ReLU
+
+use_batchnorm: false  # transformers use LayerNorm internally; BN in decoder rarely helps

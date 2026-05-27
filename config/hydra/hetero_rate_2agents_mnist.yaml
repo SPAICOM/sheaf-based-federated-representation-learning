@@ -1,0 +1,87 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 2 agents"
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.15
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sheaf-repr-learning__hetero-rate-2agents-mnist
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.8
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.05
+  pilot_batch_size: 64
+  comm_data: global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [0, 1, 2, 3, 4, 5]
+    1:
+      agents: [1]
+      target_classes: [2, 3, 4, 5, 6, 7]
+
+model:
+  agents:
+    0:
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
+    1:
+      encoder_hidden_dims: [32, 128]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
+
+orchestrator:
+  # sheaf_frl defaults (active when orchestrator=sheaf_frl)
+  lambda_sheaf: 0.05
+  parseval_normalization: false
+  l2_normalization: false
+  filter_unseen_classes: true
+  use_prototypes: true
+  log_latent_diagnostics: True
+  # sheaf_fmtl defaults (active when orchestrator=sheaf_fmtl)
+  gamma: 0.001
+  lambda_reg: 0.001
+  eta: 0.01
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

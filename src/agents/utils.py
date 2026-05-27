@@ -318,6 +318,122 @@ class MLP(nn.Module):
         return self.network(x)
 
 
+class ViTEncoder(nn.Module):
+    """Vision Transformer encoder: patch embedding + stacked attention blocks.
+
+    Splits the input image into non-overlapping square patches, projects each
+    patch to ``embed_dim`` tokens via a strided Conv2d, prepends a learnable
+    [CLS] token, adds learnable positional embeddings, then passes through
+    ``depth`` pre-LN TransformerEncoderLayer blocks. The [CLS] token vector
+    is returned as the image representation (shape ``(B, embed_dim)``).
+
+    Because the output is already 2-D, PersonalizedClassifier skips its
+    internal AdaptiveAvgPool2d step, matching the flat-encoder convention
+    used by LatentClassifier.
+
+    Parameters
+    ----------
+    in_features : int
+        Number of input channels (e.g., 3 for RGB, 1 for grayscale).
+    img_size : int
+        Spatial side length of the input image (assumed square). Must be
+        evenly divisible by ``patch_size``.
+    patch_size : int, optional
+        Side length of each square patch (default: 4).
+    embed_dim : int, optional
+        Token embedding dimension and transformer hidden size (default: 128).
+    depth : int, optional
+        Number of stacked TransformerEncoderLayer blocks (default: 4).
+    num_heads : int, optional
+        Number of self-attention heads (default: 4).
+    mlp_ratio : float, optional
+        Ratio of the FFN hidden dimension to ``embed_dim`` (default: 4.0).
+    dropout : float, optional
+        Dropout probability in attention and FFN sub-layers (default: 0.0).
+
+    Attributes
+    ----------
+    out_features : int
+        Dimensionality of the returned embedding vector (= ``embed_dim``).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        img_size: int,
+        patch_size: int = 4,
+        embed_dim: int = 128,
+        depth: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        if img_size % patch_size != 0:
+            raise ValueError(
+                f'img_size ({img_size}) must be divisible by patch_size ({patch_size})'
+            )
+
+        num_patches = (img_size // patch_size) ** 2
+
+        # Patch embedding via strided convolution: each patch → embed_dim token
+        self._patch_embed = nn.Conv2d(
+            in_features, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
+
+        # Learnable [CLS] token and positional embeddings
+        self._cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self._pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+
+        # Pre-LN transformer blocks (more stable training than post-LN)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self._transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=depth, enable_nested_tensor=False
+        )
+        self._norm = nn.LayerNorm(embed_dim)
+
+        self.out_features: int = embed_dim
+
+        nn.init.trunc_normal_(self._pos_embed, std=0.02)
+        nn.init.trunc_normal_(self._cls_token, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode image batch and return [CLS] token embeddings.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Image batch of shape ``(B, C, H, W)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(B, embed_dim)`` — flat, no spatial dimensions.
+        """
+        B = x.shape[0]
+
+        # (B, C, H, W) → (B, embed_dim, H/P, W/P) → (B, N, embed_dim)
+        tokens = self._patch_embed(x).flatten(2).transpose(1, 2)
+
+        cls_tokens = self._cls_token.expand(B, -1, -1)
+        tokens = torch.cat([cls_tokens, tokens], dim=1)
+        tokens = tokens + self._pos_embed
+
+        tokens = self._transformer(tokens)
+        tokens = self._norm(tokens)
+
+        return tokens[:, 0]  # CLS token → (B, embed_dim)
+
+
 # --------------------------------------------
 # ----------- MODULES FOR HETEROFL -----------
 # --------------------------------------------

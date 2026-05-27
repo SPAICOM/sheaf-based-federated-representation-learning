@@ -869,3 +869,63 @@ class ClassificationDataModule(l.LightningDataModule):
 
     def test_dataloader(self) -> CombinedLoader:
         return self._create_loaders('test')
+
+    def input_effective_rank(
+        self, agent_idx: int, split: str = 'train'
+    ) -> float:
+        """Roy-Vetterli effective rank of the raw input space for one agent.
+
+        Each image is flattened to a vector (C·H·W), all samples are stacked
+        into a matrix X of shape (N, D), and the effective rank is computed as
+        exp(H(p)) where p are the normalised singular values of X.
+
+        Results are cached so repeated calls across epochs are free.
+
+        Parameters
+        ----------
+        agent_idx : int
+            Agent index whose dataset to use.
+        split : str
+            One of ``'train'``, ``'val'``, ``'test'``.
+
+        Returns
+        -------
+        float
+            Effective rank in [1, D].
+        """
+        cache_key = (agent_idx, split)
+        if not hasattr(self, '_input_er_cache'):
+            self._input_er_cache: dict = {}
+        if cache_key in self._input_er_cache:
+            return self._input_er_cache[cache_key]
+
+        split_map = {
+            'train': self.train_datasets,
+            'val': self.val_datasets,
+            'test': self.test_datasets,
+        }
+        ds = split_map.get(split, {}).get(agent_idx)
+        if ds is None or len(ds) == 0:
+            return float('nan')
+
+        chunks: list[torch.Tensor] = []
+        for i in range(len(ds)):
+            item = ds[i]
+            x = item[0]
+            if isinstance(x, Image.Image):
+                x = transforms.ToTensor()(x)
+            chunks.append(x.float().flatten())
+
+        X = torch.stack(chunks, dim=0)  # (N, C*H*W)
+        print(f'{X.shape=}')
+
+        s = torch.linalg.svdvals(X)
+        s = s[s > 1e-10]
+        if s.numel() < 1:
+            er = 1.0
+        else:
+            p = s / s.sum()
+            er = float(torch.exp(-(p * p.log()).sum()).item())
+
+        self._input_er_cache[cache_key] = er
+        return er

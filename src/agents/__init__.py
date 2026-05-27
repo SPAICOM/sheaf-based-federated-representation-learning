@@ -4,6 +4,8 @@ Federated learning agent implementations.
 This package provides agent classes for federated learning scenarios:
 - BaseAgent: Abstract base class defining the agent interface
 - LatentClassifier: MLP-based classifier with encoder-decoder structure
+- CNNClassifier: CNN-based image classifier
+- TransformerClassifier: Vision Transformer image classifier (ViT-style)
 - TimmClassifier: Vision transformer/CNN classifier using timm library
 - DeepSenseRGBClassifier: RGB camera classifier for the DeepSense dataset
 - DeepSenseLiDARClassifier: LiDAR classifier for the DeepSense dataset
@@ -48,7 +50,8 @@ from .mhealth_encoders import (
 )
 from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
-from .utils import CNN, MLP, BaseEncoder, HeteroCNN, HeteroMLP, TimmEncoder
+from .transformer_classifier import TransformerClassifier
+from .utils import CNN, MLP, BaseEncoder, HeteroCNN, HeteroMLP, TimmEncoder, ViTEncoder
 
 __all__ = [
     'BaseAgent',
@@ -80,4 +83,6 @@ __all__ = [
     'PersonalizedClassifier',
     'TimmClassifier',
     'TimmEncoder',
+    'TransformerClassifier',
+    'ViTEncoder',
 ]

@@ -38,6 +38,7 @@ class FMTLCNNClassifier(PersonalizedClassifier):
         self,
         in_features: int = 3,  # Kept for compatibility, but hardcoded to 3 inside encoder
         num_classes: int = 10,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         **kwargs,
     ):
@@ -52,5 +53,6 @@ class FMTLCNNClassifier(PersonalizedClassifier):
             decoder_hidden_dims=[],
             dropout=0.0,
             use_batchnorm=False,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
         )

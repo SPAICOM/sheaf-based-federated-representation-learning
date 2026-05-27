@@ -3,4 +3,5 @@ encoder_hidden_dims: [32, 64, 128]
 decoder_hidden_dims: [256]
 rate: 1.0
 dropout: 0.1
+weight_decay: 0.0
 use_batchnorm: true

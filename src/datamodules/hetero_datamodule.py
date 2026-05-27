@@ -255,30 +255,25 @@ class HeteroClassificationDataModule(ClassificationDataModule):
 
         label_key = self.attributes[0]
 
+        pilot_split_indices = compute_split_indices(
+            total_size=len(all_data),
+            val_split=0.0,
+            test_split=0.0,
+            seed=self.seed,
+            pilot_split=self.pilot_split,
+            pilot_num_samples=self.pilot_num_samples,
+        )
+        pilot_indices = pilot_split_indices['pilot']
+        remaining_data = all_data.select(pilot_split_indices['train'])
+
         pilot_data = None
-        pilot_indices: list[int] = []
-
-        if self.pilot_split > 0 or self.pilot_num_samples:
-            pilot_split_indices = compute_split_indices(
-                total_size=len(all_data),
-                val_split=0.0,
-                test_split=0.0,
-                seed=self.seed,
-                pilot_split=self.pilot_split,
-                pilot_num_samples=self.pilot_num_samples,
-            )
-            pilot_indices = pilot_split_indices['pilot']
+        if pilot_indices:
             pilot_data = all_data.select(pilot_indices)
-            remaining_data = all_data.select(pilot_split_indices['train'])
-
-            if pilot_indices:
-                self._build_pilot_datasets(
-                    pilot_data=pilot_data,
-                    pilot_indices=pilot_indices,
-                    label_key=label_key,
-                )
-        else:
-            remaining_data = all_data
+            self._build_pilot_datasets(
+                pilot_data=pilot_data,
+                pilot_indices=pilot_indices,
+                label_key=label_key,
+            )
 
         client_indices, sampled_agent_classes = self._partition_client_indices(
             labels=remaining_data[label_key]

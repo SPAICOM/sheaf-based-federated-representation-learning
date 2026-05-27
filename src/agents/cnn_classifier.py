@@ -33,6 +33,8 @@ class CNNClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use batch normalisation (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
     """
@@ -46,6 +48,7 @@ class CNNClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
     ):
         if encoder_hidden_dims is None:
@@ -67,5 +70,6 @@ class CNNClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
         )

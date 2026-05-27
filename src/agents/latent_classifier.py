@@ -31,6 +31,8 @@ class LatentClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     """
 
     def __init__(
@@ -43,6 +45,7 @@ class LatentClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
     ):
         encoder = MLP(
@@ -62,5 +65,6 @@ class LatentClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
         )

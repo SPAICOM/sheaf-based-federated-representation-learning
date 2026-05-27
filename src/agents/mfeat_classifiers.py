@@ -34,6 +34,8 @@ class MFeatMLPClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0).
     sparsity_type : str, optional
@@ -51,6 +53,7 @@ class MFeatMLPClassifier(PersonalizedClassifier):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -68,6 +71,7 @@ class MFeatMLPClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
         )

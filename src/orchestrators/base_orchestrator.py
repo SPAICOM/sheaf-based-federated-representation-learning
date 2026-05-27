@@ -14,6 +14,8 @@ import lightning as l
 import torch
 import torch.nn as nn
 from hydra.utils import instantiate
+from PIL import Image as _PILImage
+from torchvision.transforms.functional import to_tensor as _pil_to_tensor
 
 from src.utils import calculate_communication_cost
 
@@ -113,12 +115,6 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def _reset_global_pilot_buffer(self) -> None:
         self._global_pilot_buffer = {}
 
-    def _record_val_latent(self, idx: int, latent: torch.Tensor) -> None:
-        """Append one batch of latents for agent ``idx`` to the validation buffer."""
-        if idx not in self._latent_buffer:
-            self._latent_buffer[idx] = []
-        self._latent_buffer[idx].append(latent.detach().cpu())
-
     @staticmethod
     def _latent_sparsity(Z: torch.Tensor, epsilon: float) -> float:
         """Mean number of entries with |z| > epsilon per sample."""
@@ -139,42 +135,76 @@ class BaseOrchestrator(l.LightningModule, ABC):
         except RuntimeError:
             return float('nan')
 
-    def _collect_val_latents(
-        self,
-        batch: dict | tuple,
-    ) -> None:
-        """Encode validation batch through each agent and buffer the latents."""
-        if isinstance(batch, tuple):
-            batch = batch[0]
+    def _collect_all_val_latents(self) -> None:
+        """Encode the full validation dataset through every agent.
+
+        Called once at validation epoch end. Accesses each agent's validation
+        dataset directly from the datamodule so sparsity and effective rank are
+        computed on the complete representation space, not on per-batch chunks.
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        val_datasets = getattr(dm, 'val_datasets', None)
+        if not val_datasets:
+            return
+
+        def _collate(batch):
+            xs = []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+            return torch.stack(xs)
+
+        self._reset_latent_buffer()
+
         for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
             idx = int(idx_str)
-            key = idx if idx in batch else idx_str
-            if key not in batch:
+            val_ds = val_datasets.get(idx)
+            if val_ds is None or len(val_ds) == 0:
                 continue
-            values = batch[key]
-            if not isinstance(values, (list, tuple)) or not values:
-                continue
-            x = values[0]
-            if not isinstance(x, torch.Tensor) or x.ndim == 0:
-                continue
-            if hasattr(agent, 'encode'):
-                latent = agent.encode(x)
-                self._record_val_latent(idx, latent)
+            loader = torch.utils.data.DataLoader(
+                val_ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate,
+            )
+            chunks = []
+            with torch.no_grad():
+                for x in loader:
+                    x = x.to(self.device)
+                    latent = agent.encode(x)
+                    chunks.append(latent.detach().cpu())
+            self._latent_buffer[idx] = chunks
 
     def _log_latent_diagnostics(self) -> None:
-        """Compute and log per-agent sparsity and effective rank over buffered latents."""
+        """Compute and log sparsity and effective rank on the full validation latent space."""
         if not self._latent_buffer:
             return
         epsilon = float(getattr(self.hparams, 'sparse_epsilon', 1e-2))
-        logs: dict[str, float] = {}
-        for idx, chunks in self._latent_buffer.items():
-            Z = torch.cat(chunks, dim=0)
-            logs[f'validation/latent_sparsity_agent_{idx}'] = (
-                self._latent_sparsity(Z, epsilon)
+        agent_matrices = {
+            idx: torch.cat(chunks, dim=0)
+            for idx, chunks in self._latent_buffer.items()
+        }
+        logs = {
+            f'validation/latent_sparsity_agent_{idx}': self._latent_sparsity(
+                Z, epsilon
             )
-            logs[f'validation/latent_effective_rank_agent_{idx}'] = (
-                self._effective_rank(Z)
-            )
+            for idx, Z in agent_matrices.items()
+        }
+        logs.update(
+            {
+                f'validation/latent_effective_rank_agent_{idx}': self._effective_rank(
+                    Z
+                )
+                for idx, Z in agent_matrices.items()
+            }
+        )
         self.log_dict(
             logs,
             on_step=False,
@@ -184,41 +214,82 @@ class BaseOrchestrator(l.LightningModule, ABC):
         )
         self._reset_latent_buffer()
 
-    def _collect_global_pilot_latents(self, batch: dict) -> None:
-        """Encode the global_pilot batch through every agent and buffer latents."""
-        if isinstance(batch, tuple):
-            batch = batch[0]
-        if 'global_pilot' not in batch:
+    def _collect_all_global_pilot_latents(self) -> None:
+        """Encode the full unique pilot dataset through every agent.
+
+        Called once at validation epoch end.  Accesses the datamodule directly
+        so each pilot sample is encoded exactly once, regardless of how many
+        times it appears in the per-batch combined loader.
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
             return
-        pilot_data = batch['global_pilot']
-        if not isinstance(pilot_data, (list, tuple)) or not pilot_data:
+        pilot_datasets = getattr(dm, 'pilot_datasets', None)
+        if not pilot_datasets:
             return
-        x = pilot_data[0]
-        if not isinstance(x, torch.Tensor) or x.ndim == 0:
+        pilot_ds = pilot_datasets.get(0)
+        if pilot_ds is None or len(pilot_ds) == 0:
             return
+
+        from PIL import Image as _PILImage
+        from torchvision.transforms.functional import (
+            to_tensor as _pil_to_tensor,
+        )
+
+        def _collate(batch):
+            xs = []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+            return torch.stack(xs)
+
+        loader = torch.utils.data.DataLoader(
+            pilot_ds,
+            batch_size=256,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=_collate,
+        )
+
+        self._reset_global_pilot_buffer()
+
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
             idx = int(idx_str)
-            latent = agent.encode(x)
-            if idx not in self._global_pilot_buffer:
-                self._global_pilot_buffer[idx] = []
-            self._global_pilot_buffer[idx].append(latent.detach().cpu())
+            chunks = []
+            with torch.no_grad():
+                for x in loader:
+                    x = x.to(self.device)
+                    latent = agent.encode(x)
+                    chunks.append(latent.detach().cpu())
+            self._global_pilot_buffer[idx] = chunks
 
     def _log_global_pilot_diagnostics(self) -> None:
-        """Compute and log sparsity and effective rank of global-pilot latents."""
+        """Compute and log sparsity and effective rank on the full global-pilot latent space."""
         if not self._global_pilot_buffer:
             return
         epsilon = float(getattr(self.hparams, 'sparse_epsilon', 1e-2))
-        logs: dict[str, float] = {}
-        for idx, chunks in self._global_pilot_buffer.items():
-            Z = torch.cat(chunks, dim=0)
-            logs[f'validation/global_pilot_sparsity_agent_{idx}'] = (
-                self._latent_sparsity(Z, epsilon)
+        agent_matrices = {
+            idx: torch.cat(chunks, dim=0)
+            for idx, chunks in self._global_pilot_buffer.items()
+        }
+        logs = {
+            f'validation/global_pilot_sparsity_agent_{idx}': self._latent_sparsity(
+                Z, epsilon
             )
-            logs[f'validation/global_pilot_effective_rank_agent_{idx}'] = (
-                self._effective_rank(Z)
-            )
+            for idx, Z in agent_matrices.items()
+        }
+        logs.update(
+            {
+                f'validation/global_pilot_effective_rank_agent_{idx}': self._effective_rank(
+                    Z
+                )
+                for idx, Z in agent_matrices.items()
+            }
+        )
         self.log_dict(
             logs,
             on_step=False,
@@ -414,7 +485,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     source_prefix='train',
                 )
         if getattr(self.hparams, 'log_latent_diagnostics', False):
+            self._collect_all_val_latents()
             self._log_latent_diagnostics()
+            self._collect_all_global_pilot_latents()
             self._log_global_pilot_diagnostics()
 
     def on_test_epoch_end(self) -> None:
@@ -747,11 +820,6 @@ class BaseOrchestrator(l.LightningModule, ABC):
             batch_idx=batch_idx,
             prefix=prefix,
         )
-        if prefix == 'validation' and getattr(
-            self.hparams, 'log_latent_diagnostics', False
-        ):
-            self._collect_val_latents(batch)
-            self._collect_global_pilot_latents(batch)
         return output
 
     def predict_step(

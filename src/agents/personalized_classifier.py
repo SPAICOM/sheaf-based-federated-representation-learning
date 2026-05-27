@@ -43,6 +43,9 @@ class PersonalizedClassifier(BaseAgent):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use BatchNorm1d in the decoder (default: False).
+    weight_decay : float, optional
+        L2 regularization strength applied to all model parameters in the
+        loss (default: 0.0).
     l1_reg : float, optional
         Regularization strength (default: 0.0).
     sparsity_type : str, optional
@@ -66,6 +69,7 @@ class PersonalizedClassifier(BaseAgent):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
     ):
@@ -99,6 +103,7 @@ class PersonalizedClassifier(BaseAgent):
         )
 
         self.accuracy = MulticlassAccuracy(num_classes=num_classes)
+        self.weight_decay = weight_decay
         self.l1_reg = l1_reg
         self.sparsity_type = sparsity_type
 
@@ -137,12 +142,21 @@ class PersonalizedClassifier(BaseAgent):
         """Forward pass: encode then decode to class logits."""
         return self._decoder(self.encode(x))
 
+    def weight_decay_penalty(self) -> torch.Tensor:
+        """Return the L2 weight decay penalty over all model parameters."""
+        if self.weight_decay <= 0.0:
+            param = next(self.parameters(), None)
+            return torch.tensor(0.0) if param is None else param.new_zeros(())
+        return self.weight_decay * sum(
+            p.pow(2).sum() for p in self.parameters() if p.requires_grad
+        )
+
     def compute_loss(
         self, y_hat: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
-        """Compute cross-entropy loss plus optional latent sparsity penalty."""
+        """Compute cross-entropy loss plus optional sparsity and weight decay penalties."""
         loss = F.cross_entropy(y_hat, y.long())
-        return loss + self.latent_sparsity_penalty()
+        return loss + self.latent_sparsity_penalty() + self.weight_decay_penalty()
 
     def latent_sparsity_penalty(
         self, latents: torch.Tensor | None = None

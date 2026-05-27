@@ -8,5 +8,6 @@ dropout: 0.1
 use_batchnorm: true
 
 # Latent regularization (PersonalizedClassifier)
+weight_decay: 0.0
 l1_reg: 0.0
 sparsity_type: l1            # l1 | sae-l1 | l21

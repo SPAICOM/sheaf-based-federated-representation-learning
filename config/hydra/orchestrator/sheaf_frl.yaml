@@ -5,9 +5,9 @@ lambda_schedule: cosine
 anchor_strategy: pilots
 parseval_normalization: False
 l2_normalization: False
-sparse_communication: True
+sparse_communication: False
 sparse_epsilon: 1e-2
-log_latent_diagnostics: False
+log_latent_diagnostics: True
 parseval_eps: 0.01
 num_anchors: 32
 #epoch_reencode_batch_size: 256
