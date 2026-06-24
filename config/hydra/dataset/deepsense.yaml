@@ -18,4 +18,4 @@ pilot_split: 0.1
 pilot_num_samples: null
 comm_data: shared_global_pilots
 starve_clients: false
-seed: 42
+seed: ${seed}

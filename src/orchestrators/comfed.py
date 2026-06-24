@@ -61,7 +61,10 @@ class ComFed(BaseOrchestrator):
         **kwargs,
     ):
         super().__init__(
-            agents=agents, neighbors=neighbors, optimizer=optimizer
+            agents=agents,
+            neighbors=neighbors,
+            optimizer=optimizer,
+            **kwargs,
         )
         self.save_hyperparameters()
         self.automatic_optimization = False
@@ -207,6 +210,9 @@ class ComFed(BaseOrchestrator):
             proj_opt.zero_grad()
             proj_loss = self._proj_loss(batch)
             self.manual_backward(proj_loss)
+            torch.nn.utils.clip_grad_norm_(
+                self.projection_matrices.parameters(), max_norm=1.0
+            )
             proj_opt.step()
 
         self.log(
@@ -287,9 +293,79 @@ class ComFed(BaseOrchestrator):
             extra_metrics={f'{prefix}/alignment_loss': alignment_loss},
             prog_bar=False,
             per_agent_loss_name='task_loss',
+            skip_task_performance=(prefix == 'test'),
         )
 
         return outputs, total_loss
+
+
+    # ── Communication accuracy evaluation ─────────────────────────────────────
+
+    @torch.no_grad()
+    def send_message(
+        self,
+        sender_idx: int,
+        receiver_idx: int,
+        Z_sender: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform sender's test latents into the receiver's latent space.
+
+        Each agent owns a single projection ``P_k ∈ R^{proj_dim × d_k}`` that
+        maps its local features to the shared d-dimensional consensus space.
+        We use it both ways:
+
+        1. Sender projects to the shared space:
+           ``Z_shared = Z_sender @ P_sender.T``  (shape ``n × proj_dim``).
+        2. Receiver applies the (Moore–Penrose) pseudo-inverse of its own
+           projection to recover representations in its local space:
+           ``Z_receiver = Z_shared @ pinv(P_receiver).T``  (shape ``n × d_receiver``).
+
+        Equivalently, ``Z_receiver = Z_sender @ P_sender.T @ pinv(P_receiver).T``,
+        i.e. composition with ``pinv(P_receiver) @ P_sender`` acting on column
+        vectors.
+
+        Parameters
+        ----------
+        sender_idx : int
+        receiver_idx : int
+        Z_sender : torch.Tensor
+            Raw test latents of the sender, shape ``(n, d_sender)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed representations in the receiver's latent space,
+            shape ``(n, d_receiver)``, on the same device as ``Z_sender``.
+        """
+        dev = Z_sender.device
+        P_sender = self.projection_matrices[str(sender_idx)].to(dev).float()
+        P_receiver = self.projection_matrices[str(receiver_idx)].to(dev).float()
+
+        Z_shared = Z_sender.float() @ P_sender.T
+
+        if not torch.isfinite(P_receiver).all():
+            # Projection matrix diverged during training; return zeros so
+            # comm-accuracy evaluation degrades gracefully instead of crashing.
+            d_receiver = P_receiver.shape[1]
+            return torch.zeros(Z_sender.shape[0], d_receiver, device=dev)
+
+        P_receiver_pinv = torch.linalg.pinv(P_receiver)
+        return (Z_shared @ P_receiver_pinv.T).to(dev)
+
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

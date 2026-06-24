@@ -37,10 +37,14 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    PostTrainingAlignmentMixin,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class SheafFMTL(BaseOrchestrator):
+class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
     """
     Sheaf-FMTL Orchestrator.
 
@@ -71,12 +75,21 @@ class SheafFMTL(BaseOrchestrator):
         max_lmb: float = 0.001,
         eta: float = 0.01,
         lambda_schedule: str | None = None,
+        alignment_method: str = 'general',
         **kwargs,
     ):
+        alignment_method = str(alignment_method)
+        if alignment_method not in VALID_ALIGNMENT_METHODS:
+            raise ValueError(
+                f"Unknown alignment_method '{alignment_method}'. "
+                f'Valid options: {VALID_ALIGNMENT_METHODS}'
+            )
+
         super().__init__(
             agents=agents,
             neighbors=neighbors,
             optimizer=optimizer,
+            **kwargs,
         )
         self.save_hyperparameters(ignore=['agents'])
 
@@ -348,9 +361,37 @@ class SheafFMTL(BaseOrchestrator):
             agent_performances=agent_performances,
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
+            skip_task_performance=(prefix == 'test'),
         )
 
         return outputs, total_loss
+
+
+    # send_message, _fit_alignment_maps, _cleanup_alignment inherited from
+    # PostTrainingAlignmentMixin: post-hoc whitening + alignment pipeline.
+
+    def on_validation_epoch_end(self) -> None:
+        # The projected-vector exchanges happen in on_train_epoch_end, which
+        # fires right before validation. Pair validation with the cumulative
+        # train comm budget so accuracy-vs-budget plots aren't stuck on a zero
+        # x-axis.
+        super().on_validation_epoch_end()
+        self._finalize_paired_communication('validation', source_prefix='train')
+
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

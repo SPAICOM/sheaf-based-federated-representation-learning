@@ -8,11 +8,16 @@ predefined communication graph.
 
 import torch
 import torch.nn as nn
+import torch.utils.data
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    PostTrainingAlignmentMixin,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class FederatedLearning(BaseOrchestrator):
+class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
     """Federated learning orchestrator with neighbor-restricted averaging.
 
     Implements a localized variant of Federated Averaging where each agent
@@ -54,13 +59,24 @@ class FederatedLearning(BaseOrchestrator):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
+        alignment_method: str | None = None,
+        **kwargs,
     ):
+        if alignment_method is not None:
+            alignment_method = str(alignment_method)
+            if alignment_method not in VALID_ALIGNMENT_METHODS:
+                raise ValueError(
+                    f"Unknown alignment_method '{alignment_method}'. "
+                    f'Valid options: {VALID_ALIGNMENT_METHODS}'
+                )
+
         super().__init__(
             agents=agents,
             neighbors=neighbors,
             optimizer=optimizer,
+            **kwargs,
         )
-
+        self.save_hyperparameters(ignore=['agents'])
         self._validate_agents_for_fedavg()
 
     def _validate_agents_for_fedavg(self):
@@ -224,9 +240,31 @@ class FederatedLearning(BaseOrchestrator):
             agent_performances=agent_performances,
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
+            skip_task_performance=(prefix == 'test'),
         )
 
         return outputs, total_loss
+
+    # send_message and evaluate_communication_accuracy are inherited from
+    # PostTrainingAlignmentMixin.  When alignment_method is None (default),
+    # send_message acts as identity (no maps fitted) and evaluation delegates
+    # directly to the base class.  When alignment_method is set, post-hoc
+    # whitening + alignment maps are fitted before evaluation.
+
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

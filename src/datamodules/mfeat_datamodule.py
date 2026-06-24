@@ -340,6 +340,11 @@ class MFeatDataModule(l.LightningDataModule):
         self.pilot_batch_size = (
             batch_size if pilot_batch_size is None else pilot_batch_size
         )
+        _valid = ('private_pilots', 'shared_global_pilots', 'pairwise_pilots')
+        if comm_data not in _valid:
+            raise ValueError(
+                f"Unknown comm_data '{comm_data}'. Valid options: {_valid}"
+            )
         self.comm_data = comm_data
         self.seed = seed
 

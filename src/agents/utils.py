@@ -350,6 +350,10 @@ class ViTEncoder(nn.Module):
         Ratio of the FFN hidden dimension to ``embed_dim`` (default: 4.0).
     dropout : float, optional
         Dropout probability in attention and FFN sub-layers (default: 0.0).
+    pool : str, optional
+        Pooling strategy for the final representation. ``'cls'`` returns the
+        [CLS] token; ``'mean'`` averages all patch tokens (more robust with
+        SGD and smaller datasets). Default: ``'cls'``.
 
     Attributes
     ----------
@@ -367,6 +371,7 @@ class ViTEncoder(nn.Module):
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        pool: str = 'cls',
     ):
         super().__init__()
 
@@ -374,17 +379,22 @@ class ViTEncoder(nn.Module):
             raise ValueError(
                 f'img_size ({img_size}) must be divisible by patch_size ({patch_size})'
             )
+        if pool not in ('cls', 'mean'):
+            raise ValueError(f"pool must be 'cls' or 'mean', got '{pool}'")
 
         num_patches = (img_size // patch_size) ** 2
+        self._pool = pool
 
         # Patch embedding via strided convolution: each patch → embed_dim token
         self._patch_embed = nn.Conv2d(
             in_features, embed_dim, kernel_size=patch_size, stride=patch_size
         )
 
-        # Learnable [CLS] token and positional embeddings
+        # Learnable [CLS] token (used when pool='cls')
         self._cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self._pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        # Positional embeddings: num_patches + 1 (for CLS) when cls, num_patches when mean
+        n_pos = num_patches + 1 if pool == 'cls' else num_patches
+        self._pos_embed = nn.Parameter(torch.zeros(1, n_pos, embed_dim))
 
         # Pre-LN transformer blocks (more stable training than post-LN)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -407,7 +417,7 @@ class ViTEncoder(nn.Module):
         nn.init.trunc_normal_(self._cls_token, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode image batch and return [CLS] token embeddings.
+        """Encode image batch and return a flat embedding vector.
 
         Parameters
         ----------
@@ -421,17 +431,209 @@ class ViTEncoder(nn.Module):
         """
         B = x.shape[0]
 
-        # (B, C, H, W) → (B, embed_dim, H/P, W/P) → (B, N, embed_dim)
+        # (B, C, H, W) → (B, N, embed_dim)
         tokens = self._patch_embed(x).flatten(2).transpose(1, 2)
 
-        cls_tokens = self._cls_token.expand(B, -1, -1)
-        tokens = torch.cat([cls_tokens, tokens], dim=1)
-        tokens = tokens + self._pos_embed
+        if self._pool == 'cls':
+            cls_tokens = self._cls_token.expand(B, -1, -1)
+            tokens = torch.cat([cls_tokens, tokens], dim=1)
 
+        tokens = tokens + self._pos_embed
         tokens = self._transformer(tokens)
         tokens = self._norm(tokens)
 
-        return tokens[:, 0]  # CLS token → (B, embed_dim)
+        if self._pool == 'cls':
+            return tokens[:, 0]           # CLS token → (B, embed_dim)
+        return tokens.mean(dim=1)         # mean over patch tokens → (B, embed_dim)
+
+
+# --------------------------------------------
+# ------------ MODULES FOR AUTOENCODERS ------
+# --------------------------------------------
+
+
+class CNNAEEncoder(nn.Module):
+    """Conv encoder for an autoencoder.
+
+    Conv+MaxPool blocks reduce the spatial resolution by 2 per block; the
+    resulting feature map is flattened and projected to a flat bottleneck
+    via a single linear layer. The bottleneck vector is what the sheaf
+    orchestrator aligns across agents and is also the tensor on which
+    optional sparsity penalties are applied.
+
+    Parameters
+    ----------
+    in_features : int
+        Number of input channels (e.g. 1 for MNIST, 3 for CIFAR).
+    img_size : int
+        Spatial side length of the input image (assumed square). Must be
+        divisible by ``2 ** len(hidden_dims)``.
+    hidden_dims : list[int], optional
+        Output channels for each Conv2d block (default: [32, 64]).
+    bottleneck_dim : int, optional
+        Dimensionality of the flat bottleneck latent (default: 64).
+    dropout : float, optional
+        Spatial dropout after each block (default: 0.0).
+    activation : type[nn.Module], optional
+        Activation class (default: nn.ReLU).
+    use_batchnorm : bool, optional
+        Whether to add BatchNorm2d after each Conv2d (default: False).
+
+    Attributes
+    ----------
+    out_features : int
+        Bottleneck dimensionality (= ``bottleneck_dim``).
+    spatial_after : int
+        Side length of the feature map handed to the linear projection.
+    flat_dim : int
+        Flat dim before the linear projection (= last hidden × spatial^2).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        img_size: int,
+        hidden_dims: list[int] | None = None,
+        bottleneck_dim: int = 64,
+        dropout: float = 0.0,
+        activation: type[nn.Module] = nn.ReLU,
+        use_batchnorm: bool = False,
+    ):
+        super().__init__()
+
+        if hidden_dims is None:
+            hidden_dims = [32, 64]
+        n_blocks = len(hidden_dims)
+        if img_size % (2**n_blocks) != 0:
+            raise ValueError(
+                f'img_size ({img_size}) must be divisible by '
+                f'2**{n_blocks} (= {2**n_blocks}) for {n_blocks} conv blocks.'
+            )
+
+        self.in_features = in_features
+        self.img_size = img_size
+        self.hidden_dims = list(hidden_dims)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.spatial_after: int = img_size // (2**n_blocks)
+        self.flat_dim: int = (
+            self.hidden_dims[-1] * self.spatial_after * self.spatial_after
+        )
+
+        layers: list[nn.Module] = []
+        in_ch = in_features
+        for out_ch in hidden_dims:
+            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
+            if use_batchnorm:
+                layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(
+                activation() if isinstance(activation, type) else activation
+            )
+            layers.append(nn.MaxPool2d(2))
+            if dropout > 0:
+                layers.append(nn.Dropout2d(p=dropout))
+            in_ch = out_ch
+
+        self.conv_stack = nn.Sequential(*layers)
+        self.project = nn.Linear(self.flat_dim, self.bottleneck_dim)
+        self.out_features: int = self.bottleneck_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv_stack(x)
+        h = h.flatten(1)
+        return self.project(h)
+
+
+class CNNAEDecoder(nn.Module):
+    """ConvTranspose decoder mirroring :class:`CNNAEEncoder`.
+
+    Linear-expands the bottleneck to a small spatial feature map and then
+    applies a stack of ``ConvTranspose2d(kernel=2, stride=2)`` layers,
+    doubling the spatial resolution at each step until the original
+    ``img_size`` is recovered. The final activation is a sigmoid so the
+    output lies in [0, 1] (matching ``transforms.ToTensor()`` outputs).
+
+    Parameters
+    ----------
+    out_features : int
+        Number of output channels (matches the encoder's input channels).
+    img_size : int
+        Target spatial side length (assumed square).
+    hidden_dims : list[int], optional
+        Same list as the encoder; the decoder iterates over its reverse.
+    bottleneck_dim : int, optional
+        Dimensionality of the input latent (default: 64).
+    activation : type[nn.Module], optional
+        Activation class used between deconv blocks (default: nn.ReLU).
+    use_batchnorm : bool, optional
+        Whether to add BatchNorm2d after each non-final deconv (default: False).
+    output_activation : type[nn.Module] | nn.Module | None, optional
+        Activation applied at the end. ``None`` skips it. Default: ``nn.Sigmoid``.
+    """
+
+    def __init__(
+        self,
+        out_features: int,
+        img_size: int,
+        hidden_dims: list[int] | None = None,
+        bottleneck_dim: int = 64,
+        activation: type[nn.Module] = nn.ReLU,
+        use_batchnorm: bool = False,
+        output_activation: type[nn.Module] | nn.Module | None = nn.Sigmoid,
+    ):
+        super().__init__()
+
+        if hidden_dims is None:
+            hidden_dims = [32, 64]
+        n_blocks = len(hidden_dims)
+        if img_size % (2**n_blocks) != 0:
+            raise ValueError(
+                f'img_size ({img_size}) must be divisible by '
+                f'2**{n_blocks} (= {2**n_blocks}) for {n_blocks} conv blocks.'
+            )
+
+        self.out_features = out_features
+        self.img_size = img_size
+        self.hidden_dims = list(hidden_dims)
+        self.bottleneck_dim = int(bottleneck_dim)
+        self.spatial_after: int = img_size // (2**n_blocks)
+        self.flat_dim: int = (
+            self.hidden_dims[-1] * self.spatial_after * self.spatial_after
+        )
+
+        self.unproject = nn.Linear(self.bottleneck_dim, self.flat_dim)
+
+        reversed_dims = list(reversed(hidden_dims))
+        layers: list[nn.Module] = []
+        for i in range(n_blocks):
+            in_ch = reversed_dims[i]
+            is_last = i == n_blocks - 1
+            target_ch = out_features if is_last else reversed_dims[i + 1]
+            layers.append(
+                nn.ConvTranspose2d(in_ch, target_ch, kernel_size=2, stride=2)
+            )
+            if not is_last:
+                if use_batchnorm:
+                    layers.append(nn.BatchNorm2d(target_ch))
+                layers.append(
+                    activation()
+                    if isinstance(activation, type)
+                    else activation
+                )
+        if output_activation is not None:
+            layers.append(
+                output_activation()
+                if isinstance(output_activation, type)
+                else output_activation
+            )
+
+        self.deconv_stack = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.unproject(z)
+        h = h.view(
+            -1, self.hidden_dims[-1], self.spatial_after, self.spatial_after
+        )
+        return self.deconv_stack(h)
 
 
 # --------------------------------------------

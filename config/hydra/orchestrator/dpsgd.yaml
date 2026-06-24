@@ -3,3 +3,17 @@ _target_: src.orchestrators.dpsgd.DPSGD
 agents: null
 
 neighbors: {}
+
+# Information-theoretic PID logging (Liang et al. 2023).
+# Implemented in BaseOrchestrator → applies to *every* orchestrator that
+# forwards **kwargs to super().__init__.  Toggle pid_logging to enable.
+pid_logging: False
+pid_methods: ['cvxpy']   # ['cvxpy', 'batch'] or any subset.
+pid_pairs: neighbors     # 'neighbors' (graph edges) or 'all' (full clique).
+pid_num_clusters: 10     # K-Means clusters per view (CVX method).
+pid_max_samples: 4000    # Down-sample the training set for the CVX path.
+pid_discrim_epochs: 40   # Neural-PID discriminator epochs.
+pid_align_epochs: 10     # Neural-PID alignment epochs.
+pid_batch_size: 256      # Neural-PID mini-batch size.
+pid_hidden_dim: 32
+pid_embed_dim: 10

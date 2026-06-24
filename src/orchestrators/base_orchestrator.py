@@ -6,11 +6,14 @@ across multiple agents in a federated learning setting. Subclasses must
 implement epoch-end aggregation logic and evaluation procedures.
 """
 
+import inspect
 import math
+import warnings
 from abc import ABC, abstractmethod
 from typing import Any
 
 import lightning as l
+import numpy as np
 import torch
 import torch.nn as nn
 from hydra.utils import instantiate
@@ -56,9 +59,27 @@ class BaseOrchestrator(l.LightningModule, ABC):
         agents: dict[int, nn.Module],
         neighbors: dict[int, set[int]],
         optimizer,
-        log_latent_diagnostics: bool = False,
+        log_latent_diagnostics: bool = True,
+        pid_logging: bool = False,
+        pid_methods: tuple[str, ...] = ('cvxpy',),
+        pid_pairs: str = 'neighbors',
+        pid_num_clusters: int = 10,
+        pid_max_samples: int | None = 4000,
+        pid_discrim_epochs: int = 40,
+        pid_align_epochs: int = 10,
+        pid_batch_size: int = 256,
+        pid_hidden_dim: int = 32,
+        pid_embed_dim: int = 10,
+        **kwargs: Any,
     ):
         super().__init__()
+        if kwargs:
+            unexpected = sorted(kwargs)
+            warnings.warn(
+                f'BaseOrchestrator received unexpected kwargs: {unexpected}',
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.save_hyperparameters(ignore=['agents', 'cfg'])
 
         assert len(agents) > 0, 'The "agents" dictionary must be not empty'
@@ -135,6 +156,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
         except RuntimeError:
             return float('nan')
 
+    @staticmethod
+    def _isotropy(Z: torch.Tensor) -> float:
+        """Ratio of min to max per-dim variance. 1.0 = perfectly isotropic, ~0 = strongly anisotropic."""
+        if Z.ndim != 2 or Z.shape[0] < 2 or Z.shape[1] < 1:
+            return 0.0
+        v = torch.var(Z.float(), dim=0)
+        v_max = float(v.max().item())
+        return float(v.min().item() / v_max) if v_max > 0 else 0.0
+
     def _collect_all_val_latents(self) -> None:
         """Encode the full validation dataset through every agent.
 
@@ -205,6 +235,12 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 for idx, Z in agent_matrices.items()
             }
         )
+        logs.update(
+            {
+                f'validation/latent_isotropy_agent_{idx}': self._isotropy(Z)
+                for idx, Z in agent_matrices.items()
+            }
+        )
         self.log_dict(
             logs,
             on_step=False,
@@ -268,7 +304,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             self._global_pilot_buffer[idx] = chunks
 
     def _log_global_pilot_diagnostics(self) -> None:
-        """Compute and log sparsity and effective rank on the full global-pilot latent space."""
+        """Compute and log sparsity, effective rank, and isotropy on the full global-pilot latent space."""
         if not self._global_pilot_buffer:
             return
         epsilon = float(getattr(self.hparams, 'sparse_epsilon', 1e-2))
@@ -277,19 +313,17 @@ class BaseOrchestrator(l.LightningModule, ABC):
             for idx, chunks in self._global_pilot_buffer.items()
         }
         logs = {
-            f'validation/global_pilot_sparsity_agent_{idx}': self._latent_sparsity(
-                Z, epsilon
-            )
+            f'validation/global_pilot_sparsity_agent_{idx}': self._latent_sparsity(Z, epsilon)
             for idx, Z in agent_matrices.items()
         }
-        logs.update(
-            {
-                f'validation/global_pilot_effective_rank_agent_{idx}': self._effective_rank(
-                    Z
-                )
-                for idx, Z in agent_matrices.items()
-            }
-        )
+        logs.update({
+            f'validation/global_pilot_effective_rank_agent_{idx}': self._effective_rank(Z)
+            for idx, Z in agent_matrices.items()
+        })
+        logs.update({
+            f'validation/global_pilot_isotropy_agent_{idx}': self._isotropy(Z)
+            for idx, Z in agent_matrices.items()
+        })
         self.log_dict(
             logs,
             on_step=False,
@@ -433,7 +467,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def _finalize_train_epoch_communication(self) -> None:
         """Log cumulative train communication metrics once per epoch."""
         communication_logs = self._communication_metrics('train')
-        if hasattr(self.hparams, 'max_lmb'):
+        if 'max_lmb' in inspect.signature(type(self).__init__).parameters:
             communication_logs['train/lambda_reg'] = (
                 self._effective_lambda_reg()
             )
@@ -478,13 +512,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def on_validation_epoch_end(self) -> None:
         """Log cumulative validation communication metrics."""
         for prefix in sorted(self._validation_prefixes_seen):
-            self._finalize_stage_communication(prefix)
             if prefix == 'test_monitor':
-                self._finalize_paired_communication(
-                    prefix,
-                    source_prefix='train',
-                )
-        if getattr(self.hparams, 'log_latent_diagnostics', False):
+                continue
+            self._finalize_stage_communication(prefix)
+        if getattr(self.hparams, 'log_latent_diagnostics', True):
             self._collect_all_val_latents()
             self._log_latent_diagnostics()
             self._collect_all_global_pilot_latents()
@@ -494,6 +525,171 @@ class BaseOrchestrator(l.LightningModule, ABC):
         """Log cumulative test communication metrics."""
         self._finalize_stage_communication('test')
         self._finalize_paired_communication('test', source_prefix='train')
+
+    @torch.no_grad()
+    def evaluate_communication_accuracy(self, dm) -> dict[str, float]:
+        """Compute cross-agent classification accuracy via the send_message pipeline.
+
+        Generic across orchestrators: relies only on ``self.send_message`` to
+        translate the sender's test latents into the receiver's latent space.
+        Subclasses opt in by overriding ``on_test_epoch_end`` to call this
+        method and log the returned dictionary.
+
+        For each receiver agent j and each neighbour sender i:
+          1. ``self.send_message(i, j, Z_i)`` converts the sender's test
+             latents into the receiver's local space.
+          2. The receiver's decoder classifies the reconstructed
+             representations and accuracy is measured against the sender's
+             ground-truth labels.
+
+        Returns a dict of metric name → value; the caller is responsible for
+        logging so that ``self.log_dict`` runs outside the no-grad context.
+        """
+        test_datasets = getattr(dm, 'test_datasets', None)
+        if not test_datasets:
+            return {}
+
+        def _collate_xy(batch):
+            xs, ys = [], []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+                y = item[1]
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
+            return torch.stack(xs), torch.stack(ys)
+
+        # Encode test latents and collect labels for every agent.
+        test_Z: dict[int, torch.Tensor] = {}
+        test_y: dict[int, torch.Tensor] = {}
+
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode') or not hasattr(agent, 'decoder'):
+                continue
+            idx = int(idx_str)
+            test_ds = test_datasets.get(idx)
+            if test_ds is None or len(test_ds) == 0:
+                continue
+
+            loader = torch.utils.data.DataLoader(
+                test_ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate_xy,
+            )
+            was_training = agent.training
+            agent.eval()
+            Zs, ys = [], []
+            for x_batch, y_batch in loader:
+                z = (
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
+                )
+                Zs.append(z)
+                ys.append(y_batch.cpu())
+            agent.train(was_training)
+
+            if Zs:
+                test_Z[idx] = torch.cat(Zs, dim=0)
+                test_y[idx] = torch.cat(ys, dim=0)
+
+        if not test_Z:
+            return {}
+
+        neighbors_map: dict[int, set[int]] = {
+            int(k): {int(n) for n in v}
+            for k, v in self.hparams.neighbors.items()
+        }
+
+        # Communication accuracy is a classification-only metric: the
+        # receiver's decoder is expected to return logits, so AE agents
+        # (decoder returns an image) are skipped both as receivers and as
+        # self-accuracy targets. They can still act as senders.
+        def _is_classifier(agent) -> bool:
+            return getattr(agent, 'task_type', 'classification') == 'classification'
+
+        self_accs: dict[int, float] = {}
+        logs: dict[str, float] = {}
+        for idx_str, agent in self.agents.items():
+            idx = int(idx_str)
+            if not hasattr(agent, 'decoder') or idx not in test_Z:
+                continue
+            if not _is_classifier(agent):
+                continue
+            was_training = agent.training
+            agent.eval()
+            logits = agent.decoder(test_Z[idx].to(self.device))
+            agent.train(was_training)
+            preds = logits.argmax(dim=1).cpu()
+            self_accs[idx] = float(
+                (preds == test_y[idx]).float().mean().item()
+            )
+            logs[f'test/private_task_perf_agent_{idx}'] = self_accs[idx]
+
+        if self_accs:
+            logs['test/avg_private_task_perf'] = sum(self_accs.values()) / len(self_accs)
+
+        # Communication accuracy and task fidelity per receiver.
+        receiver_comm_accs: dict[int, float] = {}
+        task_fidelities: dict[int, float] = {}
+
+        for idx_str, agent_receiver in self.agents.items():
+            receiver_idx = int(idx_str)
+            if not hasattr(agent_receiver, 'decoder'):
+                continue
+            if not _is_classifier(agent_receiver):
+                continue
+            if receiver_idx not in test_Z:
+                continue
+
+            neighbor_accs: list[float] = []
+            for sender_idx in neighbors_map.get(receiver_idx, set()):
+                if sender_idx not in test_Z:
+                    continue
+
+                Z_received = self.send_message(
+                    sender_idx=sender_idx,
+                    receiver_idx=receiver_idx,
+                    Z_sender=test_Z[sender_idx],
+                )
+
+                was_training = agent_receiver.training
+                agent_receiver.eval()
+                logits = agent_receiver.decoder(Z_received.to(self.device))
+                agent_receiver.train(was_training)
+
+                preds = logits.argmax(dim=1).cpu()
+                acc = float(
+                    (preds == test_y[sender_idx]).float().mean().item()
+                )
+                neighbor_accs.append(acc)
+
+            if neighbor_accs:
+                avg_acc = sum(neighbor_accs) / len(neighbor_accs)
+                receiver_comm_accs[receiver_idx] = avg_acc
+                logs[f'test/comm_task_perf_agent_{receiver_idx}'] = avg_acc
+
+                self_acc = self_accs.get(receiver_idx, 0.0)
+                fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
+                task_fidelities[receiver_idx] = fidelity
+                logs[f'test/task_fidelity_agent_{receiver_idx}'] = fidelity
+
+        if receiver_comm_accs:
+            logs['test/avg_comm_task_perf'] = sum(
+                receiver_comm_accs.values()
+            ) / len(receiver_comm_accs)
+        if task_fidelities:
+            logs['test/avg_task_fidelity'] = sum(
+                task_fidelities.values()
+            ) / len(task_fidelities)
+
+        return logs
 
     def _validation_prefix(self, dataloader_idx: int) -> str:
         """Map validation dataloader indices to stable logging prefixes."""
@@ -511,8 +707,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
         extra_metrics: dict[str, Any] | None = None,
         prog_bar: bool = True,
         per_agent_loss_name: str = 'task_loss',
+        skip_task_performance: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Log per-agent and aggregate metrics for val/test reporting."""
+        if prefix == 'test_monitor':
+            return torch.tensor(0.0, device=self.device), torch.tensor(
+                0.0, device=self.device
+            )
         normalized_losses = {
             idx: self._metric_tensor(loss)
             for idx, loss in agent_losses.items()
@@ -525,13 +726,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
         per_agent_logs = {}
         for idx in sorted(normalized_losses):
             loss = normalized_losses[idx]
-            performance = normalized_performances[idx]
-            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = (
-                loss
-            )
-            per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
-                performance
-            )
+            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = loss
+            if not skip_task_performance:
+                per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
+                    normalized_performances[idx]
+                )
 
         if per_agent_logs:
             self.log_dict(
@@ -589,13 +788,14 @@ class BaseOrchestrator(l.LightningModule, ABC):
             else self._metric_tensor(total_loss)
         )
 
-        aggregate_logs = {
+        aggregate_logs: dict[str, Any] = {
             f'{prefix}/task_loss_total_epoch': total_task_loss,
             f'{prefix}/global_task_loss_epoch': global_task_loss,
             f'{prefix}/total_loss_epoch': resolved_total_loss,
-            f'{prefix}/avg_task_performance_epoch': avg_performance,
-            f'{prefix}/global_task_performance_epoch': global_task_performance,
         }
+        if not skip_task_performance:
+            aggregate_logs[f'{prefix}/avg_task_performance_epoch'] = avg_performance
+            aggregate_logs[f'{prefix}/global_task_performance_epoch'] = global_task_performance
         if extra_metrics is not None:
             aggregate_logs.update(extra_metrics)
 
@@ -665,6 +865,36 @@ class BaseOrchestrator(l.LightningModule, ABC):
         Called at the end of each training epoch. Subclasses should implement
         this method to perform operations such as federated averaging,
         parameter synchronization, or model aggregation across agents.
+        """
+        pass
+
+    @abstractmethod
+    def send_message(
+        self,
+        sender_idx: int,
+        receiver_idx: int,
+        Z_sender: torch.Tensor,
+    ) -> torch.Tensor:
+        """Transform sender's latent representations into receiver's latent space.
+
+        Mandatory in every subclass. Used at evaluation time to measure how well
+        a receiver agent can classify data from a neighbour after the
+        communication pipeline (whitening, alignment, re-colouring, etc.).
+
+        Parameters
+        ----------
+        sender_idx : int
+            Index of the agent sending the message.
+        receiver_idx : int
+            Index of the agent receiving the message.
+        Z_sender : torch.Tensor
+            Test latent representations from the sender, shape ``(n, d_sender)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Transformed representations in the receiver's latent space,
+            shape ``(n, d_receiver)``.
         """
         pass
 
@@ -814,6 +1044,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
             Dictionary mapping agent indices to (prediction, label) pairs.
         """
         prefix = self._validation_prefix(dataloader_idx)
+        if prefix == 'test_monitor':
+            return {}
         self._validation_prefixes_seen.add(prefix)
         output, _ = self._shared_eval(
             batch=batch,
@@ -858,6 +1090,378 @@ class BaseOrchestrator(l.LightningModule, ABC):
         return {
             'optimizer': optimizer,
         }
+
+    # ── PID logging on training data ─────────────────────────────────────────
+    #
+    # Information-theoretic decomposition of ``I(Z_i, Z_j; Y)`` between every
+    # pair of agents at the end of training (Liang et al., 2023,
+    # arXiv:2302.12247).  Each pair gets four non-negative values logged as
+    # ``train/pid_{method}_pair_{i}_{j}/{redundancy|unique_i|unique_j|synergy}``
+    # plus the underlying mutual informations for sanity-checking.
+
+    def _flush_pid_logs(self, logs: dict[str, float]) -> None:
+        """Push PID metrics to every attached experiment logger.
+
+        ``self.log_dict`` is not reliable inside ``on_train_end`` because
+        the per-epoch aggregator has already been torn down — Lightning
+        either drops the values or emits a deprecation warning depending
+        on the version.  Writing through ``logger.log_metrics`` (or
+        ``logger.experiment.log`` for W&B) bypasses that aggregator and
+        flushes the metrics immediately under the final ``global_step``.
+        """
+        if not logs:
+            return
+        step = int(getattr(self, 'global_step', 0) or 0)
+        loggers = getattr(self.trainer, 'loggers', None)
+        if not loggers:
+            single = getattr(self.trainer, 'logger', None)
+            loggers = [single] if single is not None else []
+        for lg in loggers:
+            log_metrics = getattr(lg, 'log_metrics', None)
+            if callable(log_metrics):
+                try:
+                    log_metrics(metrics=logs, step=step)
+                    continue
+                except TypeError:
+                    log_metrics(logs, step)
+                    continue
+            experiment = getattr(lg, 'experiment', None)
+            log_fn = getattr(experiment, 'log', None)
+            if callable(log_fn):
+                log_fn({**logs, 'global_step': step})
+
+    @torch.no_grad()
+    def _encode_full_training_set(
+        self, dm
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+        """Encode each agent's training set once.
+
+        Returns
+        -------
+        per_agent : dict[int, (Z, Y, sample_ids | None)]
+            Latent matrix, label vector, and optional sample identifiers
+            (used to pair samples across agents).  Tensors live on CPU
+            to keep VRAM available for the neural PID estimator.
+        """
+        train_datasets = getattr(dm, 'train_datasets', None)
+        if not train_datasets:
+            return {}
+
+        def _collate(batch):
+            xs, ys, sids = [], [], []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+                y = item[1]
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
+                if len(item) >= 3:
+                    sid = item[2]
+                    sids.append(
+                        sid
+                        if isinstance(sid, torch.Tensor)
+                        else torch.tensor(sid)
+                    )
+            xs_t = torch.stack(xs)
+            ys_t = torch.stack(ys)
+            sids_t = torch.stack(sids) if sids else None
+            return xs_t, ys_t, sids_t
+
+        out: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            ds = train_datasets.get(idx)
+            if ds is None or len(ds) == 0:
+                continue
+            loader = torch.utils.data.DataLoader(
+                ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate,
+            )
+            was_training = agent.training
+            agent.eval()
+            zs, ys, sids = [], [], []
+            for x, y, sid in loader:
+                x = x.to(self.device)
+                z = agent.encode(x).detach().cpu().float()
+                zs.append(z)
+                ys.append(y.cpu().long())
+                if sid is not None:
+                    sids.append(sid.cpu().long())
+            agent.train(was_training)
+            if zs:
+                out[idx] = (
+                    torch.cat(zs, dim=0),
+                    torch.cat(ys, dim=0),
+                    torch.cat(sids, dim=0) if sids else None,
+                )
+        return out
+
+    @staticmethod
+    def _pair_by_sample_ids(
+        z_i: torch.Tensor,
+        y_i: torch.Tensor,
+        sid_i: torch.Tensor | None,
+        z_j: torch.Tensor,
+        y_j: torch.Tensor,
+        sid_j: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Match samples between two agents.
+
+        Preference order: (1) shared ``sample_ids``; (2) positional
+        pairing on the shorter of the two when both lack ids and have
+        identical labels in order; (3) failure → ``None``.
+        """
+        if sid_i is not None and sid_j is not None:
+            ids_i = sid_i.numpy()
+            ids_j = sid_j.numpy()
+            common = np.intersect1d(ids_i, ids_j, assume_unique=False)
+            if common.size == 0:
+                return None
+            pos_i = {int(v): k for k, v in enumerate(ids_i.tolist())}
+            pos_j = {int(v): k for k, v in enumerate(ids_j.tolist())}
+            sel_i = [pos_i[int(c)] for c in common]
+            sel_j = [pos_j[int(c)] for c in common]
+            z_i_p = z_i[sel_i]
+            z_j_p = z_j[sel_j]
+            y_p = y_i[sel_i]
+            if not torch.equal(y_p, y_j[sel_j]):
+                return None
+            return z_i_p, z_j_p, y_p
+
+        n = min(len(y_i), len(y_j))
+        if n == 0 or not torch.equal(y_i[:n], y_j[:n]):
+            return None
+        return z_i[:n], z_j[:n], y_i[:n]
+
+    def _resolve_pid_num_classes(self, y: torch.Tensor) -> int | None:
+        """Best-effort lookup of the global label cardinality."""
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is not None:
+            n = getattr(dm, 'num_classes', None)
+            if isinstance(n, dict):
+                for v in n.values():
+                    if isinstance(v, int):
+                        return int(v)
+            elif isinstance(n, int):
+                return int(n)
+        return int(y.max().item()) + 1 if y.numel() else None
+
+    def _iter_pid_pairs(self) -> list[tuple[int, int]]:
+        """Return the unordered agent pairs to score PID on.
+
+        ``pid_pairs='neighbors'`` (default) → graph edges from
+        ``self.hparams.neighbors``; ``pid_pairs='all'`` → every pair
+        of agents (full clique).  Each pair appears once, with the
+        smaller index first.
+        """
+        mode = str(getattr(self.hparams, 'pid_pairs', 'neighbors')).lower()
+        if mode == 'neighbors':
+            neighbors_map = getattr(self.hparams, 'neighbors', {}) or {}
+            seen: set[tuple[int, int]] = set()
+            for i, neigh in neighbors_map.items():
+                for j in neigh:
+                    a, b = int(i), int(j)
+                    if a == b:
+                        continue
+                    edge = (min(a, b), max(a, b))
+                    seen.add(edge)
+            return sorted(seen)
+        if mode == 'all':
+            idxs = sorted(int(k) for k in self.agents)
+            return [
+                (idxs[a], idxs[b])
+                for a in range(len(idxs))
+                for b in range(a + 1, len(idxs))
+            ]
+        raise ValueError(
+            f"Unknown pid_pairs={mode!r}. Valid: ['neighbors', 'all']."
+        )
+
+    def _compute_and_log_pair_pid(
+        self,
+        encoded: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+    ) -> dict[str, float]:
+        """Run PID estimators on every selected pair; return a log dict."""
+        from src.mutualinfo import batch_pid, cvxpy_pid
+
+        methods = tuple(self.hparams.pid_methods)
+        logs: dict[str, float] = {}
+
+        for i, j in self._iter_pid_pairs():
+            if i not in encoded or j not in encoded:
+                continue
+
+            z_i, y_i, sid_i = encoded[i]
+            z_j, y_j, sid_j = encoded[j]
+            paired = self._pair_by_sample_ids(z_i, y_i, sid_i, z_j, y_j, sid_j)
+            if paired is None:
+                continue
+            z_a, z_b, y = paired
+            if y.numel() < 32:
+                continue
+
+            num_classes = self._resolve_pid_num_classes(y)
+            pair_tag = f'{i}_{j}'
+
+            if 'cvxpy' in methods or 'cvx' in methods:
+                try:
+                    res = cvxpy_pid(
+                        z_a,
+                        z_b,
+                        y,
+                        n_clusters=int(self.hparams.pid_num_clusters),
+                        max_samples=self.hparams.pid_max_samples,
+                        seed=int(getattr(self, 'global_step', 0)),
+                    )
+                    prefix = f'train/pid_cvxpy_pair_{pair_tag}'
+                    logs[f'{prefix}/redundancy'] = res.redundancy
+                    logs[f'{prefix}/unique_{i}'] = res.unique1
+                    logs[f'{prefix}/unique_{j}'] = res.unique2
+                    logs[f'{prefix}/synergy'] = res.synergy
+                    logs[f'{prefix}/mi_y_z1'] = res.mi_y_z1
+                    logs[f'{prefix}/mi_y_z2'] = res.mi_y_z2
+                    logs[f'{prefix}/mi_y_z1z2'] = res.mi_y_z1z2
+                    logs[f'{prefix}/total_information'] = res.total_information()
+                except Exception as exc:
+                    warnings.warn(
+                        f'CVXPY PID failed on pair {pair_tag}: {exc}',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+            if 'batch' in methods or 'neural' in methods:
+                try:
+                    res = batch_pid(
+                        z_a,
+                        z_b,
+                        y,
+                        num_classes=num_classes,
+                        hidden_dim=int(self.hparams.pid_hidden_dim),
+                        embed_dim=int(self.hparams.pid_embed_dim),
+                        discrim_epochs=int(self.hparams.pid_discrim_epochs),
+                        align_epochs=int(self.hparams.pid_align_epochs),
+                        batch_size=int(self.hparams.pid_batch_size),
+                        device=self.device,
+                        seed=int(getattr(self, 'global_step', 0)),
+                    )
+                    prefix = f'train/pid_batch_pair_{pair_tag}'
+                    logs[f'{prefix}/redundancy'] = res.redundancy
+                    logs[f'{prefix}/unique_{i}'] = res.unique1
+                    logs[f'{prefix}/unique_{j}'] = res.unique2
+                    logs[f'{prefix}/synergy'] = res.synergy
+                    logs[f'{prefix}/mi_y_z1'] = res.mi_y_z1
+                    logs[f'{prefix}/mi_y_z2'] = res.mi_y_z2
+                    logs[f'{prefix}/mi_y_z1z2'] = res.mi_y_z1z2
+                    logs[f'{prefix}/total_information'] = res.total_information()
+                except Exception as exc:
+                    warnings.warn(
+                        f'Batch PID failed on pair {pair_tag}: {exc}',
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        return logs
+
+    def _encode_pilot_set(
+        self, dm
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]:
+        """Encode the shared pilot split through every agent.
+
+        Pilot datasets have the same ``sample_ids`` across all agents, so
+        ``_pair_by_sample_ids`` will always find a non-empty intersection.
+        Falls back to an empty dict if ``dm.pilot_datasets`` does not exist.
+        """
+        pilot_datasets = getattr(dm, 'pilot_datasets', None)
+        if not pilot_datasets:
+            return {}
+
+        def _collate(batch):
+            xs, ys, sids = [], [], []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+                y = item[1]
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
+                if len(item) >= 3:
+                    sid = item[2]
+                    sids.append(
+                        sid
+                        if isinstance(sid, torch.Tensor)
+                        else torch.tensor(sid)
+                    )
+            xs_t = torch.stack(xs)
+            ys_t = torch.stack(ys)
+            sids_t = torch.stack(sids) if sids else None
+            return xs_t, ys_t, sids_t
+
+        out: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            ds = pilot_datasets.get(idx)
+            if ds is None or len(ds) == 0:
+                continue
+            loader = torch.utils.data.DataLoader(
+                ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate,
+            )
+            was_training = agent.training
+            agent.eval()
+            zs, ys, sids = [], [], []
+            for x, y, sid in loader:
+                x = x.to(self.device)
+                z = agent.encode(x).detach().cpu().float()
+                zs.append(z)
+                ys.append(y.cpu().long())
+                if sid is not None:
+                    sids.append(sid.cpu().long())
+            agent.train(was_training)
+            if zs:
+                out[idx] = (
+                    torch.cat(zs, dim=0),
+                    torch.cat(ys, dim=0),
+                    torch.cat(sids, dim=0) if sids else None,
+                )
+        return out
+
+    def on_train_end(self) -> None:
+        """Run the PID estimators on the final encoder outputs (one shot).
+
+        No-op unless ``pid_logging=True`` in the hparams.  All metrics
+        are flushed under the final ``global_step`` to whatever logger
+        the trainer is using.
+
+        Encoding priority: pilot_datasets (shared across agents, guaranteed
+        to have overlapping sample IDs) → train_datasets (fallback for
+        configurations without a pilot split, e.g. uniform partitioning).
+        """
+        if not bool(getattr(self.hparams, 'pid_logging', False)):
+            return
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        encoded = self._encode_pilot_set(dm)
+        if not encoded:
+            encoded = self._encode_full_training_set(dm)
+        if not encoded:
+            return
+        logs = self._compute_and_log_pair_pid(encoded)
+        self._flush_pid_logs(logs)
 
 
 if __name__ == '__main__':

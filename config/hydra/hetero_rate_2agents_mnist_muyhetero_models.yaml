@@ -12,8 +12,8 @@ lmb_study:
   enabled: true        # set to true to run Optuna search before the full training run
   n_trials: 20          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
-  lmb_low: 1.0e-4       # lower bound of the log-uniform search interval
-  lmb_high: 1.0         # upper bound of the log-uniform search interval
+  lmb_low: 1e-4       # lower bound of the log-uniform search interval
+  lmb_high: 1e-1        # upper bound of the log-uniform search interval
 
 graph:
   neighbors_mode: "fully_connected"
@@ -24,7 +24,7 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: thursday_presentation
+  project: thursday_presentation_muy
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
@@ -47,12 +47,12 @@ dataset:
   split_strategy: grouped_non_iid
   n_agents: 2
   classes_per_agent: 10
-  shift_strength: 0.8
+  shift_strength: 1.0
   monitor_test_during_fit: true
   batch_size: 64
   num_workers: 0
   mode: min_size
-  pilot_split: 0.1
+  pilot_split: 0.2
   pilot_batch_size: 64
   comm_data: shared_global_pilots
   groups:
@@ -66,29 +66,23 @@ dataset:
 model:
   agents:
     0:
-      _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
+      _target_: src.agents.TransformerClassifier
+      patch_size: 7
+      embed_dim: 128
+      depth: 4
+      num_heads: 4
+      mlp_ratio: 4.0
+      pool: mean
+      decoder_hidden_dims: [256]
       dropout: 0.1
-      use_batchnorm: true
+      weight_decay: 1e-4
+      use_batchnorm: false
     1:
       _target_: src.agents.CNNClassifier
       encoder_hidden_dims: [32, 64]
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
-    # 1:
-    #   _target_: src.agents.TransformerClassifier
-    #   patch_size: 7
-    #   embed_dim: 128
-    #   depth: 4
-    #   num_heads: 4
-    #   mlp_ratio: 4.0
-    #   pool: mean
-    #   decoder_hidden_dims: [256]
-    #   dropout: 0.1
-    #   weight_decay: 1e-4
-    #   use_batchnorm: false
 
 orchestrator:
   parseval_normalization: false
@@ -100,9 +94,10 @@ orchestrator:
   lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl
-  comm_task_coeff: 0
+  comm_task_coeff: 1
   use_general_maps: false
   soft_maps: false
+  # align_on_intersection: True
   # Sheaf FMTL specific
   gamma: 0.001
   eta: 0.01
@@ -120,6 +115,6 @@ hydra:
       # orchestrator.alignment_method: general, procrustes
       # orchestrator.use_general_maps: false, true
       # orchestrator.max_lmb: 0.5, 5
-      # orchestrator: sheaf_fmtl, comfed, sheaf_frl, non_cooperative, federated
-      dataset.shift_strength: 0.5, 0.7, 0.9
+      orchestrator: sheaf_frl, comfed
+      dataset.shift_strength: 0.6, 0.8, 1.0
 

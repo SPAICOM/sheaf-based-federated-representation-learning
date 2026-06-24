@@ -1,10 +1,13 @@
-"""Federated Personalization (FedPer) orchestrator.
+"""Local-Global Federated Learning (LGFed) orchestrator.
 
-This module implements a centralized FedPer-style training loop where all
-agents share encoder/base layers while keeping their decoder/classification
-head private. Base layers are aggregated on a server with sample-count
-weights, then broadcast back to every client on a configurable global
-aggregation schedule.
+This module implements a centralized LGFed-style training loop where all
+agents keep their encoder/feature-extraction layers private while sharing
+decoder/classification-head layers. Head layers are aggregated on a server
+with sample-count weights, then broadcast back to every client on a
+configurable global aggregation schedule.
+
+This is the complement of FedPer: encoders are personalized, decoders are
+shared.
 """
 
 from typing import Any
@@ -19,17 +22,17 @@ from src.communication.alignment_mixin import (
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
-    """Centralized FedPer orchestrator with personalized heads.
+class LGFed(PostTrainingAlignmentMixin, BaseOrchestrator):
+    """Centralized LGFed orchestrator with personalized encoders.
 
-    The implementation uses the agent ``encoder`` as the shared base network
-    and the agent ``decoder`` as the personalized head. Only encoder
-    parameters and buffers participate in server-side aggregation.
+    The implementation uses the agent ``decoder`` as the shared head network
+    and the agent ``encoder`` as the personalized feature extractor. Only
+    decoder parameters and buffers participate in server-side aggregation.
 
     Parameters
     ----------
     agents : dict[int, nn.Module]
-        Client models. All agents must expose compatible ``encoder`` modules.
+        Client models. All agents must expose compatible ``decoder`` modules.
     neighbors : dict[int, set[int]]
         Unused by the aggregation rule, but kept for interface compatibility
         with the base orchestrator and experiment pipeline.
@@ -55,8 +58,8 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         orchestrator tries to infer them from ``trainer.datamodule`` and
         falls back to uniform weights if unavailable.
     sync_on_train_start : bool, optional
-        If ``True``, synchronize encoder weights once before the first local
-        update so all clients start from a common shared base (default: True).
+        If ``True``, synchronize decoder weights once before the first local
+        update so all clients start from a common shared head (default: True).
     """
 
     def __init__(
@@ -103,7 +106,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         )
         self.save_hyperparameters(ignore=['agents'])
 
-        self._validate_agents_for_fedper()
+        self._validate_agents_for_lgfed()
         self._client_sample_counts = self._normalize_sample_counts(
             sample_counts
         )
@@ -120,7 +123,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         local_steps: int | None,
         global_steps: int | None,
     ) -> tuple[int, str, int | None]:
-        """Resolve the configured FedPer aggregation schedule."""
+        """Resolve the configured LGFed aggregation schedule."""
         if local_steps is not None:
             if (
                 aggregation_interval is not None
@@ -168,19 +171,19 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
             normalized[int(key)] = max(int(value), 0)
         return normalized
 
-    def _validate_agents_for_fedper(self) -> None:
-        """Validate that every agent exposes a compatible shared encoder."""
+    def _validate_agents_for_lgfed(self) -> None:
+        """Validate that every agent exposes a compatible shared decoder."""
         agents = list(self.agents.values())
         ref = agents[0]
 
         if not hasattr(ref, 'encoder') or not hasattr(ref, 'decoder'):
             raise TypeError(
-                'FedPer requires agents with encoder/decoder attributes.'
+                'LGFed requires agents with encoder/decoder attributes.'
             )
 
-        ref_encoder_state = ref.encoder.state_dict()
-        ref_encoder_shapes = {
-            name: tensor.shape for name, tensor in ref_encoder_state.items()
+        ref_decoder_state = ref.decoder.state_dict()
+        ref_decoder_shapes = {
+            name: tensor.shape for name, tensor in ref_decoder_state.items()
         }
 
         for i, agent in enumerate(agents[1:], start=1):
@@ -189,16 +192,16 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
                     f'Agent {i} is missing encoder/decoder attributes.'
                 )
 
-            encoder_state = agent.encoder.state_dict()
-            if encoder_state.keys() != ref_encoder_state.keys():
+            decoder_state = agent.decoder.state_dict()
+            if decoder_state.keys() != ref_decoder_state.keys():
                 raise ValueError(
-                    f'Agent {i} encoder state keys mismatch with agent 0.'
+                    f'Agent {i} decoder state keys mismatch with agent 0.'
                 )
 
-            for name, tensor in encoder_state.items():
-                if tensor.shape != ref_encoder_shapes[name]:
+            for name, tensor in decoder_state.items():
+                if tensor.shape != ref_decoder_shapes[name]:
                     raise ValueError(
-                        f'Encoder shape mismatch in {name}:'
+                        f'Decoder shape mismatch in {name}:'
                         f' agent {i} vs agent 0.'
                     )
 
@@ -245,59 +248,34 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
             return dict.fromkeys(counts, uniform)
         return {idx: float(count) / total for idx, count in counts.items()}
 
-    # BN running buffers are per-agent statistics, not learnable parameters.
-    # Averaging them across agents with heterogeneous data corrupts test-time
-    # normalization: the decoder was trained with one agent's batch statistics
-    # but at eval() time would see the averaged statistics of a different
-    # distribution. Exclude these keys from server aggregation so each agent
-    # retains its own running stats.
-    _BN_BUFFER_SUFFIXES = frozenset(
-        {'running_mean', 'running_var', 'num_batches_tracked'}
-    )
-
-    @classmethod
-    def _is_bn_buffer(cls, key: str) -> bool:
-        return any(
-            key == s or key.endswith(f'.{s}')
-            for s in cls._BN_BUFFER_SUFFIXES
-        )
-
     @torch.no_grad()
-    def _aggregate_base_layers(self) -> dict[str, torch.Tensor]:
-        """Compute the centralized weighted average of encoder states.
-
-        BN running statistics (running_mean, running_var, num_batches_tracked)
-        are excluded from aggregation and remain per-agent so that each
-        client's test-time normalization matches its local training distribution.
-        """
+    def _aggregate_head_layers(self) -> dict[str, torch.Tensor]:
+        """Compute the centralized weighted average of decoder states."""
         agents = {int(k): v for k, v in self.agents.items()}
         weights = self._client_weights()
 
-        ref_state = agents[min(agents)].encoder.state_dict()
+        ref_state = agents[min(agents)].decoder.state_dict()
         aggregated_state = {
             name: torch.zeros_like(tensor, dtype=torch.float32)
             for name, tensor in ref_state.items()
-            if not self._is_bn_buffer(name)
         }
 
         for idx, agent in agents.items():
-            base_state = agent.encoder.state_dict()
+            head_state = agent.decoder.state_dict()
             self._record_communication(
-                base_state,
+                head_state,
                 n_transmissions=1,
                 prefix='train',
             )
-            for name, tensor in base_state.items():
-                if name in aggregated_state:
-                    aggregated_state[name] += (
-                        tensor.detach().to(dtype=torch.float32) * weights[idx]
-                    )
+            for name, tensor in head_state.items():
+                aggregated_state[name] += (
+                    tensor.detach().to(dtype=torch.float32) * weights[idx]
+                )
 
         for name, ref_tensor in ref_state.items():
-            if name in aggregated_state:
-                aggregated_state[name] = aggregated_state[name].to(
-                    dtype=ref_tensor.dtype
-                )
+            aggregated_state[name] = aggregated_state[name].to(
+                dtype=ref_tensor.dtype
+            )
 
         self._record_communication(
             aggregated_state,
@@ -307,27 +285,23 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         return aggregated_state
 
     @torch.no_grad()
-    def _broadcast_base_layers(
+    def _broadcast_head_layers(
         self,
         aggregated_state: dict[str, torch.Tensor],
     ) -> None:
-        """Load the server-aggregated encoder state into every agent.
-
-        Uses strict=False because BN running buffers are intentionally absent
-        from aggregated_state; each agent retains its own running statistics.
-        """
+        """Load the server-aggregated decoder state into every agent."""
         for agent in self.agents.values():
-            agent.encoder.load_state_dict(aggregated_state, strict=False)
+            agent.decoder.load_state_dict(aggregated_state)
 
     @torch.no_grad()
-    def _synchronize_base_layers(self) -> None:
-        """Aggregate encoder parameters on the server and broadcast them."""
-        aggregated_state = self._aggregate_base_layers()
-        self._broadcast_base_layers(aggregated_state)
+    def _synchronize_head_layers(self) -> None:
+        """Aggregate decoder parameters on the server and broadcast them."""
+        aggregated_state = self._aggregate_head_layers()
+        self._broadcast_head_layers(aggregated_state)
         self._record_communication_round(prefix='train')
 
     def on_train_start(self) -> None:
-        """Initialize counters and optionally synchronize shared base layers."""
+        """Initialize counters and optionally synchronize shared head layers."""
         super().on_train_start()
         self._infer_client_sample_counts()
         self._last_aggregated_step = 0
@@ -335,7 +309,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         self._global_aggregation_count = 0
 
         if self.hparams.sync_on_train_start:
-            self._synchronize_base_layers()
+            self._synchronize_head_layers()
 
     def _maybe_stop_after_global_aggregation(self) -> None:
         """Stop training once the configured aggregation budget is reached."""
@@ -353,7 +327,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         return None
 
     def on_train_epoch_end(self) -> None:
-        """Aggregate shared encoders according to the configured schedule."""
+        """Aggregate shared decoders according to the configured schedule."""
         if self.hparams.aggregation_unit == 'epoch':
             completed_epochs = int(self.current_epoch) + 1
             interval = int(self.hparams.aggregation_interval)
@@ -364,7 +338,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
                 and completed_epochs != self._last_aggregated_epoch
                 and completed_epochs % interval == 0
             ):
-                self._synchronize_base_layers()
+                self._synchronize_head_layers()
                 self._last_aggregated_epoch = completed_epochs
                 self._global_aggregation_count += 1
                 self._maybe_stop_after_global_aggregation()
@@ -378,7 +352,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         batch: dict[int, list[torch.Tensor]],
         batch_idx: int,
     ) -> None:
-        """Run step-scheduled FedPer aggregation when configured."""
+        """Run step-scheduled LGFed aggregation when configured."""
         if self.hparams.aggregation_unit != 'step':
             return None
 
@@ -392,7 +366,7 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         ):
             return None
 
-        self._synchronize_base_layers()
+        self._synchronize_head_layers()
         self._last_aggregated_step = step
         self._global_aggregation_count += 1
         self._maybe_stop_after_global_aggregation()
@@ -426,7 +400,6 @@ class FedPer(PostTrainingAlignmentMixin, BaseOrchestrator):
         )
 
         return outputs, total_loss
-
 
     # send_message, _fit_alignment_maps, _cleanup_alignment inherited from
     # PostTrainingAlignmentMixin: post-hoc whitening + alignment pipeline.

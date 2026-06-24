@@ -293,6 +293,11 @@ class ClassificationDataModule(l.LightningDataModule):
             batch_size if pilot_batch_size is None else pilot_batch_size
         )
         self.pilot_apply_agent_rotations = pilot_apply_agent_rotations
+        _valid = ('private_pilots', 'shared_global_pilots', 'pairwise_pilots')
+        if comm_data not in _valid:
+            raise ValueError(
+                f"Unknown comm_data '{comm_data}'. Valid options: {_valid}"
+            )
         self.comm_data = comm_data
         self.starve_clients = starve_clients
         self.seed = seed
@@ -783,12 +788,18 @@ class ClassificationDataModule(l.LightningDataModule):
         self.input_dims = {str(i): self.input_shape[0] for i in self.models}
 
     def _make_loader(self, dataset: Dataset, shuffle: bool) -> DataLoader:
+        generator = None
+        if shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             collate_fn=_collate_fn,
+            drop_last=shuffle,
+            generator=generator,
         )
 
     def _make_pilot_loader(

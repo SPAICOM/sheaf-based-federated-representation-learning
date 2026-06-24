@@ -5,6 +5,7 @@ lambda_schedule: cosine
 anchor_strategy: pilots
 parseval_normalization: False
 l2_normalization: False
+learn_whitening: True  # learnable SWBN whitening layer (g_phi_i); requires parseval/L2 off
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
@@ -13,10 +14,23 @@ num_anchors: 32
 #epoch_reencode_batch_size: 256
 local_steps: 1
 update_v_every_n_epochs: 1
+warmup_epochs: 0
 neighbors: {}
-
-#per_agent_hidden_dims:
-#  0: [128, 64]
-#  1: [64, 32]
 filter_unseen_classes: False
 use_prototypes: False
+comm_task_coeff: 0.0  # weight for the after-communication task loss (0 = disabled)
+align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
+
+# Information-theoretic PID logging (Liang et al. 2023).
+# Implemented in BaseOrchestrator → applies to *every* orchestrator that
+# forwards **kwargs to super().__init__.  Toggle pid_logging to enable.
+pid_logging: True
+pid_methods: ['cvxpy']   # ['cvxpy', 'batch'] or any subset.
+pid_pairs: neighbors     # 'neighbors' (graph edges) or 'all' (full clique).
+pid_num_clusters: 10     # K-Means clusters per view (CVX method).
+pid_max_samples: 4000    # Down-sample the training set for the CVX path.
+pid_discrim_epochs: 40   # Neural-PID discriminator epochs.
+pid_align_epochs: 10     # Neural-PID alignment epochs.
+pid_batch_size: 256      # Neural-PID mini-batch size.
+pid_hidden_dim: 32
+pid_embed_dim: 10

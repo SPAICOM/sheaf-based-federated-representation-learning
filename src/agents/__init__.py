@@ -20,6 +20,7 @@ Each agent implements:
 """
 
 from .base_agent import BaseAgent
+from .cnn_autoencoder import CNNAutoencoder
 from .cnn_classifier import CNNClassifier
 from .deepsense_classifiers import (
     DeepSenseLiDARClassifier,
@@ -48,15 +49,29 @@ from .mhealth_encoders import (
     MHealthGyroscopeEncoder,
     MHealthMagnetometerEncoder,
 )
+from .personalized_ae import PersonalizedAE
 from .personalized_classifier import PersonalizedClassifier
 from .timm_classifier import TimmClassifier
 from .transformer_classifier import TransformerClassifier
-from .utils import CNN, MLP, BaseEncoder, HeteroCNN, HeteroMLP, TimmEncoder, ViTEncoder
+from .utils import (
+    CNN,
+    MLP,
+    BaseEncoder,
+    CNNAEDecoder,
+    CNNAEEncoder,
+    HeteroCNN,
+    HeteroMLP,
+    TimmEncoder,
+    ViTEncoder,
+)
 
 __all__ = [
     'BaseAgent',
     'BaseEncoder',
     'CNN',
+    'CNNAEDecoder',
+    'CNNAEEncoder',
+    'CNNAutoencoder',
     'CNNClassifier',
     'DeepSenseLiDARClassifier',
     'DeepSenseLiDAREncoder',
@@ -80,6 +95,7 @@ __all__ = [
     'MHealthMagnetometerClassifier',
     'MHealthMagnetometerEncoder',
     'MLP',
+    'PersonalizedAE',
     'PersonalizedClassifier',
     'TimmClassifier',
     'TimmEncoder',

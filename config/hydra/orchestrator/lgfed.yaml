@@ -1,12 +1,13 @@
-_target_: src.orchestrators.sheaf_fmtl.SheafFMTL
+_target_: src.orchestrators.LGFed
 
-gamma: 0.01
-max_lmb: 0.001
-lambda_schedule: null
-eta: 0.01
+# Fair default: aggregate once per completed local epoch and let the
+# Trainer's max_epochs control total training length.
+aggregation_interval: 1
+aggregation_unit: epoch
+max_global_rounds: null
 
-agents: null
-neighbors: {}
+sample_counts: null
+sync_on_train_start: true
 
 # Information-theoretic PID logging (Liang et al. 2023).
 # Implemented in BaseOrchestrator → applies to *every* orchestrator that

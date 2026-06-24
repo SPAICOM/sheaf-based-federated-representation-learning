@@ -143,10 +143,17 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         preventing the anchor builder from receiving unseen-class embeddings.
         Falls back to keeping at least one pilot sample if an agent trained on
         no classes present in the global pilot pool.
+
+        Also builds ``self._intersection_pilot_dataset``: a pilot dataset
+        restricted to classes seen by *every* agent.  This is used by
+        ``shared_global_pilots`` mode so that no agent is asked to encode
+        out-of-distribution samples, which would corrupt the alignment map.
         """
         pilot_labels = pilot_data[label_key]
+        all_seen: list[set] = []
         for i in range(self.n_agents):
             seen_classes = set(self.train_datasets[i].dataset[label_key])
+            all_seen.append(seen_classes)
             keep = [
                 idx
                 for idx, lbl in enumerate(pilot_labels)
@@ -162,6 +169,18 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 label_key,
                 sample_ids=filtered_ids,
             )
+
+        # Intersection pilot: only classes every agent has been trained on.
+        shared_classes = set.intersection(*all_seen) if len(all_seen) > 1 else (all_seen[0] if all_seen else set())
+        keep_shared = [idx for idx, lbl in enumerate(pilot_labels) if lbl in shared_classes]
+        if not keep_shared:
+            keep_shared = [0]
+        self._intersection_pilot_dataset: ClassificationDataset = ClassificationDataset(
+            pilot_data.select(keep_shared),
+            self.data_key,
+            label_key,
+            sample_ids=[pilot_indices[idx] for idx in keep_shared],
+        )
 
     def _local_stratified_split_indices(
         self,
@@ -343,3 +362,21 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         self.num_classes['label'] = len(set(all_data[label_key]))
         self.models = list(range(self.n_agents))
         self.input_dims = {str(i): self.input_shape[0] for i in self.models}
+
+    def _create_loaders(self, split: str):
+        """Like the parent, but for ``shared_global_pilots`` swap in the
+        intersection-only pilot so no agent encodes out-of-distribution classes.
+        """
+        intersection_ds = getattr(self, '_intersection_pilot_dataset', None)
+        if (
+            self.comm_data == 'shared_global_pilots'
+            and intersection_ds is not None
+            and self.pilot_datasets
+        ):
+            orig = self.pilot_datasets.get(0)
+            self.pilot_datasets[0] = intersection_ds
+            result = super()._create_loaders(split)
+            if orig is not None:
+                self.pilot_datasets[0] = orig
+            return result
+        return super()._create_loaders(split)

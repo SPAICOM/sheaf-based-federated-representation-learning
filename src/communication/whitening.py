@@ -1,9 +1,9 @@
-"""PPFE – Pre-whitening + Pairwise Feature-space alignment Evaluation.
+"""Whitening and pairwise alignment operators for cross-agent evaluation.
 
-Pipeline (non-cooperative, post-hoc):
+Post-hoc alignment pipeline (non-cooperative setting):
   1. Each agent fits a whitening operator on its own training latents.
   2. For every directed edge (i → j), pilot representations (whitened) are
-     used to learn a linear map  A_{j←i}  that minimises ||X_j - X_i A^T||²_F.
+     used to learn an alignment map  A_{j←i}  (general or Procrustes).
   3. Cross-accuracy: agent j classifies agent i's test samples by whitening
      them (with W_i), aligning (A_{j←i}), re-colouring (C_j), then decoding.
 """
@@ -36,30 +36,52 @@ class WhiteningOp:
     C: torch.Tensor  # (d, d)  right-multiply colouring  (W^{-1} row-wise)
 
 
-def fit_whitening(Z: torch.Tensor, eps: float = 1e-6) -> WhiteningOp:
+def fit_whitening(Z: torch.Tensor, eps: float = 1e-2) -> WhiteningOp:
     """Fit whitening/colouring operators from latent matrix Z (n, d).
 
-    Uses eigendecomposition of the sample covariance with a small ridge for
-    numerical stability.  All outputs stored on CPU.
+    Uses the SVD of the centred data matrix rather than the eigendecomposition
+    of the sample covariance.  This avoids squaring the condition number and
+    handles rank-deficient cases (n < d) without convergence failures.
+
+    ``full_matrices`` is enabled only when n < d so the full set of d right
+    singular vectors is recovered for the null-space directions; when n >= d
+    the economy SVD is used to avoid an n×n U matrix.
     """
     Z = Z.float()
+    # Sanitize non-finite values that can arise from training instability so
+    # that SVD (both GPU and CPU fallback) never receives a corrupt matrix.
+    if not torch.isfinite(Z).all():
+        import warnings
+        warnings.warn(
+            f"fit_whitening: input Z contains non-finite values "
+            f"({(~torch.isfinite(Z)).sum().item()} entries). "
+            "Replacing with 0.0 — check for training instability.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        Z = torch.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
     mean = Z.mean(0)
     Z_c = Z - mean
-    n = Z_c.shape[0]
-    d = Z_c.shape[1]
+    n, d = Z_c.shape
 
-    Cov = (Z_c.T @ Z_c) / max(n - 1, 1)
-    Cov = Cov + eps * torch.eye(d, dtype=Z_c.dtype)
+    try:
+        _, S, Vt = torch.linalg.svd(Z_c, full_matrices=(n < d))
+    except RuntimeError:
+        _, S, Vt = torch.linalg.svd(Z_c.cpu(), full_matrices=(n < d))
+        S = S.to(Z_c.device)
+        Vt = Vt.to(Z_c.device)
+    r = S.shape[0]  # min(n, d)
 
-    eigenvalues, V = torch.linalg.eigh(Cov)  # V: columns are eigenvectors
-    eigenvalues = eigenvalues.clamp(min=eps)
+    # Eigenvalues of the sample covariance for the r principal directions;
+    # null-space directions (when n < d) get the ridge value eps.
+    eigenvalues = torch.full((d,), eps, dtype=Z_c.dtype, device=Z_c.device)
+    eigenvalues[:r] = (S.pow(2) / max(n - 1, 1)).clamp(min=eps)
 
-    # W: right-multiply whitening  z_white = (z - mean) @ W
-    # C: right-multiply colouring  z = z_white @ C.T + mean
-    W = V * eigenvalues.pow(-0.5)  # (d, d)
-    C = V * eigenvalues.pow(0.5)  # (d, d)
+    V = Vt.T  # (d, d) — right singular vectors as columns
+    W = V * eigenvalues.pow(-0.5)  # right-multiply whitening: z_white = (z - mean) @ W
+    C = V * eigenvalues.pow(0.5)   # right-multiply colouring:  z = z_white @ C.T + mean
 
-    return WhiteningOp(mean=mean.cpu(), W=W.cpu(), C=C.cpu())
+    return WhiteningOp(mean=mean, W=W, C=C)
 
 
 def whiten(Z: torch.Tensor, op: WhiteningOp) -> torch.Tensor:
@@ -70,6 +92,155 @@ def whiten(Z: torch.Tensor, op: WhiteningOp) -> torch.Tensor:
 def color(Z_white: torch.Tensor, op: WhiteningOp) -> torch.Tensor:
     dev = Z_white.device
     return Z_white.float() @ op.C.T.to(dev) + op.mean.to(dev)
+
+
+# ── Learnable whitening (SWBN) ─────────────────────────────────────────────────
+
+
+class SWBNWhiteningLayer(nn.Module):
+    """Learnable ZCA-whitening layer (SWBN; Zhang et al., CVPR 2021).
+
+    Owns the full whitening parameter tuple ``phi_i = (running_mean,
+    running_var, W, gamma, beta)`` for a single agent's ``d``-dimensional latent
+    space.  It is the parameterised whitening map ``g_{phi_i}`` of Section 5.2.
+
+    The key SWBN idea is to **decouple** the whitening matrix from the task
+    backward graph:
+
+    * ``W`` (the ZCA whitening matrix, initialised to ``I``) is updated *online*
+      in the forward pass by a single stochastic step on a whitening criterion,
+      fully **detached** from autograd — exactly as in SWBN.
+    * ``gamma`` / ``beta`` are ordinary leaf parameters trained by backprop.
+    * ``running_mean`` / ``running_var`` are EMA buffers used at inference,
+      analogously to BatchNorm.
+
+    Convention (row vectors, batch dimension first).  For input ``Z`` of shape
+    ``(K, d)``::
+
+        Z_s = (Z - mu) / sqrt(v + eps)      # standardise (batch stats in train)
+        Z_w = Z_s @ W.T                     # whiten   (W symmetric -> ZCA)
+        out = Z_w * gamma + beta            # affine rescale
+
+    During training ``mu`` / ``v`` are the per-feature batch statistics (and the
+    running buffers are updated from them); at inference the frozen running
+    statistics are used.  The paired :class:`SWBNColouringLayer` reads this
+    layer's ``phi_i`` and inverts these operations analytically, so it owns no
+    parameters of its own.
+    """
+
+    def __init__(
+        self,
+        d: int,
+        criterion: str = 'fro',
+        alpha: float = 1e-5,
+        momentum: float = 0.95,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        if criterion not in ('fro', 'kl'):
+            raise ValueError(
+                f"Unknown whitening criterion {criterion!r}; expected 'fro' or 'kl'."
+            )
+        self.d = int(d)
+        self.criterion = criterion
+        self.alpha = float(alpha)
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+
+        # Task parameters — trained by backprop.
+        self.gamma = nn.Parameter(torch.ones(d))
+        self.beta = nn.Parameter(torch.zeros(d))
+        # Whitening matrix + running statistics — updated outside autograd.
+        self.register_buffer('W', torch.eye(d))
+        self.register_buffer('running_mean', torch.zeros(d))
+        self.register_buffer('running_var', torch.ones(d))
+
+    @torch.no_grad()
+    def _update_W(self, Z_s: torch.Tensor) -> None:
+        """One detached stochastic step on the whitening criterion.
+
+        ``Z_s`` is the (detached) standardised batch.  Updates ``self.W`` in
+        place and re-symmetrises it (ZCA), all under ``no_grad`` so nothing
+        enters the task backward graph.
+        """
+        n = Z_s.shape[0]
+        Sigma = (Z_s.T @ Z_s) / max(n, 1)  # sample correlation, entries in [-1, 1]
+        eye = torch.eye(self.d, device=Z_s.device, dtype=Z_s.dtype)
+        WSWt = self.W @ Sigma @ self.W.T
+        residual = WSWt - eye
+        if self.criterion == 'kl':
+            dW = residual @ self.W
+        else:  # 'fro'
+            dW = (residual @ self.W @ Sigma) / residual.norm().clamp(min=self.eps)
+        W_new = self.W - self.alpha * dW
+        # Enforce symmetry (a ZCA whitening matrix is symmetric) and *reassign*
+        # the buffer rather than copy_ in place: the previous W tensor may be
+        # saved in an autograd graph from an earlier forward on this same layer
+        # in the same step (a node with >1 incident edge), and mutating it in
+        # place would trigger a version-counter error at backward.
+        self.W = 0.5 * (W_new + W_new.T)
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:  # Z: (K, d)
+        Z = Z.float()
+        if self.training and Z.shape[0] > 1:
+            mu = Z.mean(0)
+            v = Z.var(0, unbiased=True).clamp(min=0.0)
+            self.running_mean.mul_(self.momentum).add_(
+                (1.0 - self.momentum) * mu.detach()
+            )
+            self.running_var.mul_(self.momentum).add_(
+                (1.0 - self.momentum) * v.detach()
+            )
+        else:
+            mu, v = self.running_mean, self.running_var
+
+        Z_s = (Z - mu) / (v + self.eps).sqrt()  # standardise (differentiable)
+        if self.training and Z.shape[0] > 1:
+            # W is refined from the *detached* standardised batch; the task loss
+            # never sees this update (SWBN decoupling).
+            self._update_W(Z_s.detach())
+        # W is symmetric, so W.T == W; keep .T for an explicit right-multiply.
+        return Z_s @ self.W.T * self.gamma + self.beta
+
+
+class SWBNColouringLayer(nn.Module):
+    """Closed-form inverse (colouring map ``g*_{phi_i}``) of a whitening layer.
+
+    Owns **no parameters of its own**: it reads ``phi_i`` directly from the
+    paired :class:`SWBNWhiteningLayer` and inverts each whitening step
+    analytically, guaranteeing ``g*_{phi_i} ∘ g_{phi_i} = id`` whenever both use
+    the same statistics (exactly at inference; approximately during training,
+    where the forward pass standardises with batch statistics while colouring
+    uses the running statistics — the standard SWBN/BatchNorm trade-off).
+
+    The whitening layer is stored as a *non-registered* reference so its
+    parameters/buffers are not double-counted in this module's ``parameters()``
+    or ``state_dict()``.
+    """
+
+    def __init__(self, whitening_layer: SWBNWhiteningLayer):
+        super().__init__()
+        # Bypass nn.Module.__setattr__ so the shared whitening layer is NOT
+        # registered as a submodule here (it already lives on the orchestrator).
+        object.__setattr__(self, 'W_layer', whitening_layer)
+
+    def forward(self, Z: torch.Tensor) -> torch.Tensor:  # Z: (K, d)
+        wl: SWBNWhiteningLayer = self.W_layer
+        Z = Z.float()
+        # 1. invert affine rescale:  out = Z_w * gamma + beta  ->  Z_w = (out - beta) / gamma
+        Z = (Z - wl.beta) / wl.gamma
+        # 2. invert whitening:  Z_w = Z_s @ W.T  ->  Z_s = solve(W.T, Z_w.T).T
+        #    W is symmetric, so W.T == W; solve avoids forming W^{-1} explicitly.
+        W = wl.W.to(Z.dtype)
+        try:
+            Z = torch.linalg.solve(W.T, Z.T).T
+        except RuntimeError:
+            # Singular W (should not happen near identity): ridge-regularise.
+            ridge = wl.eps * torch.eye(wl.d, device=W.device, dtype=W.dtype)
+            Z = torch.linalg.solve(W.T + ridge, Z.T).T
+        # 3. invert standardisation:  Z_s = (z - mu) / sqrt(v + eps)
+        #    ->  z = Z_s * sqrt(v + eps) + mu        (running stats, as in SWBN)
+        return Z * (wl.running_var + wl.eps).sqrt() + wl.running_mean
 
 
 # ── Alignment ─────────────────────────────────────────────────────────────────
@@ -96,6 +267,32 @@ def fit_alignment(
     # A.T = gram^{-1} @ X_i.T @ X_j  →  A = X_j.T @ X_i @ gram^{-1}
     A = X_j.T @ X_i @ torch.linalg.inv(gram)
     return A.cpu()
+
+
+def fit_procrustes(
+    X_i: torch.Tensor,
+    X_j: torch.Tensor,
+) -> torch.Tensor:
+    """Learn orthogonal/semi-orthogonal V s.t. X_i @ V ≈ X_j (Procrustes).
+
+    Solves the orthogonal Procrustes problem via SVD of the cross-covariance:
+    V = U W^T where U, W come from SVD(X_i^T X_j).  When d_i ≠ d_j the map
+    is semi-orthogonal (V^T V = I).
+
+    Both X_i and X_j are (n, d) whitened pilot representations.
+
+    Returns V on CPU, shape (d_i, d_j).
+    """
+    X_i = X_i.float()
+    X_j = X_j.float()
+    C = X_i.T @ X_j
+    C = C + torch.randn_like(C) * 1e-6
+    try:
+        U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+    except RuntimeError:
+        C = C.cpu()
+        U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+    return (U @ W_T).cpu()
 
 
 # ── Latent extraction ─────────────────────────────────────────────────────────

@@ -36,6 +36,10 @@ class TransformerClassifier(PersonalizedClassifier):
         Number of self-attention heads (default: 4).
     mlp_ratio : float, optional
         Ratio of the FFN hidden dimension to ``embed_dim`` (default: 4.0).
+    pool : str, optional
+        Pooling strategy: ``'cls'`` (CLS token) or ``'mean'`` (average over
+        all patch tokens). ``'mean'`` is more robust with SGD and on small
+        datasets (default: ``'cls'``).
     decoder_hidden_dims : list[int], optional
         Hidden layer dimensions for the decoder MLP (default: [256]).
     dropout : float, optional
@@ -60,6 +64,7 @@ class TransformerClassifier(PersonalizedClassifier):
         depth: int = 4,
         num_heads: int = 4,
         mlp_ratio: float = 4.0,
+        pool: str = 'cls',
         decoder_hidden_dims: list[int] | None = None,
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
@@ -76,6 +81,7 @@ class TransformerClassifier(PersonalizedClassifier):
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
+            pool=pool,
         )
 
         super().__init__(

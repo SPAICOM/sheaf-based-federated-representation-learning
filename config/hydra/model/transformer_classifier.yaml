@@ -10,6 +10,7 @@ embed_dim: 128
 depth: 4
 num_heads: 4
 mlp_ratio: 4.0
+pool: cls             # 'cls' (CLS token) or 'mean' (avg patch tokens; better with SGD)
 
 # Decoder (MLP head)
 decoder_hidden_dims: [256]

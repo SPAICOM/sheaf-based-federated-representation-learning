@@ -14,5 +14,5 @@ test_split: 0.1
 pilot_split: 0.0
 pilot_num_samples: null
 comm_data: private_pilots
-seed: 42
+seed: ${seed}
 mode: min_size

@@ -56,6 +56,7 @@ class DPSGD(BaseOrchestrator):
             agents=agents,
             neighbors=neighbors,
             optimizer=optimizer,
+            **kwargs,
         )
 
         # Build a doubly-stochastic mixing matrix W via the
@@ -241,6 +242,17 @@ class DPSGD(BaseOrchestrator):
         )
 
         return outputs, total_loss
+
+
+    def send_message(
+        self,
+        sender_idx: int,
+        receiver_idx: int,
+        Z_sender: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f'{self.__class__.__name__} does not implement send_message.'
+        )
 
 
 if __name__ == '__main__':

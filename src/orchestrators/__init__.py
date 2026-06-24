@@ -5,6 +5,7 @@ This package provides orchestration classes that manage training across
 multiple federated learning agents:
 - FederatedLearning: Federated averaging with neighbor-restricted updates
 - FedPer: centralized shared-base training with personalized heads
+- LGFed: centralized shared-head training with personalized encoders (reverse of FedPer)
 - HeteroFL: heterogeneous-width federated learning (Diao et al., ICLR 2021)
 - DPSGD: decentralized parallel SGD with per-step model mixing
 - EpochEndDPSGD: decentralized SGD with the same mixing rule applied at epoch end
@@ -29,6 +30,7 @@ from .federated import FederatedLearning
 from .fedmuscle import FedMuscle
 from .fedper import FedPer
 from .fedproto import FedProto
+from .lgfed import LGFed
 from .heterofl import HeteroFL
 from .non_cooperative import NonCooperativeLearning
 
@@ -46,6 +48,7 @@ __all__ = [
     'FedMuscle',
     'FedPer',
     'FedProto',
+    'LGFed',
     'FederatedLearning',
     'HeteroFL',
     'NonCooperativeLearning',

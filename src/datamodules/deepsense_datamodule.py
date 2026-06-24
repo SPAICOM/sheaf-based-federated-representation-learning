@@ -352,6 +352,11 @@ class DeepSenseDataModule(l.LightningDataModule):
         self.test_split = test_split
         self.pilot_split = pilot_split
         self.pilot_num_samples = pilot_num_samples
+        _valid = ('private_pilots', 'shared_global_pilots', 'pairwise_pilots')
+        if comm_data not in _valid:
+            raise ValueError(
+                f"Unknown comm_data '{comm_data}'. Valid options: {_valid}"
+            )
         self.comm_data = comm_data
         self.starve_clients = starve_clients
         self.seed = seed

@@ -1,0 +1,17 @@
+_target_: src.agents.CNNAutoencoder
+
+in_features: null
+img_size: null        # injected from the datamodule (28 for MNIST, 32 for CIFAR)
+
+latent_dim: 64
+encoder_hidden_dims: [32, 64]
+
+dropout: 0.0
+weight_decay: 1e-2
+l1_reg: 0.0
+sparsity_type: l1     # one of: l1, sae-l1, l21
+
+activation:
+  _target_: torch.nn.ReLU
+
+use_batchnorm: true
