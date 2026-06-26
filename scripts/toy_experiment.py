@@ -45,7 +45,9 @@ from src.utils.graph_generator import generate_neighbors
 # ── Orchestrators that support max_lmb and/or comm_task_coeff ─────────────────
 ORCHESTRATORS_WITH_LMB = {
     'SheafFRL',
+    'SheafCFRL',
     'SheafFMTL',
+    'CESheafFRL',
     'ComFed',
     'FedProto',
     'FedMuscle',

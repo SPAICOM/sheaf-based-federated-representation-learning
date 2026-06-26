@@ -25,12 +25,6 @@ VALID_ANCHOR_STRATEGIES = {
 class AnchorConfig:
     """Configuration for anchor construction, communication and normalization."""
 
-    # strategy: str
-    # num_anchors: int
-    parseval_normalization: bool
-    l2_normalization: bool
-    parseval_eps: float = 1e-4
-    filter_unseen_classes: bool = False
     use_prototypes: bool = False
     sparse_communication: bool = False
     sparse_epsilon: float = 1e-5
@@ -148,13 +142,7 @@ def normalize_anchor_matrix(
     anchor_matrix: torch.Tensor,
     config: AnchorConfig,
 ) -> torch.Tensor:
-    """Apply the configured anchor normalization to a full anchor matrix."""
-    if config.parseval_normalization:
-        return parseval_normalize(
-            anchor_matrix, eps=float(config.parseval_eps)
-        )
-    if config.l2_normalization:
-        return l2_normalize(anchor_matrix)
+    """Kept for backward compatibility; whitening is handled upstream."""
     return anchor_matrix
 
 

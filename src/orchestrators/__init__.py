@@ -22,6 +22,8 @@ Each orchestrator:
 - Handles validation and testing across agents
 """
 
+# from .comm_efficient_frl import CommEfficientFRL
+from .ce_sheaf_frl import CESheafFRL
 from .comfed import ComFed
 from .dfedu import DFedU
 from .dpsgd import DPSGD
@@ -30,18 +32,18 @@ from .federated import FederatedLearning
 from .fedmuscle import FedMuscle
 from .fedper import FedPer
 from .fedproto import FedProto
-from .lgfed import LGFed
 from .heterofl import HeteroFL
+from .lgfed import LGFed
 from .non_cooperative import NonCooperativeLearning
-
-# from .comm_efficient_frl import CommEfficientFRL
 from .sheaf_align import SheafAlign
+from .sheaf_cfrl import SheafCFRL
 from .sheaf_fmtl import SheafFMTL
 from .sheaf_frl import SheafFRL
 
 __all__ = [
     'ComFed',
     'SheafAlign',
+    'CESheafFRL',
     'DFedU',
     'DPSGD',
     'EpochEndDPSGD',
@@ -52,6 +54,7 @@ __all__ = [
     'FederatedLearning',
     'HeteroFL',
     'NonCooperativeLearning',
+    'SheafCFRL',
     'SheafFMTL',
     'SheafFRL',
     'CommEfficientFRL',

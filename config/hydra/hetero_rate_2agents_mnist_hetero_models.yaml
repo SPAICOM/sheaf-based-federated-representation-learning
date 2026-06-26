@@ -9,11 +9,11 @@ seed: 42
 study_name: "HeteroRate MNIST 2 agents"
 
 lmb_study:
-  enabled: true        # set to true to run Optuna search before the full training run
-  n_trials: 30          # number of Optuna trials
+  enabled: true         # set to true to run Optuna search before the full training run
+  n_trials: 15          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
-  lmb_low: 1e-4       # lower bound of the log-uniform search interval
-  lmb_high: 1e-1 
+  lmb_low: 1e-4         # lower bound of the log-uniform search interval
+  lmb_high: 1
 
 graph:
   neighbors_mode: "fully_connected"
@@ -103,7 +103,9 @@ orchestrator:
   comm_task_coeff: 1
   use_general_maps: false
   soft_maps: false
-  align_on_intersection: True
+  align_on_intersection: false
+  phase_a_epochs: 1
+  phase_c_epochs: 2
   # Sheaf FMTL specific
   gamma: 0.001
   eta: 0.01
@@ -123,5 +125,6 @@ hydra:
       # orchestrator.max_lmb: 0.5, 5
       # orchestrator: sheaf_fmtl, sheaf_frl
       # dataset.shift_strength: 0.6, 0.8, 1.0
-      orchestrator.learn_whitening: true, false
+      # orchestrator.learn_whitening: true, false
+      orchestrator: sheaf_cfrl
 

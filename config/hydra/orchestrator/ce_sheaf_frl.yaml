@@ -1,4 +1,4 @@
-_target_: src.orchestrators.SheafFRL
+_target_: src.orchestrators.CESheafFRL
 
 max_lmb: 0.01
 lambda_schedule: cosine
@@ -8,7 +8,6 @@ sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
 num_anchors: 32
-#epoch_reencode_batch_size: 256
 local_steps: 1
 update_v_every_n_epochs: 1
 warmup_epochs: 0
@@ -18,13 +17,15 @@ use_prototypes: False
 comm_task_coeff: 0.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
 
-# SheafFRL exchanges pilots every step and optimises all losses together, refreshing
-# the alignment maps every `update_v_every_n_epochs`. For the decoupled three-phase
-# (communication-efficient) variant, use the CESheafFRL orchestrator instead.
+# ── Decoupled three-phase schedule (communication-efficient) ──────────────────
+# Each outer iteration: T_C Phase-C epochs (classical SheafFRL — exchange pilots
+# every step, all losses, refresh maps at every Phase-C epoch end), then T_A
+# Phase-A epochs (NO pilot exchange: each node reuses a frozen snapshot of its
+# neighbours' pilots as a fixed target; maps held fixed). Cycle = T_C + T_A.
+phase_c_epochs: 1   # T_C: classical SheafFRL epochs per outer iteration
+phase_a_epochs: 1   # T_A: communication-free (frozen-pilot) epochs per outer iteration
 
 # Information-theoretic PID logging (Liang et al. 2023).
-# Implemented in BaseOrchestrator → applies to *every* orchestrator that
-# forwards **kwargs to super().__init__.  Toggle pid_logging to enable.
 pid_logging: True
 pid_methods: ['cvxpy']   # ['cvxpy', 'batch'] or any subset.
 pid_pairs: neighbors     # 'neighbors' (graph edges) or 'all' (full clique).

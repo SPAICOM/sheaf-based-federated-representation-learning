@@ -9,7 +9,6 @@ neighboring agents accurately.
 """
 
 import warnings
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -28,7 +27,6 @@ from src.orchestrators.base_orchestrator import BaseOrchestrator
 from src.utils.anchors import (
     AnchorConfig,
     communication_anchor_payload,
-    normalize_anchor_matrix,
 )
 
 
@@ -42,9 +40,6 @@ class SheafFRL(BaseOrchestrator):
         optimizer,
         max_lmb: float,
         latent_dims: dict,
-        parseval_normalization: bool,
-        l2_normalization: bool,
-        parseval_eps: float = 1e-4,
         # local_steps: int = 1,
         anchor_strategy: str = 'pilots',
         num_anchors: int = 128,
@@ -95,9 +90,6 @@ class SheafFRL(BaseOrchestrator):
 
         self.save_hyperparameters()
         self.anchor_config = AnchorConfig(
-            parseval_normalization=bool(parseval_normalization),
-            l2_normalization=bool(l2_normalization),
-            parseval_eps=float(parseval_eps),
             use_prototypes=bool(use_prototypes),
             sparse_communication=bool(sparse_communication),
             sparse_epsilon=float(sparse_epsilon),
@@ -106,9 +98,38 @@ class SheafFRL(BaseOrchestrator):
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
         ] = {}
         self._whitening_ops: dict[int, WhiteningOp] = {}
-        self.stiefel_matrices = nn.ParameterDict()
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
+        self._build_restriction_maps(neighbors, latent_dims_int)
 
+        # ── Learnable (SWBN) whitening layers ─────────────────────────────────
+        # Each agent owns a learnable whitening layer g_{phi_i} and a paired
+        # colouring inverse g*_{phi_i}.  `_colouring_layers` is a plain dict
+        # (not ModuleDict) because SWBNColouringLayer owns no tensors — it reads
+        # phi_i from the paired whitening layer already registered in
+        # `self.whitening_layers`.
+        self.whitening_layers = nn.ModuleDict()
+        self._colouring_layers: dict[str, SWBNColouringLayer] = {}
+        if bool(learn_whitening):
+            for idx, d in latent_dims_int.items():
+                wl = SWBNWhiteningLayer(d)
+                self.whitening_layers[str(idx)] = wl
+                self._colouring_layers[str(idx)] = SWBNColouringLayer(wl)
+
+    def _build_restriction_maps(
+        self, neighbors: dict, latent_dims_int: dict[int, int]
+    ) -> None:
+        """Create one Stiefel restriction map per edge (truncated identity init).
+
+        Edge key ``'{node_i}_{node_j}'`` is oriented so ``d_node_i >= d_node_j``;
+        the map ``V`` has shape ``(d_i, d_j)`` and embeds node j's stalk into
+        node i's.  Overridden by :class:`SheafCFRL`, which instead builds two
+        fat semi-orthogonal maps per edge that project into a compressed edge
+        stalk.
+        """
+        self.stiefel_matrices = nn.ParameterDict()
+        learnable = bool(self.hparams.use_general_maps) and bool(
+            self.hparams.soft_maps
+        )
         for i_raw, neighborset in neighbors.items():
             for j_raw in neighborset:
                 i, j = int(i_raw), int(j_raw)
@@ -121,34 +142,12 @@ class SheafFRL(BaseOrchestrator):
                     node_i, node_j = max(i, j), min(i, j)
 
                 edge_key = f'{node_i}_{node_j}'
-
                 if edge_key not in self.stiefel_matrices:
                     d_i = latent_dims_int[node_i]
                     d_j = latent_dims_int[node_j]
-                    stiefel_matrix = torch.eye(d_i, d_j)
-                    learnable = bool(use_general_maps) and bool(soft_maps)
                     self.stiefel_matrices[edge_key] = nn.Parameter(
-                        stiefel_matrix, requires_grad=learnable
+                        torch.eye(d_i, d_j), requires_grad=learnable
                     )
-
-        # ── Learnable (SWBN) whitening layers ─────────────────────────────────
-        # When `learn_whitening` is on (and whitening is the active alignment
-        # normalisation, i.e. parseval/L2 are off), each agent owns a learnable
-        # SWBN whitening layer g_{phi_i} plus its closed-form colouring inverse
-        # g*_{phi_i}.  These replace the per-epoch buffer-and-fit `WhiteningOp`
-        # in `self._whitening_ops`.  The colouring layers own no parameters and
-        # simply read phi_i from the paired whitening layer (`_colouring_layers`
-        # is a plain dict so the shared layers are not double-registered).
-        whitening_active = bool(learn_whitening) and not (
-            bool(parseval_normalization) or bool(l2_normalization)
-        )
-        self.whitening_layers = nn.ModuleDict()
-        self._colouring_layers: dict[str, SWBNColouringLayer] = {}
-        if whitening_active:
-            for idx, d in latent_dims_int.items():
-                wl = SWBNWhiteningLayer(d)
-                self.whitening_layers[str(idx)] = wl
-                self._colouring_layers[str(idx)] = SWBNColouringLayer(wl)
 
     def _use_learnable_whitening(self) -> bool:
         """True when SWBN learnable whitening is the active normalisation.
@@ -173,6 +172,26 @@ class SheafFRL(BaseOrchestrator):
             return layer(Z)
         finally:
             layer.train(was_training)
+
+    def _whiten_node_pilots(self, idx: int, A: torch.Tensor) -> torch.Tensor:
+        """Whiten node ``idx``'s pilot latents **once** (independent of degree).
+
+        Whitening is row-wise, so it commutes with the per-edge row matching:
+        whitening up-front (one call per node) gives the same result as the old
+        per-edge whitening while updating the SWBN layer's ``W`` / running stats
+        only once per step regardless of how many neighbours node ``idx`` has.
+        """
+        if self._use_learnable_whitening():
+            return self.whitening_layers[str(idx)](A)
+        op = self._whitening_ops.get(idx)
+        return whiten(A, op) if op is not None else A
+
+    def _recolour_node(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Re-colour ``Z`` into node ``idx``'s native space (inverse of whitening)."""
+        if self._use_learnable_whitening():
+            return self._colouring_layers[str(idx)](Z)
+        op = self._whitening_ops.get(idx)
+        return color(Z, op) if op is not None else Z
 
     def _resolve_key(self, batch: dict, idx: int) -> int | str:
         str_key = str(idx)
@@ -213,9 +232,6 @@ class SheafFRL(BaseOrchestrator):
 
         raise ValueError(f'Pilot batch missing for agent {idx}.')
 
-    def _effective_anchor_config(self) -> AnchorConfig:
-        return replace(self.anchor_config)
-
     def _compute_class_prototypes(
         self,
         anchor_matrix: torch.Tensor,
@@ -246,25 +262,6 @@ class SheafFRL(BaseOrchestrator):
         if sample_ids is not None:
             return sample_ids
         return y_pilot
-
-    def _normalize_pilot_latents(
-        self,
-        pilot_latents: torch.Tensor,
-        y_pilot: torch.Tensor,
-        sample_ids: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.anchor_config.use_prototypes:
-            step_latents, step_keys = self._compute_class_prototypes(
-                pilot_latents,
-                y_pilot,
-            )
-        else:
-            step_latents = pilot_latents
-            step_keys = self._pilot_match_keys(y_pilot, sample_ids)
-
-        return normalize_anchor_matrix(
-            step_latents, self.anchor_config
-        ), step_keys
 
     @torch.no_grad()
     def _encode_pilots_eval(
@@ -304,6 +301,47 @@ class SheafFRL(BaseOrchestrator):
         return torch.cat(matched_i, dim=0), torch.cat(matched_j, dim=0)
 
     @torch.no_grad()
+    def _whiten_epoch_latents(
+        self,
+        latents_per_agent: dict[int, torch.Tensor],
+        whitening_ops: dict[int, WhiteningOp] | None,
+    ) -> tuple[dict[int, torch.Tensor], dict[int, WhiteningOp]]:
+        """Whiten each agent's epoch-accumulated pilots once for the Phase-B update.
+
+        SWBN layers are applied frozen (current phi_i, not re-estimated); closed-
+        form ZCA uses the supplied ops or fits on the spot when not supplied.
+        Returns whitened latents and any newly fitted ZCA ops (empty for SWBN).
+        """
+        use_learnable = self._use_learnable_whitening()
+        agent_normed: dict[int, torch.Tensor] = {}
+        fitted_ops: dict[int, WhiteningOp] = {}
+        for idx, A in latents_per_agent.items():
+            if use_learnable:
+                normed = self._whiten_pilots_frozen(idx, A).to(
+                    dtype=A.dtype, device=A.device
+                )
+            else:
+                op = (
+                    whitening_ops[idx]
+                    if (whitening_ops and idx in whitening_ops)
+                    else fit_whitening(A.float())
+                )
+                fitted_ops[idx] = op
+                normed = whiten(A, op).to(dtype=A.dtype, device=A.device)
+            if not torch.isfinite(normed).all():
+                warnings.warn(
+                    f"_whiten_epoch_latents: whitened latents for agent {idx} "
+                    f"contain non-finite values "
+                    f"({(~torch.isfinite(normed)).sum().item()} entries). "
+                    "Replacing with 0.0 — check for training instability.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                normed = torch.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0)
+            agent_normed[idx] = normed
+        return agent_normed, fitted_ops
+
+    @torch.no_grad()
     def _update_stiefel_matrices(
         self,
         latents_per_agent: dict[int, torch.Tensor],
@@ -328,46 +366,11 @@ class SheafFRL(BaseOrchestrator):
             return {}, {}
 
         edge_metrics: dict[str, float] = {}
-        fitted_ops: dict[int, WhiteningOp] = {}
         param_device = next(iter(self.stiefel_matrices.values())).device
 
-        use_learnable = self._use_learnable_whitening()
-        use_whitening = not (
-            self.anchor_config.parseval_normalization
-            or self.anchor_config.l2_normalization
+        agent_normed, fitted_ops = self._whiten_epoch_latents(
+            latents_per_agent, whitening_ops
         )
-        agent_normed: dict[int, torch.Tensor] = {}
-        for idx, A in latents_per_agent.items():
-            if use_learnable:
-                # Phase B applies the current phi_i (the W already refined online
-                # during Phase A); it is *not* re-estimated, so the layer is run
-                # frozen.  fitted_ops stays empty — send_message reads the layers.
-                normed = self._whiten_pilots_frozen(idx, A).to(
-                    dtype=A.dtype, device=A.device
-                )
-            elif use_whitening:
-                op = (
-                    whitening_ops[idx]
-                    if (whitening_ops and idx in whitening_ops)
-                    else fit_whitening(A.float())
-                )
-                fitted_ops[idx] = op
-                normed = whiten(A, op).to(dtype=A.dtype, device=A.device)
-            else:
-                agent_normed[idx] = A
-                continue
-            if not torch.isfinite(normed).all():
-                import warnings
-                warnings.warn(
-                    f"_update_stiefel_matrices: whitened latents for agent {idx} "
-                    f"contain non-finite values "
-                    f"({(~torch.isfinite(normed)).sum().item()} entries). "
-                    "Replacing with 0.0 — check for training instability.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                normed = torch.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0)
-            agent_normed[idx] = normed
 
         for edge_key, V_param in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
@@ -530,6 +533,28 @@ class SheafFRL(BaseOrchestrator):
             torch.cat(y_j_m, dim=0),
         )
 
+    def _match_edge(
+        self,
+        node_i: int,
+        node_j: int,
+        src_i: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        src_j: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Class-filter + key-match two pilot sources for edge (node_i, node_j).
+
+        Each source is ``(A, keys, labels)``.  Returns ``(Z_i, y_i, Z_j, y_j)`` for
+        the matched rows, or ``None``.  Used for both the live/live penalty and the
+        live/frozen (Phase-A) penalty, so one source may be a frozen snapshot.
+        """
+        A_i, k_i, l_i = src_i
+        A_j, k_j, l_j = src_j
+        A_i_f, k_i_f, l_i_f, A_j_f, k_j_f, l_j_f = self._apply_edge_class_filter(
+            node_i, node_j, A_i, k_i, l_i, A_j, k_j, l_j
+        )
+        return self._match_pilots_with_labels(
+            A_i_f, k_i_f, l_i_f, A_j_f, k_j_f, l_j_f
+        )
+
     def on_train_start(self) -> None:
         super().on_train_start()
         self._latest_pilots.clear()
@@ -549,22 +574,21 @@ class SheafFRL(BaseOrchestrator):
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
-        if self.current_epoch < self.hparams.warmup_epochs:
+        # Whether to refresh the whitening ops + Stiefel maps at this epoch end.
+        # Hook: SheafFRL refreshes every `update_v_every_n_epochs` after warmup;
+        # CESheafFRL refreshes only on Phase-C epochs.
+        do_update = self._should_update_maps_at_epoch_end()
+
+        if not do_update:
+            self._on_maps_refreshed(False)
             self._latest_pilots.clear()
             self._pilot_latent_buffer = {}
             self._task_latent_buffer = {}
             self._finalize_train_epoch_communication()
             return
 
-        if self.current_epoch % self.hparams.update_v_every_n_epochs != 0:
-            self._latest_pilots.clear()
-            self._task_latent_buffer = {}
-            self._finalize_train_epoch_communication()
-            return
-
         epoch_latents: dict[int, torch.Tensor] = {}
         epoch_keys: dict[int, torch.Tensor] = {}
-        payloads_per_agent: dict[int, Any] = {}
 
         for idx, buf in self._pilot_latent_buffer.items():
             if not buf:
@@ -587,35 +611,12 @@ class SheafFRL(BaseOrchestrator):
 
             epoch_latents[idx] = final_A
             epoch_keys[idx] = final_keys
-            payloads_per_agent[idx] = communication_anchor_payload(
-                anchor_matrix=final_A,
-                labels=final_keys,
-                config=self.anchor_config,
-            )
 
         if epoch_latents:
-            self._record_communication_round(n_rounds=1, prefix='train')
-            for idx, payload in payloads_per_agent.items():
-                n_neighbors = len(
-                    self.hparams.neighbors.get(
-                        idx,
-                        self.hparams.neighbors.get(str(idx), set()),
-                    )
-                )
-                if n_neighbors > 0:
-                    self._record_communication(
-                        payload,
-                        n_transmissions=n_neighbors,
-                        prefix='train',
-                    )
-            use_whitening = not (
-                self.anchor_config.parseval_normalization
-                or self.anchor_config.l2_normalization
-            )
             train_whitening_ops: dict[int, WhiteningOp] = {}
             # With learnable SWBN whitening, phi_i lives in the persistent layers
             # (updated online during the epoch); the buffer-and-fit ops are unused.
-            if use_whitening and not self._use_learnable_whitening():
+            if not self._use_learnable_whitening():
                 for idx, chunks in self._task_latent_buffer.items():
                     if chunks:
                         train_whitening_ops[idx] = fit_whitening(
@@ -642,13 +643,150 @@ class SheafFRL(BaseOrchestrator):
                     add_dataloader_idx=False,
                 )
 
+        # Hook (no-op in SheafFRL): CESheafFRL snapshots frozen neighbour pilots
+        # here, after the maps + whitening ops have been refreshed and while
+        # _latest_pilots is still available.
+        self._on_maps_refreshed(True)
+
         self._latest_pilots.clear()
         self._pilot_latent_buffer = {}
         self._task_latent_buffer = {}
         self._finalize_train_epoch_communication()
 
+    # ── Epoch/communication hooks (overridden by CESheafFRL) ──────────────────
+
+    def _should_update_maps_at_epoch_end(self) -> bool:
+        """Refresh maps every ``update_v_every_n_epochs`` epochs, after warmup."""
+        return (
+            self.current_epoch >= self.hparams.warmup_epochs
+            and self.current_epoch % self.hparams.update_v_every_n_epochs == 0
+        )
+
+    def _on_maps_refreshed(self, did_update: bool) -> None:
+        """Called at every epoch end (no-op here; CESheafFRL snapshots pilots)."""
+
+    def _exchanges_pilots(self, prefix: str) -> bool:
+        """Whether pilots are exchanged (and the round recorded) this step.
+
+        Always ``True`` for SheafFRL; CESheafFRL returns ``False`` during Phase A,
+        where each node reuses frozen neighbour snapshots instead of communicating.
+        """
+        return True
+
+    def _on_pilots_whitened(
+        self,
+        whitened_per_agent: dict[int, torch.Tensor],
+        keys_per_agent: dict[int, torch.Tensor],
+        labels_per_agent: dict[int, torch.Tensor],
+        prefix: str,
+    ) -> None:
+        """Called each step after the per-node whitening (no-op in SheafFRL).
+
+        CESheafFRL uses it to cache the neighbours' whitened pilots received
+        during the last Phase-C epoch, keyed by sample-id, so the whole pilot
+        pool is available as a fixed target throughout the next Phase-A block.
+        """
+
     def on_validation_epoch_end(self) -> None:
         super().on_validation_epoch_end()
+
+    def _compute_alignment_losses(
+        self,
+        whitened_per_agent: dict[int, torch.Tensor],
+        keys_per_agent: dict[int, torch.Tensor],
+        labels_per_agent: dict[int, torch.Tensor],
+        comm_weight: float,
+        skip: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-step entry point for the alignment losses (both-live).
+
+        SheafFRL evaluates the both-live penalty every step; :class:`CESheafFRL`
+        overrides this to phase-dispatch (Phase A → frozen coboundary, else
+        both-live).  The geometry lives in ``_both_live_alignment_losses`` /
+        ``_frozen_alignment_losses`` so subclasses can swap it (e.g. SheafCFRL's
+        compressed coboundary) without re-implementing the schedule.
+        """
+        return self._both_live_alignment_losses(
+            whitened_per_agent, keys_per_agent, labels_per_agent, comm_weight, skip
+        )
+
+    def _both_live_alignment_losses(
+        self,
+        whitened_per_agent: dict[int, torch.Tensor],
+        keys_per_agent: dict[int, torch.Tensor],
+        labels_per_agent: dict[int, torch.Tensor],
+        comm_weight: float,
+        skip: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both-live sheaf penalty + after-comm over all edges (embedding maps).
+
+        One Stiefel map per edge, embedding coboundary ``z_i V − z_j``; both
+        endpoints live.  :class:`SheafCFRL` overrides this with the compressed
+        two-map coboundary.  ``comm_weight > 0`` enables the after-comm term.
+        """
+        sheaf_penalty = torch.tensor(0.0, device=self.device)
+        after_comm_task_loss = torch.tensor(0.0, device=self.device)
+        if skip:
+            return sheaf_penalty, after_comm_task_loss
+
+        for edge_key, V in self.stiefel_matrices.items():
+            node_i, node_j = map(int, edge_key.split('_'))
+            if (
+                node_i not in whitened_per_agent
+                or node_j not in whitened_per_agent
+            ):
+                continue
+
+            src_i = (
+                whitened_per_agent[node_i], keys_per_agent[node_i], labels_per_agent[node_i]
+            )
+            src_j = (
+                whitened_per_agent[node_j], keys_per_agent[node_j], labels_per_agent[node_j]
+            )
+            matched = self._match_edge(node_i, node_j, src_i, src_j)
+            if matched is None:
+                continue
+
+            # Rows are already whitened (whitening was applied per node upstream).
+            Z_i, y_i_shared, Z_j, y_j_shared = matched
+            diff = torch.matmul(Z_i, V) - Z_j
+            sheaf_penalty += (diff**2).sum(dim=1).mean()
+
+            # ── After-communication task loss ─────────────────────────────────
+            # • j→i: align Z_j into node_i's space, decode with agent_i's decoder,
+            #         compute task loss against node_j's pilot labels.
+            # • i→j: align Z_i into node_j's space, decode with agent_j's decoder,
+            #         compute task loss against node_i's pilot labels.
+            if comm_weight > 0.0:
+                agent_i = self.agents[str(node_i)] if str(node_i) in self.agents else None
+                agent_j = self.agents[str(node_j)] if str(node_j) in self.agents else None
+                _is_clf = lambda a: getattr(a, 'task_type', 'classification') == 'classification'
+
+                # Inverse map: for Stiefel (semi-orthogonal cols) V.T; general → pinv(V).
+                if self.hparams.use_general_maps:
+                    V_inv = torch.linalg.pinv(V.float())
+                else:
+                    V_inv = V.float().T
+
+                # j → i direction
+                if agent_i is not None and _is_clf(agent_i):
+                    Z_j_to_i = torch.matmul(Z_j.float(), V_inv)
+                    Z_j_to_i = self._recolour_node(node_i, Z_j_to_i)
+                    logits_ji = agent_i.decoder(Z_j_to_i.to(dtype=Z_i.dtype))
+                    after_comm_task_loss += agent_i.compute_loss(
+                        logits_ji, y_j_shared.to(self.device)
+                    )
+
+                # i → j direction
+                if agent_j is not None and _is_clf(agent_j):
+                    Z_i_to_j = torch.matmul(Z_i.float(), V.float())
+                    Z_i_to_j = self._recolour_node(node_j, Z_i_to_j)
+                    logits_ij = agent_j.decoder(Z_i_to_j.to(dtype=Z_j.dtype))
+                    after_comm_task_loss += agent_j.compute_loss(
+                        logits_ij, y_i_shared.to(self.device)
+                    )
+
+        return sheaf_penalty, after_comm_task_loss
 
     def _shared_eval(
         self,
@@ -669,14 +807,6 @@ class SheafFRL(BaseOrchestrator):
         # labels regardless of whether keys_per_agent carries sample IDs.
         labels_per_agent: dict[int, torch.Tensor] = {}
 
-        # Parseval/L2 and ZCA whitening are mutually exclusive strategies.
-        # When use_whitening=True, whitening ops are taken from self._whitening_ops
-        # (fitted on the full accumulated pilot buffer at the end of the previous
-        # epoch) — never fitted on the current mini-batch.
-        use_whitening = not (
-            self.anchor_config.parseval_normalization
-            or self.anchor_config.l2_normalization
-        )
         pilots_available = True
 
         for idx_str, agent in self.agents.items():
@@ -722,34 +852,31 @@ class SheafFRL(BaseOrchestrator):
                                 add_dataloader_idx=False,
                             )
 
-                    if use_whitening:
-                        # Raw latents — whitening is applied below using ops from
-                        # the previous epoch (self._whitening_ops).
-                        step_latents = pilot_latents
-                        step_keys = self._pilot_match_keys(y_pilot, sample_ids)
-                    else:
-                        step_latents, step_keys = self._normalize_pilot_latents(
-                            pilot_latents, y_pilot, sample_ids
-                        )
-
-                    latents_per_agent[idx] = step_latents
-                    keys_per_agent[idx] = step_keys
+                    # Raw latents — whitening is applied below using ops from
+                    # the previous epoch (self._whitening_ops).
+                    latents_per_agent[idx] = pilot_latents
+                    keys_per_agent[idx] = self._pilot_match_keys(y_pilot, sample_ids)
                     # Track class labels separately: for prototype mode step_keys
                     # are already class labels aligned with prototypes; otherwise
                     # y_pilot gives per-sample class labels (keys may be sample IDs).
                     if self.anchor_config.use_prototypes:
-                        labels_per_agent[idx] = step_keys
+                        labels_per_agent[idx] = keys_per_agent[idx]
                     else:
                         labels_per_agent[idx] = y_pilot
                     payloads_per_agent[idx] = communication_anchor_payload(
-                        anchor_matrix=step_latents,
-                        labels=step_keys,
+                        anchor_matrix=latents_per_agent[idx],
+                        labels=keys_per_agent[idx],
                         config=self.anchor_config,
                     )
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
 
-        if pilots_available and prefix in self._COMMUNICATION_SPLITS and prefix != 'test_monitor':
+        if (
+            pilots_available
+            and prefix in self._COMMUNICATION_SPLITS
+            and prefix != 'test_monitor'
+            and self._exchanges_pilots(prefix)
+        ):
             self._record_communication_round(n_rounds=1, prefix=prefix)
             for idx, payload in payloads_per_agent.items():
                 n_neighbors = len(
@@ -765,100 +892,37 @@ class SheafFRL(BaseOrchestrator):
                         prefix=prefix,
                     )
 
-        sheaf_penalty = torch.tensor(0.0, device=self.device)
-        after_comm_task_loss = torch.tensor(0.0, device=self.device)
-        comm_task_coeff = float(getattr(self.hparams, 'comm_task_coeff', 0.0))
+        comm_weight = float(getattr(self.hparams, 'comm_task_coeff', 0.0))
+
+        # Whiten every node's pilots ONCE, before the per-edge loop, so a node's
+        # SWBN layer (and its W / running-stat online update) runs a single time
+        # per step regardless of its degree.  Row-wise whitening commutes with
+        # the per-edge row matching, so the matched rows are pre-whitened.
+        whitened_per_agent: dict[int, torch.Tensor] = {
+            idx: self._whiten_node_pilots(idx, A)
+            for idx, A in latents_per_agent.items()
+        }
+        self._on_pilots_whitened(
+            whitened_per_agent, keys_per_agent, labels_per_agent, prefix
+        )
 
         in_warmup = self.current_epoch < self.hparams.warmup_epochs
-        for edge_key, V in (self.stiefel_matrices.items() if not in_warmup else []):
-            node_i, node_j = map(int, edge_key.split('_'))
-
-            if (
-                node_i not in latents_per_agent
-                or node_j not in latents_per_agent
-            ):
-                continue
-
-            A_i_f, keys_i_f, labels_i_f, A_j_f, keys_j_f, labels_j_f = (
-                self._apply_edge_class_filter(
-                    node_i, node_j,
-                    latents_per_agent[node_i], keys_per_agent[node_i], labels_per_agent[node_i],
-                    latents_per_agent[node_j], keys_per_agent[node_j], labels_per_agent[node_j],
-                )
-            )
-            matched = self._match_pilots_with_labels(
-                A_i_f, keys_i_f, labels_i_f,
-                A_j_f, keys_j_f, labels_j_f,
-            )
-            if matched is None:
-                continue
-
-            A_i_shared, y_i_shared, A_j_shared, y_j_shared = matched
-            op_i = self._whitening_ops.get(node_i)
-            op_j = self._whitening_ops.get(node_j)
-            if self._use_learnable_whitening():
-                # g_{phi_i}: the SWBN layer refines W online in train mode and is
-                # frozen in eval mode (validation/test); the encoder + gamma/beta
-                # still receive gradients from the sheaf penalty below.
-                Z_i = self.whitening_layers[str(node_i)](A_i_shared)
-                Z_j = self.whitening_layers[str(node_j)](A_j_shared)
-            elif use_whitening and op_i is not None and op_j is not None:
-                Z_i = whiten(A_i_shared, op_i)
-                Z_j = whiten(A_j_shared, op_j)
-            else:
-                Z_i, Z_j = A_i_shared, A_j_shared
-            diff = torch.matmul(Z_i, V) - Z_j
-            sheaf_penalty += (diff**2).sum(dim=1).mean()
-
-            # ── After-communication task loss ─────────────────────────────────
-            # Compute a differentiable communication loss on pilot samples:
-            # • j→i: align Z_j into node_i's space, decode with agent_i's decoder,
-            #         compute task loss against node_j's pilot labels.
-            # • i→j: align Z_i into node_j's space, decode with agent_j's decoder,
-            #         compute task loss against node_i's pilot labels.
-            if comm_task_coeff > 0.0:
-                agent_i = self.agents[str(node_i)] if str(node_i) in self.agents else None
-                agent_j = self.agents[str(node_j)] if str(node_j) in self.agents else None
-                _is_clf = lambda a: getattr(a, 'task_type', 'classification') == 'classification'
-
-                # Inverse map: for Stiefel (semi-orthogonal cols) V.T; for general pinv(V).
-                if self.hparams.use_general_maps:
-                    V_inv = torch.linalg.pinv(V.float())
-                else:
-                    V_inv = V.float().T
-
-                # j → i direction
-                if agent_i is not None and _is_clf(agent_i):
-                    Z_j_to_i = torch.matmul(Z_j.float(), V_inv)
-                    if self._use_learnable_whitening():
-                        Z_j_to_i = self._colouring_layers[str(node_i)](Z_j_to_i)
-                    elif use_whitening and op_i is not None:
-                        Z_j_to_i = color(Z_j_to_i, op_i)
-                    logits_ji = agent_i.decoder(Z_j_to_i.to(dtype=A_i_shared.dtype))
-                    after_comm_task_loss += agent_i.compute_loss(
-                        logits_ji, y_j_shared.to(self.device)
-                    )
-
-                # i → j direction
-                if agent_j is not None and _is_clf(agent_j):
-                    Z_i_to_j = torch.matmul(Z_i.float(), V.float())
-                    if self._use_learnable_whitening():
-                        Z_i_to_j = self._colouring_layers[str(node_j)](Z_i_to_j)
-                    elif use_whitening and op_j is not None:
-                        Z_i_to_j = color(Z_i_to_j, op_j)
-                    logits_ij = agent_j.decoder(Z_i_to_j.to(dtype=A_j_shared.dtype))
-                    after_comm_task_loss += agent_j.compute_loss(
-                        logits_ij, y_i_shared.to(self.device)
-                    )
+        sheaf_penalty, after_comm_task_loss = self._compute_alignment_losses(
+            whitened_per_agent,
+            keys_per_agent,
+            labels_per_agent,
+            comm_weight=comm_weight,
+            skip=in_warmup,
+        )
 
         total_loss = (
             total_task_loss
             + self._effective_lambda_reg() * sheaf_penalty
-            + comm_task_coeff * after_comm_task_loss
+            + comm_weight * after_comm_task_loss
         )
 
         extra: dict[str, Any] = {f'{prefix}/sheaf_penalty': sheaf_penalty}
-        if comm_task_coeff > 0.0:
+        if comm_weight > 0.0:
             extra[f'{prefix}/after_comm_task_loss'] = after_comm_task_loss
 
         self._log_shared_metrics(

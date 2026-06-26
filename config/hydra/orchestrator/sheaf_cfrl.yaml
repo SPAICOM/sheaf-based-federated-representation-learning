@@ -1,0 +1,48 @@
+_target_: src.orchestrators.SheafCFRL
+
+max_lmb: 0.01
+lambda_schedule: cosine
+anchor_strategy: pilots
+learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
+sparse_communication: False
+sparse_epsilon: 1e-2
+log_latent_diagnostics: True
+num_anchors: 32
+local_steps: 1
+update_v_every_n_epochs: 1
+warmup_epochs: 0
+neighbors: {}
+filter_unseen_classes: False
+use_prototypes: False
+comm_task_coeff: 0.0  # weight for the after-communication task loss (mu; 0 = disabled)
+align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
+
+# ── Semantic compression (Section 9) ──────────────────────────────────────────
+# Each edge owns two fat semi-orthogonal maps projecting both stalks into a shared
+# c-dimensional edge stalk (c < min(d_i, d_j)). Phase B refits them by SOC-ADMM,
+# minimising a β-weighted blend of semantic misalignment and communication loss.
+compression_dim: 4              # c_ij: shared edge-stalk dimension (per edge, clamped to < min d)
+compression_inner_steps: 20     # T_B: SOC-ADMM iterations per edge in Phase B (spec: 10–30)
+compression_init: pca           # 'pca' (recommended) or 'truncated_identity'
+compression_beta: 0.5           # β ∈ [0,1): semantic-misalignment ↔ communication-loss trade-off
+compression_admm_alpha: 5.0     # α > 0: ADMM penalty on the Stiefel splitting constraint (≥5 → tight primal)
+
+# ── Decoupled three-phase schedule (communication-efficient; inherited from CESheafFRL) ─
+# Each outer iteration: T_C Phase-C epochs (compressed coboundary every step, maps
+# refreshed via SOC-ADMM at each Phase-C epoch end), then T_A Phase-A
+# epochs (NO pilot exchange: frozen neighbour pilots cached over the last Phase-C
+# epoch, maps held fixed). Cycle = T_C + T_A.
+phase_c_epochs: 1   # T_C: per-step (classical compressed) epochs per outer iteration
+phase_a_epochs: 1   # T_A: communication-free (frozen-pilot) epochs per outer iteration
+
+# Information-theoretic PID logging (Liang et al. 2023).
+pid_logging: True
+pid_methods: ['cvxpy']   # ['cvxpy', 'batch'] or any subset.
+pid_pairs: neighbors     # 'neighbors' (graph edges) or 'all' (full clique).
+pid_num_clusters: 10     # K-Means clusters per view (CVX method).
+pid_max_samples: 4000    # Down-sample the training set for the CVX path.
+pid_discrim_epochs: 40   # Neural-PID discriminator epochs.
+pid_align_epochs: 10     # Neural-PID alignment epochs.
+pid_batch_size: 256      # Neural-PID mini-batch size.
+pid_hidden_dim: 32
+pid_embed_dim: 10
