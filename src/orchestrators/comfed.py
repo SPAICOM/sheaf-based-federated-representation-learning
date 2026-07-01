@@ -16,17 +16,25 @@ class ComFed(BaseOrchestrator):
     """CoMFed: per-agent projection matrices align class prototypes in a shared latent space.
 
     Each agent i owns Pi ∈ R^{proj_dim × d_i} that maps local features to a common
-    d-dimensional space. Training alternates between two steps per batch:
+    d-dimensional space. Following the paper (eq. 7), the encoder weights wi and the
+    projection matrices Pi are learned *concurrently* by minimizing a single joint
+    objective, taking one gradient step on each per batch:
 
-      1. wi-step  — minimize  L_task(wi) + λ · L_align(wi; Pi fixed)
-      2. Pi-step  — minimize  L_align(Pi; wi fixed)  ×  proj_steps times
+      - wi via eq. (8):  ∇_wi [ L_task(wi) + λ · L_align(wi, Pi) ]
+      - Pi via eq. (9):  ∇_Pi [ λ · L_align(wi, Pi) ]   (single step — not a subproblem)
+
+    The task loss does not depend on Pi, so both gradients come from one backward pass
+    over total_loss; we then step the two optimizers together. This mirrors the paper's
+    deliberate choice of a single concurrent projection step rather than solving Pi to
+    convergence in an inner loop.
 
     Alignment loss for agent i (squared Frobenius / L2 consensus from the paper):
 
         L_align_i = Σ_m  ‖Pi v̄_{i,m}  −  mean_{j∈N_i}(Pj v̄_{j,m})‖²_F
 
     where v̄_{i,m} is the class-m conditional mean of agent i's encoder output.
-    Neighbor projected means are treated as fixed targets (detached) during both steps.
+    Neighbor projected means are treated as fixed targets (detached), matching the
+    "neighbor reps treated as constants" convention of eqs. (8)-(9).
 
     Communication payload per round: one proj_dim-dimensional vector per class per agent.
 
@@ -42,8 +50,6 @@ class ComFed(BaseOrchestrator):
         Mapping from agent index to local encoder output dimension d_i.
     proj_dim : int
         Shared latent space dimension d.
-    proj_steps : int
-        Number of Pi gradient steps per training batch (paper uses 10).
     lambda_schedule : str or None
         Scheduling strategy: None (constant), 'cosine', or 'exp'.
     """
@@ -56,7 +62,6 @@ class ComFed(BaseOrchestrator):
         max_lmb: float,
         latent_dims: dict,
         proj_dim: int,
-        proj_steps: int = 10,
         lambda_schedule: str | None = None,
         **kwargs,
     ):
@@ -165,31 +170,7 @@ class ComFed(BaseOrchestrator):
         return loss / max(n_terms, 1)
 
     # ------------------------------------------------------------------
-    # Pi gradient step: encoder weights frozen, only Pi receives gradient
-    # ------------------------------------------------------------------
-
-    def _proj_loss(self, batch: dict) -> torch.Tensor:
-        """Recompute projected class means with frozen encoder; gradient flows to Pi only."""
-        class_means_per_agent: dict[int, dict[int, torch.Tensor]] = {}
-
-        with torch.no_grad():
-            for idx_str, agent in self.agents.items():
-                idx = int(idx_str)
-                key = str(idx) if str(idx) in batch else idx
-                x, y = batch[key]
-                z = agent.encode(x)
-                class_means_per_agent[idx] = self._compute_class_means(z, y)
-
-        proj_means = {
-            idx: self._project_class_means(
-                class_means, self.projection_matrices[str(idx)]
-            )
-            for idx, class_means in class_means_per_agent.items()
-        }
-        return self._alignment_loss(proj_means)
-
-    # ------------------------------------------------------------------
-    # Training step: alternating wi / Pi updates
+    # Training step: single concurrent wi + Pi update (paper eqs. 7-9)
     # ------------------------------------------------------------------
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
@@ -198,22 +179,23 @@ class ComFed(BaseOrchestrator):
         if isinstance(batch, tuple):
             batch = batch[0]
 
-        # Step 1 — wi update (task loss + alignment loss; Pi untouched by model_opt)
+        # One backward over the joint objective (eq. 7) yields both gradients:
+        # ∇_wi (task + λ·align) → eq. (8) and ∇_Pi (λ·align) → eq. (9), since the
+        # task loss does not depend on Pi and neighbour targets are detached. We
+        # then step both optimizers so wi and Pi advance concurrently.
         model_opt.zero_grad()
         proj_opt.zero_grad()
         outputs, total_loss = self._shared_eval(batch, batch_idx, 'train')
         self.manual_backward(total_loss)
+        # Manual gradient clipping: Lightning's automatic clipping is unavailable
+        # under manual optimization, so clip both parameter groups here (mirrors
+        # the trainer's gradient_clip_val intent).
+        torch.nn.utils.clip_grad_norm_(self.agents.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            self.projection_matrices.parameters(), max_norm=1.0
+        )
         model_opt.step()
-
-        # Step 2 — Pi update (alignment loss only, encoder weights frozen)
-        for _ in range(self.hparams.proj_steps):
-            proj_opt.zero_grad()
-            proj_loss = self._proj_loss(batch)
-            self.manual_backward(proj_loss)
-            torch.nn.utils.clip_grad_norm_(
-                self.projection_matrices.parameters(), max_norm=1.0
-            )
-            proj_opt.step()
+        proj_opt.step()
 
         self.log(
             'train/total_loss_step',

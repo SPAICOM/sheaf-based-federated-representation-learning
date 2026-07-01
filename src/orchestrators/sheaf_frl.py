@@ -673,6 +673,33 @@ class SheafFRL(BaseOrchestrator):
         """
         return True
 
+    def _record_pilot_exchange(
+        self,
+        payloads_per_agent: dict[int, Any],
+        latents_per_agent: dict[int, torch.Tensor],
+        prefix: str,
+    ) -> None:
+        """Record one pilot exchange: 1 round + per-agent payload to all neighbours.
+
+        Each agent broadcasts its full d_i-dimensional pilot payload to every
+        neighbour.  SheafCFRL overrides this to record the compressed c_ij-dim
+        payload instead.
+        """
+        self._record_communication_round(n_rounds=1, prefix=prefix)
+        for idx, payload in payloads_per_agent.items():
+            n_neighbors = len(
+                self.hparams.neighbors.get(
+                    idx,
+                    self.hparams.neighbors.get(str(idx), set()),
+                )
+            )
+            if n_neighbors > 0:
+                self._record_communication(
+                    payload,
+                    n_transmissions=n_neighbors,
+                    prefix=prefix,
+                )
+
     def _on_pilots_whitened(
         self,
         whitened_per_agent: dict[int, torch.Tensor],
@@ -877,20 +904,7 @@ class SheafFRL(BaseOrchestrator):
             and prefix != 'test_monitor'
             and self._exchanges_pilots(prefix)
         ):
-            self._record_communication_round(n_rounds=1, prefix=prefix)
-            for idx, payload in payloads_per_agent.items():
-                n_neighbors = len(
-                    self.hparams.neighbors.get(
-                        idx,
-                        self.hparams.neighbors.get(str(idx), set()),
-                    )
-                )
-                if n_neighbors > 0:
-                    self._record_communication(
-                        payload,
-                        n_transmissions=n_neighbors,
-                        prefix=prefix,
-                    )
+            self._record_pilot_exchange(payloads_per_agent, latents_per_agent, prefix)
 
         comm_weight = float(getattr(self.hparams, 'comm_task_coeff', 0.0))
 

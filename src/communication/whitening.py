@@ -10,6 +10,7 @@ Post-hoc alignment pipeline (non-cooperative setting):
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -51,7 +52,6 @@ def fit_whitening(Z: torch.Tensor, eps: float = 1e-2) -> WhiteningOp:
     # Sanitize non-finite values that can arise from training instability so
     # that SVD (both GPU and CPU fallback) never receives a corrupt matrix.
     if not torch.isfinite(Z).all():
-        import warnings
         warnings.warn(
             f"fit_whitening: input Z contains non-finite values "
             f"({(~torch.isfinite(Z)).sum().item()} entries). "
@@ -178,10 +178,29 @@ class SWBNWhiteningLayer(nn.Module):
         # saved in an autograd graph from an earlier forward on this same layer
         # in the same step (a node with >1 incident edge), and mutating it in
         # place would trigger a version-counter error at backward.
-        self.W = 0.5 * (W_new + W_new.T)
+        W_sym = 0.5 * (W_new + W_new.T)
+        # Never commit a non-finite update: the W buffer persists across steps,
+        # so a single corrupted update would break all future whitening/colouring.
+        # Keep the last good W instead (the standardised batch was already
+        # sanitized in `forward`, so this is a final safety net).
+        if torch.isfinite(W_sym).all():
+            self.W = W_sym
 
     def forward(self, Z: torch.Tensor) -> torch.Tensor:  # Z: (K, d)
         Z = Z.float()
+        # Sanitize non-finite latents *before* they touch the running stats or
+        # the detached W update.  W is a persistent buffer carried across steps,
+        # so a single Inf/NaN here would poison it permanently and break every
+        # subsequent colouring solve.  Mirrors the guard in `fit_whitening`.
+        if not torch.isfinite(Z).all():
+            warnings.warn(
+                f"SWBNWhiteningLayer: input contains "
+                f"{(~torch.isfinite(Z)).sum().item()} non-finite entries; "
+                "replacing with 0.0 — check for training instability.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            Z = torch.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
         if self.training and Z.shape[0] > 1:
             mu = Z.mean(0)
             v = Z.var(0, unbiased=True).clamp(min=0.0)
@@ -232,12 +251,28 @@ class SWBNColouringLayer(nn.Module):
         # 2. invert whitening:  Z_w = Z_s @ W.T  ->  Z_s = solve(W.T, Z_w.T).T
         #    W is symmetric, so W.T == W; solve avoids forming W^{-1} explicitly.
         W = wl.W.to(Z.dtype)
-        try:
-            Z = torch.linalg.solve(W.T, Z.T).T
-        except RuntimeError:
-            # Singular W (should not happen near identity): ridge-regularise.
-            ridge = wl.eps * torch.eye(wl.d, device=W.device, dtype=W.dtype)
-            Z = torch.linalg.solve(W.T + ridge, Z.T).T
+        if not torch.isfinite(W).all():
+            # A non-finite W (upstream divergence) would make the solve raise or
+            # silently emit NaN.  Degrade gracefully to identity de-whitening for
+            # this call rather than crashing/poisoning the step.
+            warnings.warn(
+                "SWBNColouringLayer: whitening matrix W is non-finite; "
+                "skipping de-whitening (identity fallback) — check training "
+                "stability.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            try:
+                Z = torch.linalg.solve(W.T, Z.T).T
+            except RuntimeError:
+                # Near-singular W (should not happen near identity): ridge, then
+                # fall back to a pseudo-inverse if even the ridged solve fails.
+                ridge = wl.eps * torch.eye(wl.d, device=W.device, dtype=W.dtype)
+                try:
+                    Z = torch.linalg.solve(W.T + ridge, Z.T).T
+                except RuntimeError:
+                    Z = Z @ torch.linalg.pinv(W.T)
         # 3. invert standardisation:  Z_s = (z - mu) / sqrt(v + eps)
         #    ->  z = Z_s * sqrt(v + eps) + mu        (running stats, as in SWBN)
         return Z * (wl.running_var + wl.eps).sqrt() + wl.running_mean

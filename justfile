@@ -69,3 +69,29 @@ test_slow:
 # Run tests for specific module
 test_module module="agents":
     PYTHONPATH=. uv run pytest tests/{{module}}/ -v
+
+# Launch (or attach to) the `sfrl` tmux session running both multi-agent
+# experiments — one window per config: hetero_multi_agent (default config)
+# and homo_multi_agent (hetero_rate_multiagent_mnist_homo).
+sfrl:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    session="sfrl"
+    root="{{justfile_directory()}}"
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        # Window 1: hetero setup (script default config).
+        tmux new-session -d -s "$session" -n hetero_multi_agent -c "$root"
+        tmux send-keys -t "$session:hetero_multi_agent" \
+            'uv run scripts/multi_agent_experiment.py' C-m
+        # Window 2: homo setup.
+        tmux new-window -t "$session" -n homo_multi_agent -c "$root"
+        tmux send-keys -t "$session:homo_multi_agent" \
+            'uv run scripts/multi_agent_experiment.py --config-name hetero_rate_multiagent_mnist_homo' C-m
+        tmux select-window -t "$session:hetero_multi_agent"
+    fi
+    # Attach, or switch if we're already inside tmux.
+    if [ -n "${TMUX:-}" ]; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi

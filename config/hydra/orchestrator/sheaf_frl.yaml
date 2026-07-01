@@ -1,7 +1,7 @@
 _target_: src.orchestrators.SheafFRL
 
-max_lmb: 0.01
-lambda_schedule: cosine
+max_lmb: 3.82e-3
+lambda_schedule: null
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
 sparse_communication: False

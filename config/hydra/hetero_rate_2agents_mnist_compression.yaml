@@ -1,7 +1,7 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: sheaf_frl
+  - orchestrator: sheaf_cfrl
   - optimizer: sgd
   - _self_
 
@@ -9,11 +9,11 @@ seed: 42
 study_name: "HeteroRate MNIST 2 agents"
 
 lmb_study:
-  enabled: true         # set to true to run Optuna search before the full training run
-  n_trials: 15          # number of Optuna trials
+  enabled: true        # set to true to run Optuna search before the full training run
+  n_trials: 20          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
-  lmb_low: 1e-4         # lower bound of the log-uniform search interval
-  lmb_high: 1
+  lmb_low: 1.0e-4       # lower bound of the log-uniform search interval
+  lmb_high: 1.0         # upper bound of the log-uniform search interval
 
 graph:
   neighbors_mode: "fully_connected"
@@ -24,14 +24,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: thursday_presentation_hetero
+  project: sfrl_bottleneck
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 30
+  max_epochs: 20
   accelerator: auto
   devices: 1
   deterministic: true
@@ -47,7 +47,7 @@ dataset:
   split_strategy: grouped_non_iid
   n_agents: 2
   classes_per_agent: 10
-  shift_strength: 0.8
+  shift_strength: 0.7
   monitor_test_during_fit: true
   batch_size: 64
   num_workers: 0
@@ -67,53 +67,37 @@ model:
   agents:
     0:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128]
-      decoder_hidden_dims: [256, 128, 64]
-      dropout: 0.3
-      use_batchnorm: true
-    1:
-      _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
+      encoder_hidden_dims: ${model.encoder_hidden_dims}
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
-    # 1:
-    #   _target_: src.agents.TransformerClassifier
-    #   patch_size: 7
-    #   embed_dim: 128
-    #   depth: 4
-    #   num_heads: 4
-    #   mlp_ratio: 4.0
-    #   pool: mean
-    #   decoder_hidden_dims: [256]
-    #   dropout: 0.1
-    #   weight_decay: 1e-4
-    #   use_batchnorm: false
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: ${model.encoder_hidden_dims}
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
 
 orchestrator:
-  parseval_normalization: false
-  l2_normalization: false
   use_prototypes: false
   log_latent_diagnostics: true
   # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  max_lmb: 1e-2
+  max_lmb: 1e-02
   lambda_schedule: null
   # Sheaf FRL specific
-  warmup_epochs: 0 # just for sheaf_frl
+  warmup_epochs: 0
   comm_task_coeff: 1
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
+  learn_whitening: true
   # CE Sheaf FRL specific
   phase_a_epochs: 1
   phase_c_epochs: 2
   # Sheaf compressed FRL
   compression_factor: 0.5
-  # Sheaf FMTL specific
-  gamma: 0.001
-  eta: 0.01
-  # Post-training alignment (for methods not working on representations)
-  alignment_method: procrustes # can be "general" or "procrustes"
+  # Post-training alignment
+  alignment_method: procrustes
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch
@@ -123,12 +107,4 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # orchestrator.alignment_method: general, procrustes
-      # orchestrator.use_general_maps: false, true
-      # orchestrator.max_lmb: 0.5, 5
-      # orchestrator: sheaf_fmtl, sheaf_frl
-      # dataset.shift_strength: 0.6, 0.8, 1.0
-      # orchestrator.learn_whitening: true, false
-      orchestrator: sheaf_cfrl
-      orchestrator.compression_factor: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8
-
+      orchestrator.compression_factor: 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9

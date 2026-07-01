@@ -1,0 +1,295 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: comfed
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 15 agents"
+
+lmb_study:
+  enabled: true         # set to true to run Optuna search before the full training run
+  efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
+  n_trials: 15          # number of Optuna trials
+  n_tune_epochs: 5     # epochs per trial
+  lmb_low: 1e-4         # lower bound of the log-uniform search interval
+  lmb_high: 1
+
+graph:
+  # "class_overlap": sparse, connected graph that keeps only the edges between
+  # the agents sharing the most target classes, capped at max_edge_frac of all
+  # possible edges. A maximum-weight spanning tree is always retained so the
+  # graph stays connected. Other modes: fully_connected, erdos_renyi, barabasi,
+  # manual (hand-written `neighbors` dict below).
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
+  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
+  # Extra knobs the other modes need (optional — sensible defaults in
+  # generate_neighbors): erdos_renyi → seed, p ; barabasi → seed, m ;
+  # manual → neighbors: {i: [j, k], ...}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: multi_hetero_agents
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 30
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  # Bound gradient norm so a single exploding step can't push an agent's
+  # weights to inf/NaN (SGD momentum=0.9 + comm_task_coeff=1 + no warmup makes
+  # this easy early on). Applied natively by Lightning (automatic optimization).
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 15
+  classes_per_agent: 10
+  shift_strength: 0.7
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  # 15 single-agent groups. Each agent skews (shift_strength) toward its
+  # target_classes; every set has >= 6 of the 10 MNIST digits, with
+  # overlap across agents so the sheaf maps have shared structure to align.
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+    2:
+      agents: [2]
+      target_classes: [0, 1, 2, 3, 4, 5, 6]
+    3:
+      agents: [3]
+      target_classes: [3, 4, 5, 6, 7, 8, 9]
+    4:
+      agents: [4]
+      target_classes: [0, 1, 2, 3, 6, 7, 8, 9]
+    5:
+      agents: [5]
+      target_classes: [2, 3, 4, 5, 6, 7]
+    6:
+      agents: [6]
+      target_classes: [0, 1, 2, 3, 4, 5, 6, 7]
+    7:
+      agents: [7]
+      target_classes: [1, 2, 3, 4, 5, 6]
+    8:
+      agents: [8]
+      target_classes: [0, 2, 4, 6, 7, 8, 9]
+    9:
+      agents: [9]
+      target_classes: [0, 1, 2, 5, 6, 7, 8, 9]
+    10:
+      agents: [10]
+      target_classes: [1, 2, 3, 4, 5, 6, 7]
+    11:
+      agents: [11]
+      target_classes: [0, 1, 2, 3, 4, 5, 8, 9]
+    12:
+      agents: [12]
+      target_classes: [3, 4, 5, 6, 7, 8]
+    13:
+      agents: [13]
+      target_classes: [0, 1, 4, 5, 6, 7, 8, 9]
+    14:
+      agents: [14]
+      target_classes: [0, 1, 2, 3, 7, 8, 9]
+    # 15:
+    #   agents: [15]
+    #   target_classes: [2, 3, 4, 5, 6, 7, 8, 9]
+    # 16:
+    #   agents: [16]
+    #   target_classes: [0, 1, 5, 6, 7, 8, 9]
+    # 17:
+    #   agents: [17]
+    #   target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    # 18:
+    #   agents: [18]
+    #   target_classes: [2, 3, 4, 5, 6, 7, 8]
+    # 19:
+    #   agents: [19]
+    #   target_classes: [0, 1, 2, 3, 4, 8, 9]
+
+model:
+  # 15 heterogeneous CNN classifiers. They differ in depth (2-4 conv blocks;
+  # capped at 4 since MNIST 28x28 halves to 1x1 after 4 MaxPool stages),
+  # channel widths, decoder shape, dropout and batchnorm. The last conv
+  # channel sets each agent's latent (stalk) dimension, varied 32 -> 256.
+  agents:
+    0:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128]
+      decoder_hidden_dims: [256, 128, 64]
+      dropout: 0.3
+      use_batchnorm: true
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
+    2:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [16, 32, 64]
+      decoder_hidden_dims: [128]
+      dropout: 0.2
+      use_batchnorm: true
+    3:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128]
+      decoder_hidden_dims: [256, 128]
+      dropout: 0.25
+      use_batchnorm: false
+    4:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 48, 96, 192]
+      decoder_hidden_dims: [192, 96]
+      dropout: 0.3
+      use_batchnorm: true
+    5:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [24, 48, 96]
+      decoder_hidden_dims: [96]
+      dropout: 0.15
+      use_batchnorm: true
+    6:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128, 256]
+      decoder_hidden_dims: [256]
+      dropout: 0.4
+      use_batchnorm: true
+    7:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [16, 32]
+      decoder_hidden_dims: [64, 32]
+      dropout: 0.1
+      use_batchnorm: false
+    8:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [48, 96, 160]
+      decoder_hidden_dims: [160, 80]
+      dropout: 0.2
+      use_batchnorm: true
+    9:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 80]
+      decoder_hidden_dims: [100]
+      dropout: 0.05
+      use_batchnorm: true
+    10:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [40, 80, 120]
+      decoder_hidden_dims: [120, 60]
+      dropout: 0.3
+      use_batchnorm: false
+    11:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128, 128]
+      decoder_hidden_dims: [256, 128]
+      dropout: 0.35
+      use_batchnorm: true
+    12:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [20, 40, 60, 80]
+      decoder_hidden_dims: [80]
+      dropout: 0.2
+      use_batchnorm: true
+    13:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 96]
+      decoder_hidden_dims: [192, 96]
+      dropout: 0.25
+      use_batchnorm: true
+    14:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [56, 112]
+      decoder_hidden_dims: [128]
+      dropout: 0.1
+      use_batchnorm: false
+    # 15:
+    #   _target_: src.agents.CNNClassifier
+    #   encoder_hidden_dims: [32, 64, 128]
+    #   decoder_hidden_dims: [128]
+    #   dropout: 0.2
+    #   use_batchnorm: true
+    # 16:
+    #   _target_: src.agents.CNNClassifier
+    #   encoder_hidden_dims: [48, 96]
+    #   decoder_hidden_dims: [96, 48]
+    #   dropout: 0.15
+    #   use_batchnorm: true
+    # 17:
+    #   _target_: src.agents.CNNClassifier
+    #   encoder_hidden_dims: [16, 32, 64, 128]
+    #   decoder_hidden_dims: [128, 64]
+    #   dropout: 0.3
+    #   use_batchnorm: true
+    # 18:
+    #   _target_: src.agents.CNNClassifier
+    #   encoder_hidden_dims: [28, 56, 112]
+    #   decoder_hidden_dims: [112]
+    #   dropout: 0.2
+    #   use_batchnorm: false
+    # 19:
+    #   _target_: src.agents.CNNClassifier
+    #   encoder_hidden_dims: [64, 96]
+    #   decoder_hidden_dims: [192, 96]
+    #   dropout: 0.25
+    #   use_batchnorm: true
+
+orchestrator:
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
+  max_lmb: 1e-02
+  lambda_schedule: null
+  # Sheaf FRL specific
+  warmup_epochs: 0 # just for sheaf_frl
+  comm_task_coeff: 1
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  learn_whitening: true
+  # CE Sheaf FRL specific
+  phase_a_epochs: 1
+  phase_c_epochs: 2
+  # Sheaf compressed FRL
+  compression_factor: 0.5
+  # Sheaf FMTL specific
+  gamma: 0.001
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
+      orchestrator: non_cooperative, ce_sheaf_frl

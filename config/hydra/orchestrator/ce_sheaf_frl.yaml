@@ -1,7 +1,7 @@
 _target_: src.orchestrators.CESheafFRL
 
-max_lmb: 0.01
-lambda_schedule: cosine
+max_lmb: 3.23e-3
+lambda_schedule: null
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
 sparse_communication: False
@@ -14,16 +14,12 @@ warmup_epochs: 0
 neighbors: {}
 filter_unseen_classes: False
 use_prototypes: False
-comm_task_coeff: 0.0  # weight for the after-communication task loss (mu; 0 = disabled)
+comm_task_coeff: 1.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
 
 # ── Decoupled three-phase schedule (communication-efficient) ──────────────────
-# Each outer iteration: T_C Phase-C epochs (classical SheafFRL — exchange pilots
-# every step, all losses, refresh maps at every Phase-C epoch end), then T_A
-# Phase-A epochs (NO pilot exchange: each node reuses a frozen snapshot of its
-# neighbours' pilots as a fixed target; maps held fixed). Cycle = T_C + T_A.
 phase_c_epochs: 1   # T_C: classical SheafFRL epochs per outer iteration
-phase_a_epochs: 1   # T_A: communication-free (frozen-pilot) epochs per outer iteration
+phase_a_epochs: 2   # T_A: communication-free (frozen-pilot) epochs per outer iteration
 
 # Information-theoretic PID logging (Liang et al. 2023).
 pid_logging: True

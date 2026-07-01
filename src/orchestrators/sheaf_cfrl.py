@@ -53,11 +53,11 @@ class SheafCFRL(CESheafFRL):
     def __init__(
         self,
         *,
-        compression_dim: int = 4,
+        compression_factor: float = 0.5,
         compression_inner_steps: int = 20,
         compression_init: str = 'pca',
         compression_beta: float = 0.5,
-        compression_admm_alpha: float = 5.0,
+        compression_admm_alpha: float = 1.0,
         **kwargs,
     ):
         if str(compression_init) not in ('pca', 'truncated_identity'):
@@ -65,8 +65,12 @@ class SheafCFRL(CESheafFRL):
                 f"compression_init must be 'pca' or 'truncated_identity', "
                 f'got {compression_init!r}.'
             )
-        if int(compression_dim) < 1:
-            raise ValueError('compression_dim must be >= 1.')
+        if not 0.0 < float(compression_factor) <= 1.0:
+            raise ValueError(
+                'compression_factor must be a fraction in (0, 1] of '
+                'min(d_i, d_j) — the edge-stalk dimension to retain on each '
+                f'edge (e.g. 0.5 keeps 50%); got {compression_factor!r}.'
+            )
         if int(compression_inner_steps) < 1:
             raise ValueError('compression_inner_steps (T_B) must be >= 1.')
         if not 0.0 <= float(compression_beta) < 1.0:
@@ -78,14 +82,14 @@ class SheafCFRL(CESheafFRL):
         # below) which only stashes the graph; the real maps are built here once
         # the compression hyperparameters are available.
         super().__init__(**kwargs)
-        self._compression_dim = int(compression_dim)
+        self._compression_factor = float(compression_factor)
         self._compression_inner_steps = int(compression_inner_steps)
         self._compression_init = str(compression_init)
         self._compression_beta = float(compression_beta)
         self._compression_admm_alpha = float(compression_admm_alpha)
         # Expose for logging / checkpointing (not captured by the parent's
         # save_hyperparameters, which only sees SheafFRL's signature).
-        self.hparams['compression_dim'] = self._compression_dim
+        self.hparams['compression_factor'] = self._compression_factor
         self.hparams['compression_inner_steps'] = self._compression_inner_steps
         self.hparams['compression_init'] = self._compression_init
         self.hparams['compression_beta'] = self._compression_beta
@@ -109,7 +113,9 @@ class SheafCFRL(CESheafFRL):
         ``_build_compression_maps`` once the compression hyperparameters exist.
         """
         self.stiefel_matrices = nn.ParameterDict()
-        self._latent_dims_int = {int(k): int(v) for k, v in latent_dims_int.items()}
+        self._latent_dims_int = {
+            int(k): int(v) for k, v in latent_dims_int.items()
+        }
         self._cfrl_neighbors = neighbors
         self._initialized_edges: set[str] = set()
 
@@ -119,7 +125,7 @@ class SheafCFRL(CESheafFRL):
         # Each entry: (edge_key, node_a, node_b, c_ij).
         self._compression_edges: list[tuple[str, int, int, int]] = []
         self._initialized_edges = set()
-        c_req = self._compression_dim
+        factor = self._compression_factor
         seen: set[str] = set()
 
         for i_raw, neighborset in self._cfrl_neighbors.items():
@@ -139,21 +145,27 @@ class SheafCFRL(CESheafFRL):
                 seen.add(edge_key)
 
                 d_a, d_b = self._latent_dims_int[a], self._latent_dims_int[b]
-                c_ij = max(1, min(c_req, d_a, d_b))
-                if c_ij >= min(d_a, d_b):
+                min_d = min(d_a, d_b)
+                # Retain ``factor`` of the smaller node's dimension on the edge.
+                c_ij = max(1, min(min_d, round(factor * min_d)))
+                if c_ij >= min_d:
                     warnings.warn(
-                        f'SheafCFRL: compression_dim={c_req} is not < '
-                        f'min(d)={min(d_a, d_b)} for edge {edge_key}; this edge '
-                        'is not actually compressed.',
+                        f'SheafCFRL: compression_factor={factor} keeps '
+                        f'c_ij={c_ij} = min(d)={min_d} for edge {edge_key}; this '
+                        'edge is not actually compressed.',
                         UserWarning,
                         stacklevel=2,
                     )
                 # Truncated-identity init: first c_ij rows of I_d  → (c, d).
-                self.compression_maps[self._proj_key(edge_key, a)] = nn.Parameter(
-                    torch.eye(d_a)[:c_ij].clone(), requires_grad=False
+                self.compression_maps[self._proj_key(edge_key, a)] = (
+                    nn.Parameter(
+                        torch.eye(d_a)[:c_ij].clone(), requires_grad=False
+                    )
                 )
-                self.compression_maps[self._proj_key(edge_key, b)] = nn.Parameter(
-                    torch.eye(d_b)[:c_ij].clone(), requires_grad=False
+                self.compression_maps[self._proj_key(edge_key, b)] = (
+                    nn.Parameter(
+                        torch.eye(d_b)[:c_ij].clone(), requires_grad=False
+                    )
                 )
                 self._compression_edges.append((edge_key, a, b, c_ij))
 
@@ -162,6 +174,38 @@ class SheafCFRL(CESheafFRL):
             if {a, b} == {int(s), int(r)}:
                 return edge_key
         return None
+
+    def _record_pilot_exchange(
+        self,
+        payloads_per_agent: dict,
+        latents_per_agent: dict,
+        prefix: str,
+    ) -> None:
+        """Record one pilot exchange using compressed c_ij-dimensional payloads.
+
+        Each directed edge (i→j) carries latents_i projected into the c_ij-
+        dimensional edge stalk (V_ji Z_i^T), not the full d_i-dimensional
+        embedding.  Both directions of every undirected edge are recorded
+        separately: a→b transmits K_a×c_ij scalars, b→a transmits K_b×c_ij.
+        """
+        self._record_communication_round(n_rounds=1, prefix=prefix)
+        for _edge_key, a, b, c_ij in self._compression_edges:
+            if a in payloads_per_agent:
+                payload_a = payloads_per_agent[a]
+                n_rows_a = (
+                    payload_a.shape[0]
+                    if isinstance(payload_a, torch.Tensor)
+                    else latents_per_agent[a].shape[0]
+                )
+                self._record_communication(int(n_rows_a) * c_ij, prefix=prefix)
+            if b in payloads_per_agent:
+                payload_b = payloads_per_agent[b]
+                n_rows_b = (
+                    payload_b.shape[0]
+                    if isinstance(payload_b, torch.Tensor)
+                    else latents_per_agent[b].shape[0]
+                )
+                self._record_communication(int(n_rows_b) * c_ij, prefix=prefix)
 
     def on_train_start(self) -> None:
         super().on_train_start()
@@ -203,8 +247,8 @@ class SheafCFRL(CESheafFRL):
         c = P.shape[0]
         Ic = torch.eye(c, device=P.device, dtype=P.dtype)
         # One c×c solve per eigenvalue, batched over the d columns.
-        M = lam.view(-1, 1, 1) * P.unsqueeze(0) + Ic    # (d, c, c)
-        rhs = (R @ Q).t().unsqueeze(-1)                 # (d, c, 1)
+        M = lam.view(-1, 1, 1) * P.unsqueeze(0) + Ic  # (d, c, c)
+        rhs = (R @ Q).t().unsqueeze(-1)  # (d, c, 1)
         Y = torch.linalg.solve(M, rhs).squeeze(-1).t()  # (c, d)
         return Y @ Q.t()
 
@@ -244,13 +288,21 @@ class SheafCFRL(CESheafFRL):
             if a not in whitened_per_agent or b not in whitened_per_agent:
                 continue
 
-            V_a = self.compression_maps[self._proj_key(edge_key, a)]  # (c, d_a)
-            V_b = self.compression_maps[self._proj_key(edge_key, b)]  # (c, d_b)
+            V_a = self.compression_maps[
+                self._proj_key(edge_key, a)
+            ]  # (c, d_a)
+            V_b = self.compression_maps[
+                self._proj_key(edge_key, b)
+            ]  # (c, d_b)
             src_a = (
-                whitened_per_agent[a], keys_per_agent[a], labels_per_agent[a]
+                whitened_per_agent[a],
+                keys_per_agent[a],
+                labels_per_agent[a],
             )
             src_b = (
-                whitened_per_agent[b], keys_per_agent[b], labels_per_agent[b]
+                whitened_per_agent[b],
+                keys_per_agent[b],
+                labels_per_agent[b],
             )
             matched = self._match_edge(a, b, src_a, src_b)
             if matched is None:
@@ -267,13 +319,22 @@ class SheafCFRL(CESheafFRL):
 
             # ── After-communication task loss (project → lift across the edge) ─
             if comm_weight > 0.0:
-                agent_a = self.agents[str(a)] if str(a) in self.agents else None
-                agent_b = self.agents[str(b)] if str(b) in self.agents else None
-                _is_clf = lambda ag: getattr(ag, 'task_type', 'classification') == 'classification'
+                agent_a = (
+                    self.agents[str(a)] if str(a) in self.agents else None
+                )
+                agent_b = (
+                    self.agents[str(b)] if str(b) in self.agents else None
+                )
+                _is_clf = lambda ag: (
+                    getattr(ag, 'task_type', 'classification')
+                    == 'classification'
+                )
 
                 # b → a: project b into edge (V_b), lift to a (V_a), recolour, decode.
                 if agent_a is not None and _is_clf(agent_a):
-                    Z_b_to_a = torch.matmul(torch.matmul(Z_b.float(), V_b.t()), V_a)
+                    Z_b_to_a = torch.matmul(
+                        torch.matmul(Z_b.float(), V_b.t()), V_a
+                    )
                     Z_b_to_a = self._recolour_node(a, Z_b_to_a)
                     logits_ba = agent_a.decoder(Z_b_to_a.to(dtype=Z_a.dtype))
                     after_comm_task_loss += agent_a.compute_loss(
@@ -282,7 +343,9 @@ class SheafCFRL(CESheafFRL):
 
                 # a → b: project a into edge (V_a), lift to b (V_b), recolour, decode.
                 if agent_b is not None and _is_clf(agent_b):
-                    Z_a_to_b = torch.matmul(torch.matmul(Z_a.float(), V_a.t()), V_b)
+                    Z_a_to_b = torch.matmul(
+                        torch.matmul(Z_a.float(), V_a.t()), V_b
+                    )
                     Z_a_to_b = self._recolour_node(b, Z_a_to_b)
                     logits_ab = agent_b.decoder(Z_a_to_b.to(dtype=Z_b.dtype))
                     after_comm_task_loss += agent_b.compute_loss(
@@ -318,24 +381,36 @@ class SheafCFRL(CESheafFRL):
         for edge_key, a, b, _c in self._compression_edges:
             if a not in whitened_per_agent or b not in whitened_per_agent:
                 continue
-            V_a = self.compression_maps[self._proj_key(edge_key, a)]  # (c, d_a)
-            V_b = self.compression_maps[self._proj_key(edge_key, b)]  # (c, d_b)
+            V_a = self.compression_maps[
+                self._proj_key(edge_key, a)
+            ]  # (c, d_a)
+            V_b = self.compression_maps[
+                self._proj_key(edge_key, b)
+            ]  # (c, d_b)
             src_a = (
-                whitened_per_agent[a], keys_per_agent[a], labels_per_agent[a]
+                whitened_per_agent[a],
+                keys_per_agent[a],
+                labels_per_agent[a],
             )
             src_b = (
-                whitened_per_agent[b], keys_per_agent[b], labels_per_agent[b]
+                whitened_per_agent[b],
+                keys_per_agent[b],
+                labels_per_agent[b],
             )
             # Pull node a (live) toward frozen b; then node b (live) toward frozen a.
             if b in frozen:
                 m = self._match_edge(a, b, src_a, frozen[b])
                 if m is not None:
-                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(m[2], V_b.t())
+                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(
+                        m[2], V_b.t()
+                    )
                     sheaf_penalty += (d**2).sum(dim=1).mean()
             if a in frozen:
                 m = self._match_edge(a, b, frozen[a], src_b)
                 if m is not None:
-                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(m[2], V_b.t())
+                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(
+                        m[2], V_b.t()
+                    )
                     sheaf_penalty += (d**2).sum(dim=1).mean()
 
         return sheaf_penalty, after_comm
@@ -383,7 +458,10 @@ class SheafCFRL(CESheafFRL):
 
         # Section 9.4 init: the incoming maps already lie on the Stiefel manifold,
         # so Y⁰ = V⁰ᵀ (Stiefel-feasible) and the scaled duals start at zero.
-        Y_a, Y_b = V_a.t().contiguous(), V_b.t().contiguous()  # (d_a,c),(d_b,c)
+        Y_a, Y_b = (
+            V_a.t().contiguous(),
+            V_b.t().contiguous(),
+        )  # (d_a,c),(d_b,c)
         U_a, U_b = torch.zeros_like(Y_a), torch.zeros_like(Y_b)
 
         for _ in range(t_b):
@@ -393,7 +471,8 @@ class SheafCFRL(CESheafFRL):
             C_b = (1.0 + beta) * (V_b @ Sigma_ba) + alpha * (Y_a - U_a).t()
             V_a = self._sylvester_eig(
                 torch.linalg.solve(B_b, A_b),
-                lam_a, Q_a,
+                lam_a,
+                Q_a,
                 torch.linalg.solve(B_b, C_b),
             )
 
@@ -404,13 +483,14 @@ class SheafCFRL(CESheafFRL):
             C_a = (1.0 + beta) * (V_a @ Sigma_ab) + alpha * (Y_b - U_b).t()
             V_b = self._sylvester_eig(
                 torch.linalg.solve(B_a, A_a),
-                lam_b, Q_b,
+                lam_b,
+                Q_b,
                 torch.linalg.solve(B_a, C_a),
             )
 
             # Step 3 — project the transposed maps onto the Stiefel manifold.
-            Y_a = self._polar_factor(V_a.t() + U_a)   # (d_a, c) ∈ St(d_a, c)
-            Y_b = self._polar_factor(V_b.t() + U_b)   # (d_b, c) ∈ St(d_b, c)
+            Y_a = self._polar_factor(V_a.t() + U_a)  # (d_a, c) ∈ St(d_a, c)
+            Y_b = self._polar_factor(V_b.t() + U_b)  # (d_b, c) ∈ St(d_b, c)
 
             # Step 4 — scaled dual ascent.
             U_a = U_a + V_a.t() - Y_a
@@ -444,10 +524,17 @@ class SheafCFRL(CESheafFRL):
                 continue
 
             # Epoch keys double as labels (they are class labels at epoch level).
-            Z_a_f, keys_a_f, _la, Z_b_f, keys_b_f, _lb = self._apply_edge_class_filter(
-                a, b,
-                agent_normed[a], keys_per_agent[a], keys_per_agent[a],
-                agent_normed[b], keys_per_agent[b], keys_per_agent[b],
+            Z_a_f, keys_a_f, _la, Z_b_f, keys_b_f, _lb = (
+                self._apply_edge_class_filter(
+                    a,
+                    b,
+                    agent_normed[a],
+                    keys_per_agent[a],
+                    keys_per_agent[a],
+                    agent_normed[b],
+                    keys_per_agent[b],
+                    keys_per_agent[b],
+                )
             )
             shared = self._match_keys(
                 A_i=Z_a_f, A_j=Z_b_f, keys_i=keys_a_f, keys_j=keys_b_f
@@ -477,21 +564,23 @@ class SheafCFRL(CESheafFRL):
                 # whitening).  The 1/n scaling — relative to the spec's raw ÃᵀÃ —
                 # keeps the ADMM penalty α scale-free in the matched-pilot count.
                 n = max(1, Z_a.shape[0])
-                Sigma_a = (Z_a.t() @ Z_a) / n     # (d_a, d_a) = Σ_i
-                Sigma_b = (Z_b.t() @ Z_b) / n     # (d_b, d_b) = Σ_j
-                Sigma_ab = (Z_a.t() @ Z_b) / n    # (d_a, d_b) = Σ_ij
+                Sigma_a = (Z_a.t() @ Z_a) / n  # (d_a, d_a) = Σ_i
+                Sigma_b = (Z_b.t() @ Z_b) / n  # (d_b, d_b) = Σ_j
+                Sigma_ab = (Z_a.t() @ Z_b) / n  # (d_a, d_b) = Σ_ij
                 V_a, V_b, primal = self._admm_phase_b(
                     V_a, V_b, Sigma_a, Sigma_b, Sigma_ab, c_ij, t_b
                 )
                 param_a.copy_(V_a.to(dtype=param_a.dtype, device=dev))
                 param_b.copy_(V_b.to(dtype=param_b.dtype, device=dev))
-                edge_metrics[f'compressed_admm_primal_resid_edge_{edge_key}'] = primal
+                edge_metrics[
+                    f'compressed_admm_primal_resid_edge_{edge_key}'
+                ] = primal
                 self._initialized_edges.add(edge_key)
 
-            resid = (
-                (Z_a @ V_a.t() - Z_b @ V_b.t()) ** 2
-            ).sum(dim=1).mean()
-            edge_metrics[f'compressed_residual_edge_{edge_key}'] = float(resid.item())
+            resid = ((Z_a @ V_a.t() - Z_b @ V_b.t()) ** 2).sum(dim=1).mean()
+            edge_metrics[f'compressed_residual_edge_{edge_key}'] = float(
+                resid.item()
+            )
 
         return edge_metrics, fitted_ops
 
@@ -518,17 +607,29 @@ class SheafCFRL(CESheafFRL):
             Z = self._whiten_pilots_frozen(sender_idx, Z_sender.to(work_dev))
         else:
             op_s = self._whitening_ops.get(sender_idx)
-            Z = whiten(Z_sender, op_s) if op_s is not None else Z_sender.float()
+            Z = (
+                whiten(Z_sender, op_s)
+                if op_s is not None
+                else Z_sender.float()
+            )
 
         # Step 2 — project into the compressed edge stalk, then lift to receiver.
         edge_key = self._find_edge(sender_idx, receiver_idx)
         if edge_key is not None:
-            V_s = self.compression_maps[
-                self._proj_key(edge_key, int(sender_idx))
-            ].float().to(work_dev)
-            V_r = self.compression_maps[
-                self._proj_key(edge_key, int(receiver_idx))
-            ].float().to(work_dev)
+            V_s = (
+                self.compression_maps[
+                    self._proj_key(edge_key, int(sender_idx))
+                ]
+                .float()
+                .to(work_dev)
+            )
+            V_r = (
+                self.compression_maps[
+                    self._proj_key(edge_key, int(receiver_idx))
+                ]
+                .float()
+                .to(work_dev)
+            )
             Z_lift = torch.matmul(torch.matmul(Z.to(work_dev), V_s.t()), V_r)
         else:
             Z_lift = Z.to(work_dev)

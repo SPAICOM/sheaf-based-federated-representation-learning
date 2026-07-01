@@ -1,7 +1,7 @@
 _target_: src.orchestrators.sheaf_fmtl.SheafFMTL
 
 gamma: 0.01
-max_lmb: 0.001
+max_lmb: 1e-02
 lambda_schedule: null
 eta: 0.01
 

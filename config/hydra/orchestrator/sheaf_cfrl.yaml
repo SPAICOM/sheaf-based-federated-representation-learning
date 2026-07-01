@@ -1,7 +1,7 @@
 _target_: src.orchestrators.SheafCFRL
 
-max_lmb: 0.01
-lambda_schedule: cosine
+max_lmb: 4.76e-4
+lambda_schedule: null
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
 sparse_communication: False
@@ -21,7 +21,7 @@ align_on_intersection: False  # if True, filter pilots to intersection of target
 # Each edge owns two fat semi-orthogonal maps projecting both stalks into a shared
 # c-dimensional edge stalk (c < min(d_i, d_j)). Phase B refits them by SOC-ADMM,
 # minimising a β-weighted blend of semantic misalignment and communication loss.
-compression_dim: 4              # c_ij: shared edge-stalk dimension (per edge, clamped to < min d)
+compression_factor: 0.5         # fraction of min(d_i, d_j) retained per edge: c_ij = round(factor·min_d)
 compression_inner_steps: 20     # T_B: SOC-ADMM iterations per edge in Phase B (spec: 10–30)
 compression_init: pca           # 'pca' (recommended) or 'truncated_identity'
 compression_beta: 0.5           # β ∈ [0,1): semantic-misalignment ↔ communication-loss trade-off
