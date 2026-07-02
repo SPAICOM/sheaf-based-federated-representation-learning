@@ -31,7 +31,7 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: multi_hetero_agents_2
+  project: multi_hetero_agents_true
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
@@ -68,69 +68,56 @@ dataset:
   pilot_batch_size: 64
   comm_data: shared_global_pilots
   # 15 single-agent groups. Each agent skews (shift_strength) toward its
-  # target_classes; every set has >= 6 of the 10 MNIST digits, with
-  # overlap across agents so the sheaf maps have shared structure to align.
+  # target_classes; each set has 5-6 of the 10 MNIST digits and is distinct
+  # from every other, but keeps enough pairwise overlap (>= 2 shared classes)
+  # that the class_overlap graph stays connected and the sheaf maps have
+  # shared structure to align.
   groups:
     0:
       agents: [0]
-      target_classes: [4, 5, 6, 7, 8, 9]
+      target_classes: [4, 5, 6, 7, 8]
     1:
       agents: [1]
-      target_classes: [0, 1, 2, 3, 4, 5]
+      target_classes: [0, 1, 2, 3, 4]
     2:
       agents: [2]
-      target_classes: [0, 1, 2, 3, 4, 5, 6]
+      target_classes: [0, 1, 2, 3, 4, 5]
     3:
       agents: [3]
-      target_classes: [3, 4, 5, 6, 7, 8, 9]
+      target_classes: [4, 5, 6, 7, 8, 9]
     4:
       agents: [4]
-      target_classes: [0, 1, 2, 3, 6, 7, 8, 9]
+      target_classes: [0, 1, 2, 7, 8, 9]
     5:
       agents: [5]
-      target_classes: [2, 3, 4, 5, 6, 7]
+      target_classes: [2, 3, 4, 5, 6]
     6:
       agents: [6]
-      target_classes: [0, 1, 2, 3, 4, 5, 6, 7]
+      target_classes: [1, 2, 3, 4, 5, 6]
     7:
       agents: [7]
-      target_classes: [1, 2, 3, 4, 5, 6]
+      target_classes: [3, 4, 5, 6, 7]
     8:
       agents: [8]
-      target_classes: [0, 2, 4, 6, 7, 8, 9]
+      target_classes: [0, 2, 4, 6, 8]
     9:
       agents: [9]
-      target_classes: [0, 1, 2, 5, 6, 7, 8, 9]
+      target_classes: [5, 6, 7, 8, 9]
     10:
       agents: [10]
-      target_classes: [1, 2, 3, 4, 5, 6, 7]
+      target_classes: [1, 2, 3, 4, 5]
     11:
       agents: [11]
-      target_classes: [0, 1, 2, 3, 4, 5, 8, 9]
+      target_classes: [0, 1, 2, 8, 9]
     12:
       agents: [12]
       target_classes: [3, 4, 5, 6, 7, 8]
     13:
       agents: [13]
-      target_classes: [0, 1, 4, 5, 6, 7, 8, 9]
+      target_classes: [1, 4, 6, 8, 9]
     14:
       agents: [14]
-      target_classes: [0, 1, 2, 3, 7, 8, 9]
-    # 15:
-    #   agents: [15]
-    #   target_classes: [2, 3, 4, 5, 6, 7, 8, 9]
-    # 16:
-    #   agents: [16]
-    #   target_classes: [0, 1, 5, 6, 7, 8, 9]
-    # 17:
-    #   agents: [17]
-    #   target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    # 18:
-    #   agents: [18]
-    #   target_classes: [2, 3, 4, 5, 6, 7, 8]
-    # 19:
-    #   agents: [19]
-    #   target_classes: [0, 1, 2, 3, 4, 8, 9]
+      target_classes: [0, 1, 2, 3, 7]
 
 model:
   # 15 heterogeneous CNN classifiers. They differ in depth (2-4 conv blocks;
@@ -146,7 +133,7 @@ model:
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128]  # +3rd block: pools 7x7 -> 3x3
+      encoder_hidden_dims: [32, 64, 128, 224]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
@@ -182,7 +169,7 @@ model:
       use_batchnorm: true
     7:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128]  # +3rd block & wider: was [16,32] (too small)
+      encoder_hidden_dims: [24, 48, 96, 144]  # deepened to 4 blocks (was [32,64,128], dup of 0/1)
       decoder_hidden_dims: [64, 32]
       dropout: 0.1
       use_batchnorm: true
@@ -206,7 +193,7 @@ model:
       use_batchnorm: true
     11:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128, 128]
+      encoder_hidden_dims: [48, 96, 192, 240]  # deepened to 4 blocks (was [64,128,128], near-dup of 3)
       decoder_hidden_dims: [256, 128]
       dropout: 0.2  # lowered from 0.35: was converging slowly, not capacity-bound
       use_batchnorm: true
@@ -228,43 +215,10 @@ model:
       decoder_hidden_dims: [128]
       dropout: 0.1
       use_batchnorm: true
-    # 15:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [32, 64, 128]
-    #   decoder_hidden_dims: [128]
-    #   dropout: 0.2
-    #   use_batchnorm: true
-    # 16:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [48, 96]
-    #   decoder_hidden_dims: [96, 48]
-    #   dropout: 0.15
-    #   use_batchnorm: true
-    # 17:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [16, 32, 64, 128]
-    #   decoder_hidden_dims: [128, 64]
-    #   dropout: 0.3
-    #   use_batchnorm: true
-    # 18:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [28, 56, 112]
-    #   decoder_hidden_dims: [112]
-    #   dropout: 0.2
-    #   use_batchnorm: true
-    # 19:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [64, 96]
-    #   decoder_hidden_dims: [192, 96]
-    #   dropout: 0.25
-    #   use_batchnorm: true
 
 orchestrator:
   use_prototypes: false
   log_latent_diagnostics: true
-  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  max_lmb: 1e-02
-  lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl
   comm_task_coeff: 1
