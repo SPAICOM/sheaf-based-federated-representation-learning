@@ -1,7 +1,7 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: comfed
+  - orchestrator: sheaf_frl
   - optimizer: sgd
   - _self_
 
@@ -9,7 +9,7 @@ seed: 42
 study_name: "HeteroRate MNIST 15 agents"
 
 lmb_study:
-  enabled: true         # set to true to run Optuna search before the full training run
+  enabled: false         # set to true to run Optuna search before the full training run
   efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
   n_trials: 15          # number of Optuna trials
   n_tune_epochs: 5     # epochs per trial
@@ -31,14 +31,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: multi_hetero_agents
+  project: multi_homo_agents_true
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 30
+  max_epochs: 40
   accelerator: auto
   devices: 1
   deterministic: true
@@ -116,33 +116,15 @@ dataset:
     14:
       agents: [14]
       target_classes: [0, 1, 2, 3, 7, 8, 9]
-    # 15:
-    #   agents: [15]
-    #   target_classes: [2, 3, 4, 5, 6, 7, 8, 9]
-    # 16:
-    #   agents: [16]
-    #   target_classes: [0, 1, 5, 6, 7, 8, 9]
-    # 17:
-    #   agents: [17]
-    #   target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    # 18:
-    #   agents: [18]
-    #   target_classes: [2, 3, 4, 5, 6, 7, 8]
-    # 19:
-    #   agents: [19]
-    #   target_classes: [0, 1, 2, 3, 4, 8, 9]
 
 model:
-  # 15 heterogeneous CNN classifiers. They differ in depth (2-4 conv blocks;
-  # capped at 4 since MNIST 28x28 halves to 1x1 after 4 MaxPool stages),
-  # channel widths, decoder shape, dropout and batchnorm. The last conv
-  # channel sets each agent's latent (stalk) dimension, varied 32 -> 256.
+  # 15 homogeneous CNN classifiers — all agents share the same architecture.
   agents:
     0:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128]
-      decoder_hidden_dims: [256, 128, 64]
-      dropout: 0.3
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
@@ -152,119 +134,89 @@ model:
       use_batchnorm: true
     2:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [16, 32, 64]
-      decoder_hidden_dims: [128]
-      dropout: 0.2
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     3:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128]
-      decoder_hidden_dims: [256, 128]
-      dropout: 0.25
-      use_batchnorm: false
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
     4:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 48, 96, 192]
-      decoder_hidden_dims: [192, 96]
-      dropout: 0.3
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     5:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [24, 48, 96]
-      decoder_hidden_dims: [96]
-      dropout: 0.15
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     6:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128, 256]
-      decoder_hidden_dims: [256]
-      dropout: 0.4
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     7:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [16, 32]
-      decoder_hidden_dims: [64, 32]
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
       dropout: 0.1
-      use_batchnorm: false
+      use_batchnorm: true
     8:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [48, 96, 160]
-      decoder_hidden_dims: [160, 80]
-      dropout: 0.2
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     9:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 80]
-      decoder_hidden_dims: [100]
-      dropout: 0.05
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     10:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [40, 80, 120]
-      decoder_hidden_dims: [120, 60]
-      dropout: 0.3
-      use_batchnorm: false
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
     11:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128, 128]
-      decoder_hidden_dims: [256, 128]
-      dropout: 0.35
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     12:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [20, 40, 60, 80]
-      decoder_hidden_dims: [80]
-      dropout: 0.2
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     13:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 96]
-      decoder_hidden_dims: [192, 96]
-      dropout: 0.25
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
       use_batchnorm: true
     14:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [56, 112]
-      decoder_hidden_dims: [128]
+      encoder_hidden_dims: [32, 64]
+      decoder_hidden_dims: [120]
       dropout: 0.1
-      use_batchnorm: false
-    # 15:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [32, 64, 128]
-    #   decoder_hidden_dims: [128]
-    #   dropout: 0.2
-    #   use_batchnorm: true
-    # 16:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [48, 96]
-    #   decoder_hidden_dims: [96, 48]
-    #   dropout: 0.15
-    #   use_batchnorm: true
-    # 17:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [16, 32, 64, 128]
-    #   decoder_hidden_dims: [128, 64]
-    #   dropout: 0.3
-    #   use_batchnorm: true
-    # 18:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [28, 56, 112]
-    #   decoder_hidden_dims: [112]
-    #   dropout: 0.2
-    #   use_batchnorm: false
-    # 19:
-    #   _target_: src.agents.CNNClassifier
-    #   encoder_hidden_dims: [64, 96]
-    #   decoder_hidden_dims: [192, 96]
-    #   dropout: 0.25
-    #   use_batchnorm: true
+      use_batchnorm: true
 
 orchestrator:
   use_prototypes: false
   log_latent_diagnostics: true
   # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  max_lmb: 1e-02
-  lambda_schedule: null
+  # max_lmb: 1e-02
+  # lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl
   comm_task_coeff: 1
@@ -291,5 +243,5 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
-      orchestrator: non_cooperative, ce_sheaf_frl
+      dataset.shift_strength: 0.6, 0.7, 0.8, 0.9
+      orchestrator: federated, non_cooperative, sheaf_fmtl, comfed

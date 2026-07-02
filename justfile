@@ -95,3 +95,11 @@ sfrl:
     else
         tmux attach-session -t "$session"
     fi
+
+# Run multi-agent experiment with hetero config (default)
+multiagent-hetero *args="":
+    uv run scripts/multi_agent_experiment.py {{args}}
+
+# Run multi-agent experiment with homo config
+multiagent-homo *args="":
+    uv run scripts/multi_agent_experiment.py --config-name hetero_rate_multiagent_mnist_homo {{args}}
