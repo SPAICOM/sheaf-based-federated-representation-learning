@@ -1,6 +1,6 @@
 _target_: src.orchestrators.ComFed
 
-max_lmb: 1.18e-4
+max_lmb: 1.18e-3
 lambda_schedule: null
 
 proj_dim: 64

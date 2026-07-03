@@ -103,3 +103,15 @@ multiagent-hetero *args="":
 # Run multi-agent experiment with homo config
 multiagent-homo *args="":
     uv run scripts/multi_agent_experiment.py --config-name hetero_rate_multiagent_mnist_homo {{args}}
+
+# Plot the sfrl_bottleneck sweep (comm task perf vs latent dim)
+plot-bottleneck *args="":
+    uv run scripts/plot_bottleneck_metrics.py --project sfrl_bottleneck {{args}}
+
+# Plot the multi_hetero_agents_true project (comm-vs-shift, training curves, tables)
+plot-hetero *args="":
+    uv run scripts/plot_multiagent_metrics.py --project multi_hetero_agents_true {{args}}
+
+# Plot the multi_homo_agents_true project (own out_dir so hetero plots aren't overwritten)
+plot-homo *args="":
+    uv run scripts/plot_multiagent_metrics.py --project multi_homo_agents_true --out_dir results/multi_agent/plots_homo {{args}}

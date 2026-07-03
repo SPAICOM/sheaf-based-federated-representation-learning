@@ -19,10 +19,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    PostTrainingAlignmentMixin,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class FedMuscle(BaseOrchestrator):
+class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
     """Federated learning with Muscle loss for representation alignment.
 
     Implements the FedMuscle algorithm where:
@@ -51,7 +55,15 @@ class FedMuscle(BaseOrchestrator):
     T : int, optional
         Number of CL alignment epochs per communication round (default: 1).
     alignment_mode : str, optional
-        Loss mode: "contrastive" (default) or "alignment".
+        Muscle *loss* mode used during training: "contrastive" (default) or
+        "alignment".
+    alignment_method : str, optional
+        Post-training *map* used to measure cross-agent communication accuracy
+        at test time: ``'general'`` (unconstrained least-squares, default) or
+        ``'procrustes'`` (semi-orthogonal). Whitening + alignment maps are
+        fitted post-hoc on pilot data via :class:`PostTrainingAlignmentMixin`;
+        this does not change any training-time behaviour. Distinct from
+        ``alignment_mode`` above.
 
     Notes
     -----
@@ -73,6 +85,7 @@ class FedMuscle(BaseOrchestrator):
         T: int = 1,
         alignment_mode: str = 'contrastive',
         lambda_schedule: str | None = None,
+        alignment_method: str = 'general',
         **kwargs,
     ):
         super().__init__(
@@ -81,6 +94,12 @@ class FedMuscle(BaseOrchestrator):
             optimizer=optimizer,
             **kwargs,
         )
+        alignment_method = str(alignment_method)
+        if alignment_method not in VALID_ALIGNMENT_METHODS:
+            raise ValueError(
+                f"Unknown alignment_method '{alignment_method}'. "
+                f'Valid options: {VALID_ALIGNMENT_METHODS}'
+            )
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
@@ -431,6 +450,7 @@ class FedMuscle(BaseOrchestrator):
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
+            skip_task_performance=(prefix == 'test'),
             extra_metrics={
                 f'{prefix}/muscle_loss': muscle_loss,
                 f'{prefix}/effective_lambda': torch.tensor(
@@ -449,16 +469,26 @@ class FedMuscle(BaseOrchestrator):
 
         return outputs, total_loss
 
+    # send_message, _fit_alignment_maps, _cleanup_alignment and
+    # evaluate_communication_accuracy are inherited from
+    # PostTrainingAlignmentMixin.  Post-hoc whitening + alignment maps are
+    # fitted on pilot data before evaluation so cross-agent communication task
+    # metrics can be reported, mirroring FederatedLearning / NonCooperative.
 
-    def send_message(
-        self,
-        sender_idx: int,
-        receiver_idx: int,
-        Z_sender: torch.Tensor,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            f'{self.__class__.__name__} does not implement send_message.'
-        )
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

@@ -8,12 +8,21 @@ defaults:
 seed: 42
 study_name: "HeteroRate MNIST 2 agents"
 
+# ── Compression study grid ────────────────────────────────────────────────────
+# The orchestrator is the only Hydra multirun dimension (sheaf_cfrl vs comfed);
+# the compression-factor and shift grids below are looped *inside* the script so
+# that one λ study can be shared across all shifts of a given factor.
+study:
+  compression_factors: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  shift_strengths: [0.5, 0.6]
+
 lmb_study:
-  enabled: true        # set to true to run Optuna search before the full training run
+  enabled: false         # run one Optuna search per (orchestrator, compression_factor)
   n_trials: 20          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
   lmb_low: 1.0e-4       # lower bound of the log-uniform search interval
   lmb_high: 1.0         # upper bound of the log-uniform search interval
+  ref_shift_strength: 0.7  # shift at which λ is tuned (then held fixed across shifts)
 
 graph:
   neighbors_mode: "fully_connected"
@@ -24,14 +33,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sfrl_bottleneck
+  project: compressed_sfrl_1
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 20
+  max_epochs: 1
   accelerator: auto
   devices: 1
   deterministic: true
@@ -64,6 +73,7 @@ dataset:
       target_classes: [0, 1, 2, 3, 4, 5]
 
 model:
+  encoder_hidden_dims: [64, 128]   # latent_dim = last hidden dim = 128
   agents:
     0:
       _target_: src.agents.CNNClassifier
@@ -79,11 +89,9 @@ model:
       use_batchnorm: true
 
 orchestrator:
+  pid_logging: false
   use_prototypes: false
   log_latent_diagnostics: true
-  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  max_lmb: 1e-02
-  lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0
   comm_task_coeff: 1
@@ -107,4 +115,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      orchestrator.compression_factor: 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
+      # Compare the two compression-efficient orchestrators. The compression
+      # factor and shift grids are swept inside the script (see `study:` above)
+      # so that one λ study per factor is reused across all shifts.
+      orchestrator: sheaf_cfrl, comfed

@@ -15,10 +15,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    PostTrainingAlignmentMixin,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class FedProto(BaseOrchestrator):
+class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
     """Federated learning with prototype-based representation alignment.
 
     Implements FedProto where:
@@ -44,6 +48,12 @@ class FedProto(BaseOrchestrator):
         Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     prototype_momentum : float, optional
         Momentum for updating global prototypes (default: 0.9).
+    alignment_method : str, optional
+        Post-training alignment used to measure cross-agent communication
+        accuracy at test time: ``'general'`` (unconstrained least-squares,
+        default) or ``'procrustes'`` (semi-orthogonal). Whitening + alignment
+        maps are fitted post-hoc on pilot data via
+        :class:`PostTrainingAlignmentMixin`; no training-time behaviour changes.
 
     Notes
     -----
@@ -61,6 +71,7 @@ class FedProto(BaseOrchestrator):
         max_lmb: float = 0.1,
         prototype_momentum: float = 0.9,
         lambda_schedule: str | None = None,
+        alignment_method: str = 'general',
         **kwargs,
     ):
         super().__init__(
@@ -69,6 +80,12 @@ class FedProto(BaseOrchestrator):
             optimizer=optimizer,
             **kwargs,
         )
+        alignment_method = str(alignment_method)
+        if alignment_method not in VALID_ALIGNMENT_METHODS:
+            raise ValueError(
+                f"Unknown alignment_method '{alignment_method}'. "
+                f'Valid options: {VALID_ALIGNMENT_METHODS}'
+            )
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
@@ -320,6 +337,7 @@ class FedProto(BaseOrchestrator):
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
+            skip_task_performance=(prefix == 'test'),
             extra_metrics={
                 f'{prefix}/proto_loss': proto_loss,
                 f'{prefix}/num_global_prototypes': torch.tensor(
@@ -332,16 +350,26 @@ class FedProto(BaseOrchestrator):
 
         return outputs, total_loss
 
+    # send_message, _fit_alignment_maps, _cleanup_alignment and
+    # evaluate_communication_accuracy are inherited from
+    # PostTrainingAlignmentMixin.  Post-hoc whitening + alignment maps are
+    # fitted on pilot data before evaluation so cross-agent communication task
+    # metrics can be reported, mirroring FederatedLearning / NonCooperative.
 
-    def send_message(
-        self,
-        sender_idx: int,
-        receiver_idx: int,
-        Z_sender: torch.Tensor,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            f'{self.__class__.__name__} does not implement send_message.'
-        )
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

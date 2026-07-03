@@ -1,7 +1,7 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: sheaf_fmtl
+  - orchestrator: comfed
   - optimizer: sgd
   - _self_
 
@@ -246,4 +246,4 @@ hydra:
   sweeper:
     params:
       dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
-      orchestrator: non_cooperative, ce_sheaf_frl, sheaf_frl, sheaf_cfrl, sheaf_fmtl, comfed
+      # orchestrator: non_cooperative, ce_sheaf_frl, sheaf_frl, sheaf_cfrl, sheaf_fmtl, comfed

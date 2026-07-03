@@ -21,6 +21,10 @@ produces:
        - communication rounds (training-cumulative)
        - communication kilobytes (training-cumulative)
        - number of parameters: agent weights (+ sheaf/coupling maps)
+       - estimated training FLOPs: 3 x per-sample forward FLOPs x
+         batch_size x total steps (agent-only; see note below)
+       - runtime proxy: total run wall-clock (``_runtime``); no eval-only
+         timer is logged, so this is fit+test combined
 
 Parameter counting
 ------------------
@@ -50,6 +54,13 @@ Usage:
         --project multi_hetero_agents_true \\
         --out_dir results/multi_agent/plots
     python scripts/plot_multiagent_metrics.py --no-params   # skip param counts
+
+When several runs share the same (orchestrator, shift) — e.g. a re-run ComFed —
+``--select`` chooses which to keep:
+    python scripts/plot_multiagent_metrics.py --select best      # best comm perf
+    python scripts/plot_multiagent_metrics.py --select latest    # most recent (default)
+    python scripts/plot_multiagent_metrics.py --select best \\
+        --select-metric test/avg_private_task_perf               # best by another metric
 """
 
 from __future__ import annotations
@@ -70,6 +81,8 @@ import yaml
 ORCH_ORDER = [
     'NonCooperativeLearning',
     'ComFed',
+    'FedProto',
+    'FedMuscle',
     'SheafFMTL',
     'SheafFRL',
     'CESheafFRL',
@@ -78,6 +91,8 @@ ORCH_ORDER = [
 ORCH_LABELS = {
     'NonCooperativeLearning': 'Non-cooperative',
     'ComFed': 'ComFed',
+    'FedProto': 'FedProto',
+    'FedMuscle': 'FedMuscle',
     'SheafFMTL': 'Sheaf-FMTL',
     'SheafFRL': 'Sheaf-FRL',
     'CESheafFRL': 'CE-Sheaf-FRL',
@@ -243,18 +258,45 @@ def _per_agent_values(summary: dict[str, Any], pattern: re.Pattern) -> list[floa
 # ── Discovery / dedup ─────────────────────────────────────────────────────────
 
 
+def _selection_score(
+    meta: dict[str, Any], select: str, metric: str
+) -> tuple[float, ...]:
+    """Sort key for picking one run among duplicates of the same (orch, shift).
+
+    ``latest`` ranks by mtime; ``best`` ranks by the chosen summary ``metric``
+    (higher = better), falling back to mtime as a tie-breaker. Runs missing the
+    metric score -inf so a run that has it always wins.
+    """
+    if select == 'best':
+        val = meta['summary'].get(metric)
+        val = float(val) if isinstance(val, (int, float)) else float('-inf')
+        return (val, meta['mtime'])
+    return (meta['mtime'],)
+
+
 def discover_runs(
     wandb_dir: Path,
     project: str | None,
     study_name: str | None = None,
+    select: str = 'latest',
+    select_metric: str = 'test/avg_comm_task_perf',
 ) -> dict[tuple[str, float], dict[str, Any]]:
-    """Return {(orch, shift): meta} keeping the latest completed matching run.
+    """Return {(orch, shift): meta}, one chosen run per cell.
 
     Runs are scoped by their wandb ``project`` (a run property, read from the
     RunRecord) — not by ``study_name``, which is reused across projects and so
     leaks runs from unrelated sweeps.
+
+    When several completed runs share the same ``(orch, shift)`` (e.g. repeated
+    ComFed runs), ``select`` decides which one is kept:
+      * ``latest`` — most recent by mtime (default, reproduces old behaviour);
+      * ``best``   — highest ``select_metric`` (default the plotted comm perf).
     """
-    best: dict[tuple[str, float], dict[str, Any]] = {}
+    from collections import defaultdict
+
+    candidates: dict[tuple[str, float], list[dict[str, Any]]] = defaultdict(
+        list
+    )
     for run_dir in sorted(wandb_dir.glob('run-*')):
         if project is not None and read_run_project(run_dir) != project:
             continue
@@ -265,9 +307,22 @@ def discover_runs(
             continue
         if 'test/avg_comm_task_perf' not in meta['summary']:
             continue  # "completed" = test phase finished
-        key = (meta['orch'], meta['shift'])
-        if key not in best or meta['mtime'] > best[key]['mtime']:
-            best[key] = meta
+        candidates[(meta['orch'], meta['shift'])].append(meta)
+
+    best: dict[tuple[str, float], dict[str, Any]] = {}
+    for key, metas in candidates.items():
+        chosen = max(metas, key=lambda m: _selection_score(m, select, metric=select_metric))
+        best[key] = chosen
+        if len(metas) > 1:
+            orch, shift = key
+            score = chosen['summary'].get(select_metric)
+            print(
+                f'  {orch} @ shift {shift:g}: {len(metas)} runs → kept '
+                f'{chosen["dir"].name} ({select}'
+                + (f", {select_metric}={score:.3f}" if select == 'best'
+                   and isinstance(score, (int, float)) else '')
+                + ')'
+            )
     return best
 
 
@@ -335,8 +390,15 @@ def _param_signature(raw_config: dict[str, Any]) -> str:
     return json.dumps(sig, sort_keys=True, default=str)
 
 
-def count_parameters(meta: dict[str, Any]) -> dict | None:
-    """Return {agent_params, map_params, total} for a run, or None on failure."""
+def count_model_stats(meta: dict[str, Any]) -> dict | None:
+    """Return {agent_params, map_params, total, fwd_flops_total} or None.
+
+    ``fwd_flops_total`` is the forward-pass FLOP count (torch ``FlopCounterMode``
+    convention) for a *single* input, summed across all agents. It depends only
+    on the agent architectures, so it is identical across orchestrators that
+    share the same agents — the training-FLOP estimate scales it by
+    ``3 x batch_size x steps`` in the table builder.
+    """
     sig = _param_signature(meta['raw_config'])
     if sig in _PARAM_CACHE:
         return _PARAM_CACHE[sig]
@@ -344,6 +406,8 @@ def count_parameters(meta: dict[str, Any]) -> dict | None:
     result: dict | None = None
     try:
         import sys
+
+        import torch
 
         repo_root = str(Path(__file__).resolve().parent.parent)
         if repo_root not in sys.path:
@@ -396,13 +460,28 @@ def count_parameters(meta: dict[str, Any]) -> dict | None:
                 m.W.numel() for m in orch.whitening_layers.values()
             )
         map_params = (registered - agent_params) + whitening_W
+
+        # Forward FLOPs for one input, summed across agents.
+        from torch.utils.flop_counter import FlopCounterMode
+
+        example = torch.zeros(1, channels, img, img)
+        fwd_flops_total = 0
+        for agent in agents.values():
+            agent.eval()
+            counter = FlopCounterMode(display=False)
+            with counter, torch.no_grad():
+                agent(example)
+            fwd_flops_total += int(counter.get_total_flops())
+
         result = {
             'agent_params': int(agent_params),
             'map_params': int(map_params),
             'total': int(agent_params + map_params),
+            'fwd_flops_total': int(fwd_flops_total),
         }
     except Exception as exc:  # noqa: BLE001 — table still useful without counts
-        print(f'  [warn] param count failed for {meta["orch"]}: {exc}')
+        print(f'  [warn] model-stats reconstruction failed for '
+              f'{meta["orch"]}: {exc}')
         result = None
 
     _PARAM_CACHE[sig] = result
@@ -417,6 +496,17 @@ def _fmt_count(n: int) -> str:
     if n >= 1e3:
         return f'{n / 1e3:.1f} K'
     return str(n)
+
+
+def _fmt_flops(n: float) -> str:
+    for suffix, div in (('E', 1e18), ('P', 1e15), ('T', 1e12), ('G', 1e9)):
+        if n >= div:
+            return f'{n / div:.2f} {suffix}FLOPs'
+    return f'{n / 1e6:.1f} MFLOPs'
+
+
+def _fmt_seconds(s: float) -> str:
+    return f'{int(round(s))} s ({s / 60:.1f} min)'
 
 
 # ── Plot 1: comm task perf vs shift ───────────────────────────────────────────
@@ -569,17 +659,32 @@ def build_shift_table(
             'private_task_perf_std': priv_std,
             'comm_rounds': summ.get('train/communication_rounds'),
             'comm_kb': summ.get('train/communication_kilobytes'),
+            # Proxy for evaluation time: total run wall-clock (fit + test).
+            'runtime_s': summ.get('_runtime'),
         }
         if with_params:
-            counts = count_parameters(meta)
-            if counts is None:
+            stats = count_model_stats(meta)
+            if stats is None:
                 row['agent_params'] = None
                 row['map_params'] = None
                 row['total_params'] = None
+                row['train_flops_est'] = None
             else:
-                row['agent_params'] = counts['agent_params']
-                row['map_params'] = counts['map_params']
-                row['total_params'] = counts['total']
+                row['agent_params'] = stats['agent_params']
+                row['map_params'] = stats['map_params']
+                row['total_params'] = stats['total']
+                # Estimated training FLOPs: 3 (fwd+bwd) x per-sample forward
+                # FLOPs x samples processed (batch_size x total steps).
+                ds = _unwrap(meta['raw_config'], 'dataset') or {}
+                batch_size = ds.get('batch_size') if isinstance(ds, dict) else None
+                steps = summ.get('trainer/global_step')
+                if batch_size is not None and steps is not None:
+                    row['train_flops_est'] = (
+                        3 * stats['fwd_flops_total'] * int(batch_size)
+                        * int(steps)
+                    )
+                else:
+                    row['train_flops_est'] = None
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -617,6 +722,13 @@ def _pretty_table(df: pd.DataFrame, with_params: bool) -> pd.DataFrame:
             else:
                 params.append(_fmt_count(int(r['agent_params'])))
         out['Params (agents + maps)'] = params
+        out['Est. train FLOPs'] = [
+            'n/a' if f is None else _fmt_flops(float(f))
+            for f in df['train_flops_est']
+        ]
+    out['Runtime (proxy)'] = [
+        '—' if s is None else _fmt_seconds(float(s)) for s in df['runtime_s']
+    ]
     return out
 
 
@@ -681,6 +793,20 @@ def main() -> None:
         '--out_dir', type=Path, default=Path('results/multi_agent/plots')
     )
     parser.add_argument(
+        '--select',
+        choices=['latest', 'best'],
+        default='latest',
+        help='When several runs share an (orchestrator, shift): keep the most '
+        'recent (latest, default) or the best-scoring (best).',
+    )
+    parser.add_argument(
+        '--select-metric',
+        type=str,
+        default='test/avg_comm_task_perf',
+        help='Summary metric maximised when --select best (default: the '
+        'plotted comm task perf).',
+    )
+    parser.add_argument(
         '--no-params',
         action='store_true',
         help='Skip parameter counting (avoids reconstructing the models).',
@@ -689,8 +815,17 @@ def main() -> None:
 
     project = None if args.project.lower() == 'none' else args.project
     study = None if args.study_name.lower() == 'none' else args.study_name
-    print(f'Scanning {args.wandb_dir} (project={project!r}, study={study!r}) …')
-    runs = discover_runs(args.wandb_dir, project, study)
+    print(
+        f'Scanning {args.wandb_dir} (project={project!r}, study={study!r}, '
+        f'select={args.select!r}) …'
+    )
+    runs = discover_runs(
+        args.wandb_dir,
+        project,
+        study,
+        select=args.select,
+        select_metric=args.select_metric,
+    )
     if not runs:
         raise SystemExit(
             f'No completed runs found in {args.wandb_dir} '
