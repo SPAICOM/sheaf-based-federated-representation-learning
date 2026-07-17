@@ -45,6 +45,7 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
     def on_train_epoch_end(self) -> None:
         """No communication or aggregation is performed."""
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
         return None
 
     def _shared_eval(

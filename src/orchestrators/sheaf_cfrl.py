@@ -19,11 +19,13 @@ misalignment and the *communication* loss — how well each node reconstructs th
 other after the lossy round-trip ``V_·^T V_·`` through the edge stalk (Section
 9.2).  For β > 0 the communication terms couple the two maps non-linearly (one
 appears transposed inside a product with the other), so the naive alternating
-Procrustes solution is wrong (Section 9.3); Phase B instead runs ``T_B`` SOC-ADMM
-iterations per edge, each a closed-form pass of two generalised Sylvester solves
-(updating ``V_ji`` then ``V_ij``), two polar projections onto the Stiefel
-manifold (the auxiliaries ``Y_i``, ``Y_j``) and a scaled dual ascent (``U_i``,
-``U_j``).  The decoupled three-phase schedule, whitening, and frozen-pilot
+Procrustes solution is wrong (Section 9.3); Phase B instead runs SOC-ADMM
+iterations per edge — a fixed budget of ``T_B`` when ``compression_inner_steps``
+is an int, or to convergence (Boyd's primal/dual residual criterion, capped at
+``compression_admm_max_iter``) when it is ``None`` — each a closed-form pass of
+two generalised Sylvester solves (updating ``V_ji`` then ``V_ij``), two polar
+projections onto the Stiefel manifold (the auxiliaries ``Y_i``, ``Y_j``) and a
+scaled dual ascent (``U_i``, ``U_j``).  The decoupled three-phase schedule, whitening, and frozen-pilot
 caching are inherited from :class:`CESheafFRL`; only the map structure, the
 (both-live and Phase-A frozen) coboundary penalties, the Phase-B update and
 ``send_message`` differ.
@@ -31,6 +33,7 @@ caching are inherited from :class:`CESheafFRL`; only the map structure, the
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import torch
@@ -54,10 +57,13 @@ class SheafCFRL(CESheafFRL):
         self,
         *,
         compression_factor: float = 0.5,
-        compression_inner_steps: int = 20,
+        compression_inner_steps: int | None = 20,
         compression_init: str = 'pca',
         compression_beta: float = 0.5,
         compression_admm_alpha: float = 1.0,
+        compression_admm_abs_tol: float = 1e-3,
+        compression_admm_rel_tol: float = 1e-2,
+        compression_admm_max_iter: int = 500,
         **kwargs,
     ):
         if str(compression_init) not in ('pca', 'truncated_identity'):
@@ -71,22 +77,45 @@ class SheafCFRL(CESheafFRL):
                 'min(d_i, d_j) — the edge-stalk dimension to retain on each '
                 f'edge (e.g. 0.5 keeps 50%); got {compression_factor!r}.'
             )
-        if int(compression_inner_steps) < 1:
-            raise ValueError('compression_inner_steps (T_B) must be >= 1.')
+        if (
+            compression_inner_steps is not None
+            and int(compression_inner_steps) < 1
+        ):
+            raise ValueError(
+                'compression_inner_steps (T_B) must be >= 1, or None to run '
+                'each Phase-B ADMM to convergence.'
+            )
         if not 0.0 <= float(compression_beta) < 1.0:
             raise ValueError('compression_beta (β) must lie in [0, 1).')
         if float(compression_admm_alpha) <= 0.0:
             raise ValueError('compression_admm_alpha (α) must be > 0.')
+        if (
+            float(compression_admm_abs_tol) < 0.0
+            or float(compression_admm_rel_tol) < 0.0
+        ):
+            raise ValueError(
+                'compression_admm_abs_tol (ε_abs) and compression_admm_rel_tol '
+                '(ε_rel) must be >= 0.'
+            )
+        if int(compression_admm_max_iter) < 1:
+            raise ValueError('compression_admm_max_iter (k_max) must be >= 1.')
 
         # SheafFRL.__init__ calls self._build_restriction_maps(...) (overridden
         # below) which only stashes the graph; the real maps are built here once
         # the compression hyperparameters are available.
         super().__init__(**kwargs)
         self._compression_factor = float(compression_factor)
-        self._compression_inner_steps = int(compression_inner_steps)
+        self._compression_inner_steps = (
+            None
+            if compression_inner_steps is None
+            else int(compression_inner_steps)
+        )
         self._compression_init = str(compression_init)
         self._compression_beta = float(compression_beta)
         self._compression_admm_alpha = float(compression_admm_alpha)
+        self._compression_admm_abs_tol = float(compression_admm_abs_tol)
+        self._compression_admm_rel_tol = float(compression_admm_rel_tol)
+        self._compression_admm_max_iter = int(compression_admm_max_iter)
         # Expose for logging / checkpointing (not captured by the parent's
         # save_hyperparameters, which only sees SheafFRL's signature).
         self.hparams['compression_factor'] = self._compression_factor
@@ -94,7 +123,20 @@ class SheafCFRL(CESheafFRL):
         self.hparams['compression_init'] = self._compression_init
         self.hparams['compression_beta'] = self._compression_beta
         self.hparams['compression_admm_alpha'] = self._compression_admm_alpha
+        self.hparams['compression_admm_abs_tol'] = (
+            self._compression_admm_abs_tol
+        )
+        self.hparams['compression_admm_rel_tol'] = (
+            self._compression_admm_rel_tol
+        )
+        self.hparams['compression_admm_max_iter'] = (
+            self._compression_admm_max_iter
+        )
         self._build_compression_maps()
+        # The parent registered the duals on the (empty) Stiefel edge set;
+        # re-key them onto the compressed edges now that they exist.
+        if self._dual_lmb_enabled():
+            self._init_edge_duals(e[0] for e in self._compression_edges)
 
     # ── Map construction ──────────────────────────────────────────────────────
 
@@ -315,7 +357,7 @@ class SheafCFRL(CESheafFRL):
             P_a = torch.matmul(Z_a, V_a.t())  # (n, c)
             P_b = torch.matmul(Z_b, V_b.t())  # (n, c)
             diff = P_a - P_b
-            sheaf_penalty += (diff**2).sum(dim=1).mean()
+            sheaf_penalty += self._edge_penalty_term(edge_key, diff)
 
             # ── After-communication task loss (project → lift across the edge) ─
             if comm_weight > 0.0:
@@ -404,14 +446,14 @@ class SheafCFRL(CESheafFRL):
                     d = torch.matmul(m[0], V_a.t()) - torch.matmul(
                         m[2], V_b.t()
                     )
-                    sheaf_penalty += (d**2).sum(dim=1).mean()
+                    sheaf_penalty += self._edge_penalty_term(edge_key, d)
             if a in frozen:
                 m = self._match_edge(a, b, frozen[a], src_b)
                 if m is not None:
                     d = torch.matmul(m[0], V_a.t()) - torch.matmul(
                         m[2], V_b.t()
                     )
-                    sheaf_penalty += (d**2).sum(dim=1).mean()
+                    sheaf_penalty += self._edge_penalty_term(edge_key, d)
 
         return sheaf_penalty, after_comm
 
@@ -426,8 +468,8 @@ class SheafCFRL(CESheafFRL):
         Sigma_b: torch.Tensor,
         Sigma_ab: torch.Tensor,
         c: int,
-        t_b: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        t_b: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, int]:
         """SOC-ADMM for one edge (Section 9.3); returns Stiefel-feasible maps.
 
         Parameters mirror the spec with ``i ↔ a``, ``j ↔ b``::
@@ -437,19 +479,45 @@ class SheafCFRL(CESheafFRL):
             Σ_a, Σ_b                 node second-moment matrices
             Σ_ab = Ãa^T Ãb / n       cross-moment  (Σ_ji = Σ_ab^T)
 
-        Each of the ``t_b`` iterations runs the four closed-form steps: two
-        generalised Sylvester solves (update ``V_a`` then ``V_b``, the latter
-        using the just-updated ``V_a``), two polar projections onto the Stiefel
-        manifold (auxiliaries ``Y_a``, ``Y_b``) and a scaled dual ascent
-        (``U_a``, ``U_b``).  The maps are read off from the converged auxiliaries
-        (``V_a = Y_aᵀ``) so they are exactly row-orthonormal.  Returns
-        ``(V_a, V_b, primal_residual)``.
+        Each iteration runs the four closed-form steps: two generalised
+        Sylvester solves (update ``V_a`` then ``V_b``, the latter using the
+        just-updated ``V_a``), two polar projections onto the Stiefel manifold
+        (auxiliaries ``Y_a``, ``Y_b``) and a scaled dual ascent (``U_a``,
+        ``U_b``).
+
+        With an integer ``t_b`` exactly that many iterations run.  With
+        ``t_b=None`` the recursion runs to convergence, monitored via Boyd's
+        primal/dual residuals on the splitting constraints ``V_·ᵀ = Y_·``::
+
+            R_· = V_·ᵀ − Y_·   (primal),    S_· = α (Y_· − Y_·^prev)   (dual)
+
+        stopping once ``max(‖R_a‖, ‖R_b‖) ≤ ε_pri`` and ``max(‖S_a‖, ‖S_b‖) ≤
+        ε_dual``, where the tolerances combine the absolute/relative inputs
+        (``compression_admm_abs_tol`` / ``compression_admm_rel_tol``)::
+
+            ε_pri  = √(d_max·c)·ε_abs + ε_rel·max(‖V_a‖, ‖V_b‖, √c)
+            ε_dual = √(d_max·c)·ε_abs + ε_rel·α·max(‖U_a‖, ‖U_b‖)
+
+        (``‖Y‖_F = √c`` on the Stiefel manifold), capped at
+        ``compression_admm_max_iter`` iterations.  The maps are read off from
+        the converged auxiliaries (``V_a = Y_aᵀ``) so they are exactly
+        row-orthonormal.  Returns ``(V_a, V_b, primal_residual, n_iters)``.
         """
         beta = self._compression_beta
         alpha = self._compression_admm_alpha
         dev, dt = V_a.device, V_a.dtype
         Ic = torch.eye(c, device=dev, dtype=dt)
         Sigma_ba = Sigma_ab.t()  # (d_b, d_a) = Σ_ji
+
+        run_to_convergence = t_b is None
+        max_iters = (
+            self._compression_admm_max_iter if run_to_convergence else t_b
+        )
+        # Dimension factors of the stopping tolerances (constant across iters).
+        d_max = max(V_a.shape[1], V_b.shape[1])
+        eps_dim = math.sqrt(d_max * c) * self._compression_admm_abs_tol
+        rel_tol = self._compression_admm_rel_tol
+        sqrt_c = math.sqrt(c)
 
         # Σ_a, Σ_b are fixed across the loop → eigendecompose once for the
         # symmetric Sylvester solves (Σ = Q diag(λ) Qᵀ).
@@ -464,7 +532,9 @@ class SheafCFRL(CESheafFRL):
         )  # (d_a,c),(d_b,c)
         U_a, U_b = torch.zeros_like(Y_a), torch.zeros_like(Y_b)
 
-        for _ in range(t_b):
+        n_iters = 0
+        for _ in range(max_iters):
+            n_iters += 1
             # Step 1 — update V_a = V_ji via the generalised Sylvester eq. (S1).
             A_b = (1.0 - beta) * Ic + beta * (V_b @ V_b.t())
             B_b = alpha * Ic + beta * (V_b @ Sigma_b @ V_b.t())
@@ -488,7 +558,9 @@ class SheafCFRL(CESheafFRL):
                 torch.linalg.solve(B_a, C_a),
             )
 
-            # Step 3 — project the transposed maps onto the Stiefel manifold.
+            # Step 3 — project the transposed maps onto the Stiefel manifold
+            # (keep the previous auxiliaries for the dual residual).
+            Y_a_prev, Y_b_prev = Y_a, Y_b
             Y_a = self._polar_factor(V_a.t() + U_a)  # (d_a, c) ∈ St(d_a, c)
             Y_b = self._polar_factor(V_b.t() + U_b)  # (d_b, c) ∈ St(d_b, c)
 
@@ -496,11 +568,30 @@ class SheafCFRL(CESheafFRL):
             U_a = U_a + V_a.t() - Y_a
             U_b = U_b + V_b.t() - Y_b
 
+            if run_to_convergence:
+                # Boyd stopping criterion on the splitting constraints.
+                r_norm = max(
+                    (V_a.t() - Y_a).norm().item(),
+                    (V_b.t() - Y_b).norm().item(),
+                )
+                s_norm = alpha * max(
+                    (Y_a - Y_a_prev).norm().item(),
+                    (Y_b - Y_b_prev).norm().item(),
+                )
+                eps_pri = eps_dim + rel_tol * max(
+                    V_a.norm().item(), V_b.norm().item(), sqrt_c
+                )
+                eps_dual = eps_dim + rel_tol * alpha * max(
+                    U_a.norm().item(), U_b.norm().item()
+                )
+                if r_norm <= eps_pri and s_norm <= eps_dual:
+                    break
+
         primal = float(
             (V_a.t() - Y_a).norm().item() + (V_b.t() - Y_b).norm().item()
         )
         # Read off Stiefel-feasible maps from the converged auxiliaries.
-        return Y_a.t().contiguous(), Y_b.t().contiguous(), primal
+        return Y_a.t().contiguous(), Y_b.t().contiguous(), primal, n_iters
 
     @torch.no_grad()
     def _update_stiefel_matrices(
@@ -567,7 +658,7 @@ class SheafCFRL(CESheafFRL):
                 Sigma_a = (Z_a.t() @ Z_a) / n  # (d_a, d_a) = Σ_i
                 Sigma_b = (Z_b.t() @ Z_b) / n  # (d_b, d_b) = Σ_j
                 Sigma_ab = (Z_a.t() @ Z_b) / n  # (d_a, d_b) = Σ_ij
-                V_a, V_b, primal = self._admm_phase_b(
+                V_a, V_b, primal, n_iters = self._admm_phase_b(
                     V_a, V_b, Sigma_a, Sigma_b, Sigma_ab, c_ij, t_b
                 )
                 param_a.copy_(V_a.to(dtype=param_a.dtype, device=dev))
@@ -575,6 +666,9 @@ class SheafCFRL(CESheafFRL):
                 edge_metrics[
                     f'compressed_admm_primal_resid_edge_{edge_key}'
                 ] = primal
+                edge_metrics[f'compressed_admm_iters_edge_{edge_key}'] = float(
+                    n_iters
+                )
                 self._initialized_edges.add(edge_key)
 
             resid = ((Z_a @ V_a.t() - Z_b @ V_b.t()) ** 2).sum(dim=1).mean()

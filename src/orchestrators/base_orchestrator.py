@@ -20,6 +20,7 @@ from hydra.utils import instantiate
 from PIL import Image as _PILImage
 from torchvision.transforms.functional import to_tensor as _pil_to_tensor
 
+from src.communication.whitening import common_pilot_indices
 from src.utils import calculate_communication_cost
 
 
@@ -527,7 +528,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._finalize_paired_communication('test', source_prefix='train')
 
     @torch.no_grad()
-    def evaluate_communication_accuracy(self, dm) -> dict[str, float]:
+    def evaluate_communication_accuracy(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
         """Compute cross-agent classification accuracy via the send_message pipeline.
 
         Generic across orchestrators: relies only on ``self.send_message`` to
@@ -541,6 +544,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
           2. The receiver's decoder classifies the reconstructed
              representations and accuracy is measured against the sender's
              ground-truth labels.
+
+        ``prefix`` namespaces the returned metric keys (default ``'test'``);
+        pass ``'train'`` to track this against the held-out split at other
+        points during training without colliding with the test-time metrics.
 
         Returns a dict of metric name → value; the caller is responsible for
         logging so that ``self.log_dict`` runs outside the no-grad context.
@@ -630,10 +637,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             self_accs[idx] = float(
                 (preds == test_y[idx]).float().mean().item()
             )
-            logs[f'test/private_task_perf_agent_{idx}'] = self_accs[idx]
+            logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
 
         if self_accs:
-            logs['test/avg_private_task_perf'] = sum(self_accs.values()) / len(self_accs)
+            logs[f'{prefix}/avg_private_task_perf'] = sum(self_accs.values()) / len(self_accs)
 
         # Communication accuracy and task fidelity per receiver.
         receiver_comm_accs: dict[int, float] = {}
@@ -673,21 +680,178 @@ class BaseOrchestrator(l.LightningModule, ABC):
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
-                logs[f'test/comm_task_perf_agent_{receiver_idx}'] = avg_acc
+                logs[f'{prefix}/comm_task_perf_agent_{receiver_idx}'] = avg_acc
 
                 self_acc = self_accs.get(receiver_idx, 0.0)
                 fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
                 task_fidelities[receiver_idx] = fidelity
-                logs[f'test/task_fidelity_agent_{receiver_idx}'] = fidelity
+                logs[f'{prefix}/task_fidelity_agent_{receiver_idx}'] = fidelity
 
         if receiver_comm_accs:
-            logs['test/avg_comm_task_perf'] = sum(
+            logs[f'{prefix}/avg_comm_task_perf'] = sum(
                 receiver_comm_accs.values()
             ) / len(receiver_comm_accs)
         if task_fidelities:
-            logs['test/avg_task_fidelity'] = sum(
+            logs[f'{prefix}/avg_task_fidelity'] = sum(
                 task_fidelities.values()
             ) / len(task_fidelities)
+
+        return logs
+
+    def _log_train_comm_task_perf(self) -> None:
+        """Log ``train/avg_comm_task_perf`` against the held-out test split.
+
+        Mirrors the test-time cross-agent accuracy logged in each
+        orchestrator's ``on_test_epoch_end`` (via
+        ``evaluate_communication_accuracy``), but runs every train epoch under
+        the ``'train'`` prefix so alignment quality can be tracked live
+        instead of only once at the very end.  Concrete orchestrators call
+        this from their own ``on_train_epoch_end``.
+
+        When the orchestrator's ``evaluate_communication_accuracy`` also
+        reports the coboundary misalignment loss (post-training-alignment
+        methods refit their maps for every call, so each epoch's value uses
+        maps fitted on the current representations; SheafFRL-family methods
+        evaluate their learned maps), ``train/misalignment_loss`` and its
+        per-edge breakdown are logged too.
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm, prefix='train')
+        keep = {
+            key: value
+            for key, value in logs.items()
+            if key == 'train/avg_comm_task_perf' or 'misalignment_loss' in key
+        }
+        if keep:
+            self.log_dict(
+                keep,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
+
+    @torch.no_grad()
+    def evaluate_misalignment_loss(self, dm, prefix: str = 'test') -> dict[str, float]:
+        """Cross-agent coboundary misalignment loss on matched pilot pairs.
+
+        For every directed edge (sender → receiver), projects the sender's
+        pilot latents into the receiver's space via ``self.send_message`` and
+        compares the result against the receiver's own pilot latents on the
+        samples common to both pilot sets (matched by sample id via
+        ``common_pilot_indices``).  This is the same quantity SheafFRL calls
+        ``sheaf_penalty`` (there evaluated in the whitened coboundary space
+        via its own online-learned Stiefel maps every step); here it is
+        evaluated generically through whatever ``send_message`` the concrete
+        orchestrator implements — with a post-training-fitted alignment map,
+        or as an identity fallback when none is fitted.
+
+        Normalised by ``2·d_receiver`` (see
+        :meth:`SheafFRL._edge_penalty_term`) for scale comparability.
+        Orchestrators without a working ``send_message`` (raising
+        ``NotImplementedError``) are silently skipped edge by edge.
+
+        Returns a dict of metric name → value; the caller logs it.
+        """
+        pilot_datasets = getattr(dm, 'pilot_datasets', None)
+        if not pilot_datasets:
+            return {}
+
+        def _collate_x(batch):
+            xs = []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+            return torch.stack(xs)
+
+        pilot_Z: dict[int, torch.Tensor] = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            pilot_ds = pilot_datasets.get(idx)
+            if pilot_ds is None or len(pilot_ds) == 0:
+                continue
+
+            loader = torch.utils.data.DataLoader(
+                pilot_ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate_x,
+            )
+            was_training = agent.training
+            agent.eval()
+            Zs = []
+            for x_batch in loader:
+                Zs.append(
+                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                )
+            agent.train(was_training)
+
+            if Zs:
+                pilot_Z[idx] = torch.cat(Zs, dim=0)
+
+        if not pilot_Z:
+            return {}
+
+        neighbors_map: dict[int, set[int]] = {
+            int(k): {int(n) for n in v}
+            for k, v in self.hparams.neighbors.items()
+        }
+
+        per_receiver: dict[int, list[float]] = {}
+        logs: dict[str, float] = {}
+        for sender_idx, receiver_set in neighbors_map.items():
+            if sender_idx not in pilot_Z:
+                continue
+            pi = pilot_datasets.get(sender_idx)
+            for receiver_idx in receiver_set:
+                if receiver_idx == sender_idx or receiver_idx not in pilot_Z:
+                    continue
+                pj = pilot_datasets.get(receiver_idx)
+                if pi is None or pj is None:
+                    continue
+
+                idx_i, idx_j = common_pilot_indices(pi, pj)
+                if len(idx_i) < 2:
+                    continue
+
+                Z_i = pilot_Z[sender_idx][idx_i]
+                Z_j = pilot_Z[receiver_idx][idx_j]
+                try:
+                    Z_pred = (
+                        self.send_message(
+                            sender_idx=sender_idx,
+                            receiver_idx=receiver_idx,
+                            Z_sender=Z_i.to(self.device),
+                        )
+                        .detach()
+                        .cpu()
+                        .float()
+                    )
+                except NotImplementedError:
+                    continue
+
+                diff = Z_pred - Z_j
+                d_e = diff.shape[1]
+                if d_e == 0:
+                    continue
+                normed = float(
+                    ((diff**2).sum(dim=1).mean() / (2.0 * d_e)).item()
+                )
+                logs[
+                    f'{prefix}/misalignment_loss_edge_{sender_idx}_{receiver_idx}'
+                ] = normed
+                per_receiver.setdefault(receiver_idx, []).append(normed)
+
+        all_vals = [v for vs in per_receiver.values() for v in vs]
+        if all_vals:
+            logs[f'{prefix}/misalignment_loss'] = sum(all_vals) / len(all_vals)
 
         return logs
 

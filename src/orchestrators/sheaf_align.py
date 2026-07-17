@@ -208,7 +208,14 @@ class SheafAlign(BaseOrchestrator):
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
-            extra_metrics={f'{prefix}/alignment_penalty': alignment_penalty},
+            extra_metrics={
+                f'{prefix}/alignment_penalty': alignment_penalty,
+                # Standardised alias tracked across all orchestrators (see
+                # BaseOrchestrator.evaluate_misalignment_loss). SheafAlign has
+                # no send_message/post-training alignment, so this is simply
+                # its own online-learned projection-based penalty.
+                f'{prefix}/misalignment_loss': alignment_penalty,
+            },
             prog_bar=False,
             per_agent_loss_name='task_loss',
         )

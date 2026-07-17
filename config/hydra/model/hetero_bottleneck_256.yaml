@@ -1,0 +1,13 @@
+agents:
+  0:
+    _target_: src.agents.CNNClassifier
+    encoder_hidden_dims: [64, 128, 256]
+    decoder_hidden_dims: [128, 64]
+    dropout: 0.3
+    use_batchnorm: true
+  1:
+    _target_: src.agents.CNNClassifier
+    encoder_hidden_dims: [128, 256]
+    decoder_hidden_dims: [128]
+    dropout: 0.1
+    use_batchnorm: true

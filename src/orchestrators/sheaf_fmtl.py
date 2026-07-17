@@ -187,6 +187,7 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 self.projection_matrices[edge_key].data -= update_matrix
 
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     def _collect_agent_vectors(self) -> dict[int, torch.Tensor]:
         """Return flattened trainable parameter vectors for each agent."""

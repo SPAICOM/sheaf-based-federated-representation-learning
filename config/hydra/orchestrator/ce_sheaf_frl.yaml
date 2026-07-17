@@ -1,7 +1,16 @@
 _target_: src.orchestrators.CESheafFRL
 
+# ── Sheaf-penalty weight λ: three mutually exclusive modes ────────────────────
+#   fixed     — max_lmb on every edge            (lambda_schedule: null, learn_lmb: false)
+#   scheduled — max_lmb warmed up over training  (lambda_schedule: cosine|exp, learn_lmb: false)
+#   learned   — per-edge λ_e by dual ascent on P_e/(2·d_e) ≤ dual_rho
+#               (learn_lmb: true; max_lmb and lambda_schedule are ignored)
 max_lmb: 3.23e-3
 lambda_schedule: null
+learn_lmb: false
+dual_rho: 0.1        # tolerated fraction of the unaligned residual energy, in (0, 1)
+dual_lr: 0.01        # per-step dual-ascent rate on the normalised violation
+dual_lmb_max: 100.0  # safety cap per multiplier (guards genuinely infeasible edges)
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
 sparse_communication: False

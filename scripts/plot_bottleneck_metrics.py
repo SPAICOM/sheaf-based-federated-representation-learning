@@ -1,23 +1,38 @@
-"""Visualize the ``sfrl_bottleneck`` sweep from local WandB run logs.
+"""Visualize the ``sfrl_bottleneck`` sweep from WandB run logs.
 
-Reads the WandB logs under ``logs/wandb/run-*`` (no cloud access) for the
-``sfrl_bottleneck`` project and plots communication task performance as a
-function of the latent (bottleneck) dimension:
+By default, fetches runs from the wandb cloud API (``--entity``/``--project``)
+— local ``logs/wandb`` run directories are routinely cleaned up once a run has
+synced, so the cloud is the reliable source of truth. Pass ``--local`` to
+instead read straight from the on-disk logs under ``logs/wandb/run-*`` (no
+cloud access) — this still auto-falls back to the cloud API if nothing local
+is found. Either way it plots communication task performance as a function of
+the latent (bottleneck) dimension:
 
     x-axis : ``latent_dim``               (logged in each run's config)
     y-axis : ``test/avg_comm_task_perf``  (final test-time scalar)
-    curves : one per orchestrator         (Federated / Non-cooperative / Sheaf-FRL)
+    curves : one per orchestrator
 
-A translucent band shows the spread (± std) of the per-agent
-``test/comm_task_perf_agent_{i}`` around the average.
+This reuses the exact plotting machinery from ``plot_multiagent_metrics.py``
+(:func:`plot_metric_vs_x`), so the styling is identical: by default
+(``adjusted=True``) each orchestrator's points are dodged slightly off the
+shared latent-dim value and the spread (± std) of the per-agent
+``test/comm_task_perf_agent_{i}`` around the average is drawn as small
+error-bar caps (bar-plot style) rather than a translucent band. Every
+orchestrator in ``EXCLUDED_ORCHS`` (from ``plot_multiagent_metrics``,
+currently ``CESheafFRL`` and ``SheafCFRL``) is dropped from the run set
+entirely before plotting — edit that set directly to bring one back.
 
-Runs are scoped by their wandb *project* (read from the RunRecord), so runs
-from other projects that reuse the same study name are never mixed in.
+Runs are scoped by their wandb *project*, so runs from other projects that
+reuse the same study name are never mixed in.
 
 Usage:
-    python scripts/plot_bottleneck_metrics.py
+    python scripts/plot_bottleneck_metrics.py   # remote, your default entity
     python scripts/plot_bottleneck_metrics.py \\
+        --entity my-team \\
         --project sfrl_bottleneck --out_dir results/bottleneck/plots
+
+    # Read from logs/wandb instead (falls back to remote if empty).
+    python scripts/plot_bottleneck_metrics.py --local
 """
 
 from __future__ import annotations
@@ -26,27 +41,26 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 import seaborn as sns
 
-# Reuse the WandB local-log helpers from the multi-agent plotting script.
+# Reuse the WandB log-parsing helpers, orchestrator labels/exclusions, and the
+# shared metric-vs-x plotting machinery from the multi-agent plotting script —
+# so the same orchestrator always looks the same, and every plot behaves
+# identically, across every plotting script here.
 from plot_multiagent_metrics import (  # noqa: E402
     _AGENT_COMM_RE,
+    EXCLUDED_ORCHS,
+    ORCH_ORDER,
+    _agent_metric_long_df,
     _load_raw_config,
-    _per_agent_values,
+    _remote_mtime,
+    _style_maps,
     _unwrap,
+    drop_excluded_orchs,
+    metric_summary_df,
+    plot_metric_vs_x,
     read_run_project,
 )
-
-# Orchestrator display order / labels for the bottleneck sweep.
-ORCH_ORDER = ['NonCooperativeLearning', 'FederatedLearning', 'SheafFRL']
-ORCH_LABELS = {
-    'NonCooperativeLearning': 'Non-cooperative',
-    'FederatedLearning': 'Federated',
-    'SheafFRL': 'Sheaf-FRL',
-}
 
 
 def discover_runs(
@@ -101,69 +115,66 @@ def discover_runs(
     return best
 
 
+def discover_runs_remote(
+    api: Any,
+    entity: str,
+    project: str,
+    exclude_latent: set[float] | None = None,
+) -> dict[tuple[str, float], dict[str, Any]]:
+    """Same contract as :func:`discover_runs`, scanning a wandb cloud project.
+
+    Used as an automatic fallback when the local ``logs/wandb`` scan finds
+    nothing (e.g. the local run directories were cleaned up after syncing).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    exclude_latent = exclude_latent or set()
+    remote_runs = list(
+        api.runs(f'{entity}/{project}', filters={'state': 'finished'})
+    )
+
+    def _meta(run: Any) -> dict[str, Any] | None:
+        # api.runs() hands back lazily-loaded runs: .config/.summary are
+        # empty until a full attribute load is forced.
+        run.load(force=True)
+        raw = dict(run.config)
+        orch = _unwrap(raw, 'orchestrator')
+        orch_name = (
+            str(orch['_target_']).split('.')[-1]
+            if isinstance(orch, dict) and '_target_' in orch
+            else None
+        )
+        latent_dim = _unwrap(raw, 'latent_dim')
+        if orch_name is None or latent_dim is None:
+            return None
+        if float(latent_dim) in exclude_latent:
+            return None
+        summary = dict(run.summary)
+        if 'test/avg_comm_task_perf' not in summary:
+            return None
+        return {
+            'orch': orch_name,
+            'latent_dim': float(latent_dim),
+            'summary': summary,
+            'mtime': _remote_mtime(run, summary),
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        metas = list(pool.map(_meta, remote_runs))
+
+    best: dict[tuple[str, float], dict[str, Any]] = {}
+    for meta in metas:
+        if meta is None:
+            continue
+        key = (meta['orch'], meta['latent_dim'])
+        if key not in best or meta['mtime'] > best[key]['mtime']:
+            best[key] = meta
+    return best
+
+
 def _ordered_orchs(orchs: set[str]) -> list[str]:
     known = [o for o in ORCH_ORDER if o in orchs]
     return known + sorted(o for o in orchs if o not in ORCH_ORDER)
-
-
-def plot_comm_vs_latent(
-    runs: dict[tuple[str, float], dict[str, Any]],
-    orchs: list[str],
-    out_dir: Path,
-) -> pd.DataFrame:
-    palette = sns.color_palette('tab10', n_colors=max(len(orchs), 3))
-    colors = {o: palette[i] for i, o in enumerate(orchs)}
-    markers = ['o', 's', '^', 'D', 'v', 'P']
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    table_rows = []
-    for idx, orch in enumerate(orchs):
-        pts = []
-        for (o, latent), meta in runs.items():
-            if o != orch:
-                continue
-            avg = float(meta['summary']['test/avg_comm_task_perf'])
-            per_agent = _per_agent_values(meta['summary'], _AGENT_COMM_RE)
-            std = float(np.std(per_agent)) if per_agent else 0.0
-            pts.append((latent, avg, std))
-            table_rows.append(
-                {
-                    'orchestrator': ORCH_LABELS.get(orch, orch),
-                    'latent_dim': latent,
-                    'avg_comm_task_perf': avg,
-                    'comm_task_perf_std': std,
-                }
-            )
-        if not pts:
-            continue
-        pts.sort()
-        xs = np.array([p[0] for p in pts])
-        ys = np.array([p[1] for p in pts])
-        ax.plot(
-            xs,
-            ys,
-            marker=markers[idx % len(markers)],
-            markersize=9,
-            linewidth=2.5,
-            color=colors[orch],
-            label=ORCH_LABELS.get(orch, orch),
-        )
-
-    latents = sorted({latent for _, latent in runs})
-    ax.set_xticks(latents)
-    ax.set_xticklabels([str(int(x)) for x in latents], rotation=45, ha='right')
-    ax.set_xlabel('Latent (bottleneck) dimension')
-    ax.set_ylabel('Avg communication task performance')
-    ax.set_title('Communication task performance vs latent dimension')
-    ax.legend(title='Orchestrator', frameon=True)
-    sns.despine()
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / 'comm_task_perf_vs_latent_dim.png'
-    fig.savefig(out, dpi=150, bbox_inches='tight')
-    print(f'  saved → {out}')
-    plt.close(fig)
-    return pd.DataFrame(table_rows).sort_values(['orchestrator', 'latent_dim'])
 
 
 def main() -> None:
@@ -183,30 +194,106 @@ def main() -> None:
         default=[128.0],
         help='Latent dims to drop (default: 128). Pass nothing to keep all.',
     )
+    parser.add_argument(
+        '--entity',
+        type=str,
+        default=None,
+        help='wandb entity to use for the (default) remote fetch (default: '
+        'your wandb default entity). Ignored with --local.',
+    )
+    parser.add_argument(
+        '--local',
+        action='store_true',
+        help='Scan local logs/wandb run directories instead of the wandb '
+        'cloud API. Still auto-falls back to the API if nothing local is '
+        'found.',
+    )
     args = parser.parse_args()
 
     project = None if args.project.lower() == 'none' else args.project
     exclude = set(args.exclude_latent)
-    print(f'Scanning {args.wandb_dir} (project={project!r}) …')
     if exclude:
-        print(f'  excluding latent dims: {sorted(int(x) for x in exclude)}')
-    runs = discover_runs(args.wandb_dir, project, exclude_latent=exclude)
+        print(f'Excluding latent dims: {sorted(int(x) for x in exclude)}')
+
+    def _fetch_remote() -> dict[tuple[str, float], dict[str, Any]]:
+        if project is None:
+            raise SystemExit(
+                'Remote fetching needs an explicit --project (use --local '
+                'for an all-projects local scan).'
+            )
+        import wandb
+
+        api = wandb.Api()
+        entity = args.entity or api.default_entity
+        if entity is None:
+            raise SystemExit(
+                'No wandb entity available for the remote fetch (pass '
+                '--entity, or run `wandb login`).'
+            )
+        print(f'Scanning wandb cloud project {entity}/{project!r} …')
+        return discover_runs_remote(api, entity, project, exclude_latent=exclude)
+
+    if args.local:
+        print(f'Scanning {args.wandb_dir} (project={project!r}) …')
+        runs = discover_runs(args.wandb_dir, project, exclude_latent=exclude)
+        if not runs and project is not None:
+            print(
+                f'No completed local runs found in {args.wandb_dir} — '
+                f'falling back to the wandb cloud API …'
+            )
+            runs = _fetch_remote()
+    else:
+        runs = _fetch_remote()
+
     if not runs:
         raise SystemExit(
-            f'No completed runs found in {args.wandb_dir} '
-            f'for project {project!r}.'
+            f'No completed runs found for project {project!r} '
+            f'({"local" if args.local else "remote"}).'
+        )
+
+    runs = drop_excluded_orchs(runs)
+    if not runs:
+        raise SystemExit(
+            f'No completed runs left for project {project!r} after '
+            f'excluding {sorted(EXCLUDED_ORCHS)}.'
         )
 
     orchs = _ordered_orchs({o for o, _ in runs})
+    colors, markers, _ = _style_maps(orchs)
     latents = sorted({latent for _, latent in runs})
     print(f'Found {len(runs)} runs — orchestrators: {orchs}')
     print(f'  latent dims: {[int(x) for x in latents]}')
 
-    df = plot_comm_vs_latent(runs, orchs, args.out_dir)
-    df.to_csv(args.out_dir / 'comm_task_perf_vs_latent_dim.csv', index=False)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style='whitegrid', context='paper', font_scale=1.4)
+
+    comm_df = _agent_metric_long_df(
+        runs, _AGENT_COMM_RE, 'comm_task_perf', x_col='latent_dim'
+    )
+    plot_metric_vs_x(
+        comm_df,
+        orchs,
+        colors,
+        markers,
+        args.out_dir,
+        'comm_task_perf_vs_latent_dim.png',
+        'comm_task_perf',
+        'Avg. communication accuracy',
+        x_col='latent_dim',
+        xlabel='Latent (bottleneck) dimension',
+        xticklabel_fmt=lambda x: str(int(x)),
+        xticklabel_rotation=45,
+    )
+
+    summary = metric_summary_df(
+        comm_df, orchs, 'comm_task_perf', x_col='latent_dim'
+    )
+    summary.to_csv(
+        args.out_dir / 'comm_task_perf_vs_latent_dim.csv', index=False
+    )
     print(f'  saved → {args.out_dir / "comm_task_perf_vs_latent_dim.csv"}')
     print()
-    print(df.to_string(index=False))
+    print(summary.to_string(index=False))
     print('\nDone.')
 
 

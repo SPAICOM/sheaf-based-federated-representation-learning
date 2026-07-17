@@ -552,10 +552,18 @@ def main(cfg: DictConfig) -> None:
     #     print(f'  agent {i}: input ER = {er:.2f}')
 
     # ── Tune max_lmb (Optuna) if requested and the orchestrator supports it ──────
+    # With learn_lmb the per-edge multipliers are learned by dual ascent during
+    # training itself, so max_lmb is unused and the search would be wasted.
+    learn_lmb = bool(
+        OmegaConf.select(cfg, 'orchestrator.learn_lmb', default=False)
+    )
     lmb_study_cfg = cfg.get('lmb_study', {})
+    if learn_lmb and lmb_study_cfg.get('enabled', False):
+        print('\n[lmb_study] skipped: orchestrator.learn_lmb=True (dual ascent).')
     if (
         lmb_study_cfg.get('enabled', False)
         and orch_name in ORCHESTRATORS_WITH_LMB
+        and not learn_lmb
     ):
         agent_subset: list[int] | None = None
         if lmb_study_cfg.get('efficient', False):
@@ -589,8 +597,14 @@ def main(cfg: DictConfig) -> None:
 
     name_parts = [orch_name]
     if orch_name in ORCHESTRATORS_WITH_LMB:
-        lmb = float(OmegaConf.select(cfg, 'orchestrator.max_lmb'))
-        name_parts.append(f'lmb_{lmb:.4e}')
+        if learn_lmb:
+            rho = float(
+                OmegaConf.select(cfg, 'orchestrator.dual_rho', default=0.1)
+            )
+            name_parts.append(f'lmb_dual_rho{rho:g}')
+        else:
+            lmb = float(OmegaConf.select(cfg, 'orchestrator.max_lmb'))
+            name_parts.append(f'lmb_{lmb:.4e}')
     if orch_name in ORCHESTRATORS_WITH_CTC:
         ctc = OmegaConf.select(
             cfg, 'orchestrator.comm_task_coeff', default=None

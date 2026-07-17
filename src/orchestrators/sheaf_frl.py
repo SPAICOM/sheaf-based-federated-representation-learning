@@ -31,7 +31,27 @@ from src.utils.anchors import (
 
 
 class SheafFRL(BaseOrchestrator):
-    """Sheaf-based Federated Representation Learning orchestrator."""
+    """Sheaf-based Federated Representation Learning orchestrator.
+
+    Each edge's penalty is normalised by ``2·d_e`` (see
+    :meth:`_edge_penalty_term`) so it is dimension-free and comparable
+    across edges/configs regardless of latent size, before being weighted
+    in one of three mutually exclusive ways:
+
+    * **fixed** — one global ``max_lmb`` on every edge
+      (``lambda_schedule=None``, ``learn_lmb=False``);
+    * **scheduled** — ``max_lmb`` warmed up over training
+      (``lambda_schedule='cosine' | 'exp'``, ``learn_lmb=False``);
+    * **learned** — per-edge multipliers ``λ_e`` adapted online by projected
+      dual ascent on the whitening-normalised residual constraint
+      ``P_e / (2·d_e) ≤ dual_rho`` (``learn_lmb=True``; ``max_lmb`` and
+      ``lambda_schedule`` are unused).  Whitened, unaligned latents give
+      ``E[P_e] ≈ 2·d_e`` and perfect alignment gives 0, so ``dual_rho`` is a
+      dimension-free "tolerated fraction of the unaligned residual energy".
+      Each ``λ_e`` grows while its edge violates the tolerance and decays to
+      exactly 0 once inside it, so warmup and schedules emerge automatically
+      and hard (e.g. cross-group) edges receive more weight than easy ones.
+    """
 
     def __init__(
         self,
@@ -55,6 +75,10 @@ class SheafFRL(BaseOrchestrator):
         comm_task_coeff: float = 0.0,
         align_on_intersection: bool = False,
         learn_whitening: bool = True,
+        learn_lmb: bool = False,
+        dual_rho: float = 0.1,
+        dual_lr: float = 0.01,
+        dual_lmb_max: float = 100.0,
         **kwargs,
     ):
         super().__init__(
@@ -78,6 +102,22 @@ class SheafFRL(BaseOrchestrator):
             raise ValueError('update_v_every_n_epochs must be at least 1')
         if warmup_epochs < 0:
             raise ValueError('warmup_epochs must be non-negative')
+        if learn_lmb:
+            if lambda_schedule:
+                raise ValueError(
+                    'learn_lmb=True (per-edge dual ascent) and '
+                    'lambda_schedule are mutually exclusive: the learned '
+                    'multipliers replace the scheduled global coefficient.'
+                )
+            if not 0.0 < float(dual_rho) < 1.0:
+                raise ValueError(
+                    'dual_rho is the tolerated fraction of the unaligned '
+                    f'residual energy and must lie in (0, 1); got {dual_rho}.'
+                )
+            if float(dual_lr) <= 0.0:
+                raise ValueError('dual_lr must be > 0')
+            if float(dual_lmb_max) <= 0.0:
+                raise ValueError('dual_lmb_max must be > 0')
 
         if soft_maps and not use_general_maps:
             warnings.warn(
@@ -100,6 +140,13 @@ class SheafFRL(BaseOrchestrator):
         self._whitening_ops: dict[int, WhiteningOp] = {}
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
         self._build_restriction_maps(neighbors, latent_dims_int)
+
+        # ── Per-edge dual multipliers (learn_lmb mode) ─────────────────────────
+        # Normalised residuals recorded by _edge_penalty_term during the current
+        # step; consumed by _dual_ascent_step and the step metrics.
+        self._step_edge_residuals: dict[str, torch.Tensor] = {}
+        if learn_lmb:
+            self._init_edge_duals(self.stiefel_matrices.keys())
 
         # ── Learnable (SWBN) whitening layers ─────────────────────────────────
         # Each agent owns a learnable whitening layer g_{phi_i} and a paired
@@ -148,6 +195,90 @@ class SheafFRL(BaseOrchestrator):
                     self.stiefel_matrices[edge_key] = nn.Parameter(
                         torch.eye(d_i, d_j), requires_grad=learnable
                     )
+
+    # ── Per-edge λ: dual-ascent machinery ──────────────────────────────────────
+
+    def _dual_lmb_enabled(self) -> bool:
+        """True when per-edge dual-ascent multipliers replace the global λ."""
+        return bool(getattr(self.hparams, 'learn_lmb', False))
+
+    def _init_edge_duals(self, edge_keys) -> None:
+        """(Re)create the per-edge dual multipliers ``λ_e`` (all zero).
+
+        Called once the edge set is known: from ``__init__`` here (Stiefel
+        edges) and again by :class:`SheafCFRL` once its compressed edges
+        replace the (empty) Stiefel dict.  ``dual_lambdas`` is a buffer so the
+        multipliers follow the module across devices and checkpoints.
+        """
+        self._dual_edge_index = {
+            k: i for i, k in enumerate(sorted(edge_keys))
+        }
+        self.register_buffer(
+            'dual_lambdas', torch.zeros(len(self._dual_edge_index))
+        )
+
+    def _edge_penalty_term(
+        self, edge_key: str, diff: torch.Tensor
+    ) -> torch.Tensor:
+        """One edge's contribution to the sheaf penalty, per the active λ mode.
+
+        ``diff`` holds the matched-row coboundary residuals in the edge's
+        coboundary space, shape ``(n, d_e)`` — ``d_e = d_j`` for embedding
+        maps, ``c_ij`` for compressed edge stalks (i.e. the alignment map's
+        row dimension: each row of ``diff`` lives in this space).
+
+        The raw penalty ``mean_rows ‖diff‖²`` is always normalised by
+        ``2·d_e``, its whitened-unaligned baseline (whitened uncorrelated
+        latents give ``E‖diff‖² ≈ 2·d_e``; perfect alignment 0), so the
+        returned term ``P̂_e`` is dimension-free and always falls roughly
+        within ``[0, 1]`` — comparable across edges of different latent
+        sizes (and across configs sweeping the bottleneck dimension).
+
+        Fixed/scheduled mode: returns ``P̂_e``; the global coefficient is
+        applied once by ``_shared_eval``.
+
+        Dual mode: returns ``λ_e · P̂_e`` and records ``P̂_e`` for the
+        post-step dual update.  Phase-A frozen penalties contribute two
+        terms per edge (one per live endpoint); both estimate the same edge
+        residual, so their recordings are averaged.
+        """
+        penalty = (diff**2).sum(dim=1).mean()
+        normed = penalty / (2.0 * diff.shape[1])
+        if not self._dual_lmb_enabled():
+            return normed
+        resid = normed.detach()
+        prev = self._step_edge_residuals.get(edge_key)
+        self._step_edge_residuals[edge_key] = (
+            resid if prev is None else 0.5 * (prev + resid)
+        )
+        # Read λ_e as a *copy*: indexing the buffer returns a view sharing its
+        # version counter, and the multiply saves it for backward — the dual
+        # update later this same step would then trip the in-place version
+        # check at loss.backward() (same trap as SWBNWhiteningLayer's W).
+        lam = self.dual_lambdas[self._dual_edge_index[edge_key]].clone()
+        return lam * normed
+
+    @torch.no_grad()
+    def _dual_ascent_step(self) -> None:
+        """Projected dual ascent on the residuals recorded this step.
+
+        ``λ_e ← clip(λ_e + dual_lr·(P̂_e − dual_rho), [0, dual_lmb_max])`` —
+        each multiplier integrates its edge's constraint violations, growing
+        while the edge is misaligned beyond the tolerance and decaying (to
+        exactly 0) once within it.  The integration itself averages out the
+        per-step pilot-batch noise, so no extra smoothing is needed.
+        """
+        rho = float(self.hparams.dual_rho)
+        lr = float(self.hparams.dual_lr)
+        cap = float(self.hparams.dual_lmb_max)
+        lams = self.dual_lambdas.clone()
+        for edge_key, resid in self._step_edge_residuals.items():
+            i = self._dual_edge_index[edge_key]
+            lams[i] = lams[i] + lr * (resid.to(lams.device) - rho)
+        # Update into a fresh tensor and *reassign* the buffer rather than
+        # mutate it in place: this step's forward may hold saved reads of the
+        # old tensor in the autograd graph (cf. SWBNWhiteningLayer._update_W).
+        self.dual_lambdas = lams.clamp_(0.0, cap)
 
     def _use_learnable_whitening(self) -> bool:
         """True when SWBN learnable whitening is the active normalisation.
@@ -255,6 +386,34 @@ class SheafFRL(BaseOrchestrator):
             device=labels.device,
             dtype=labels.dtype,
         )
+
+    def _apply_prototype_collapse(
+        self,
+        whitened_per_agent: dict[int, torch.Tensor],
+        keys_per_agent: dict[int, torch.Tensor],
+        labels_per_agent: dict[int, torch.Tensor],
+    ) -> None:
+        """Collapse each node's whitened pilot rows to one prototype per class.
+
+        In prototype mode the per-step sheaf penalty aligns class prototypes
+        rather than individual pilot rows.  The collapse runs *after* whitening:
+        the SWBN online update keeps estimating its statistics on per-sample
+        rows, and — whitening being affine — it commutes exactly with the class
+        mean, so these prototypes equal whitened raw-latent prototypes.
+
+        Keys and labels are both replaced by the prototype class labels
+        (in-place in the dicts), so the downstream edge class filter
+        (union/intersection of target classes via ``align_on_intersection``)
+        and ``_match_keys`` operate class-wise: one matched row per shared
+        class per edge.  Gradients flow through the class means.
+        """
+        for idx in list(whitened_per_agent):
+            protos, proto_labels = self._compute_class_prototypes(
+                whitened_per_agent[idx], labels_per_agent[idx]
+            )
+            whitened_per_agent[idx] = protos
+            keys_per_agent[idx] = proto_labels
+            labels_per_agent[idx] = proto_labels
 
     def _pilot_match_keys(
         self, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None
@@ -574,6 +733,18 @@ class SheafFRL(BaseOrchestrator):
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
+        if self._dual_lmb_enabled() and self._dual_edge_index:
+            self.log_dict(
+                {
+                    f'train/dual_lmb_edge_{k}': float(self.dual_lambdas[i])
+                    for k, i in self._dual_edge_index.items()
+                },
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
+
         # Whether to refresh the whitening ops + Stiefel maps at this epoch end.
         # Hook: SheafFRL refreshes every `update_v_every_n_epochs` after warmup;
         # CESheafFRL refreshes only on Phase-C epochs.
@@ -585,6 +756,7 @@ class SheafFRL(BaseOrchestrator):
             self._pilot_latent_buffer = {}
             self._task_latent_buffer = {}
             self._finalize_train_epoch_communication()
+            self._log_train_comm_task_perf()
             return
 
         epoch_latents: dict[int, torch.Tensor] = {}
@@ -652,6 +824,7 @@ class SheafFRL(BaseOrchestrator):
         self._pilot_latent_buffer = {}
         self._task_latent_buffer = {}
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     # ── Epoch/communication hooks (overridden by CESheafFRL) ──────────────────
 
@@ -777,7 +950,7 @@ class SheafFRL(BaseOrchestrator):
             # Rows are already whitened (whitening was applied per node upstream).
             Z_i, y_i_shared, Z_j, y_j_shared = matched
             diff = torch.matmul(Z_i, V) - Z_j
-            sheaf_penalty += (diff**2).sum(dim=1).mean()
+            sheaf_penalty += self._edge_penalty_term(edge_key, diff)
 
             # ── After-communication task loss ─────────────────────────────────
             # • j→i: align Z_j into node_i's space, decode with agent_i's decoder,
@@ -883,16 +1056,15 @@ class SheafFRL(BaseOrchestrator):
                     # the previous epoch (self._whitening_ops).
                     latents_per_agent[idx] = pilot_latents
                     keys_per_agent[idx] = self._pilot_match_keys(y_pilot, sample_ids)
-                    # Track class labels separately: for prototype mode step_keys
-                    # are already class labels aligned with prototypes; otherwise
-                    # y_pilot gives per-sample class labels (keys may be sample IDs).
-                    if self.anchor_config.use_prototypes:
-                        labels_per_agent[idx] = keys_per_agent[idx]
-                    else:
-                        labels_per_agent[idx] = y_pilot
+                    # Per-sample class labels aligned with the latent rows.
+                    # Prototype mode replaces rows/keys/labels with per-class
+                    # prototypes after whitening (_apply_prototype_collapse);
+                    # keys must NOT be used here — with global pilots they are
+                    # sample IDs, and grouping/filtering by them is meaningless.
+                    labels_per_agent[idx] = y_pilot
                     payloads_per_agent[idx] = communication_anchor_payload(
                         anchor_matrix=latents_per_agent[idx],
-                        labels=keys_per_agent[idx],
+                        labels=y_pilot,
                         config=self.anchor_config,
                     )
 
@@ -916,11 +1088,20 @@ class SheafFRL(BaseOrchestrator):
             idx: self._whiten_node_pilots(idx, A)
             for idx, A in latents_per_agent.items()
         }
+        # Prototype mode: collapse to per-class prototypes AFTER whitening, so
+        # the SWBN online update keeps seeing per-sample rows.  Placed before
+        # _on_pilots_whitened so CESheafFRL's Phase-A snapshots cache prototypes
+        # keyed by class, matching what the live side produces in Phase A.
+        if self.anchor_config.use_prototypes:
+            self._apply_prototype_collapse(
+                whitened_per_agent, keys_per_agent, labels_per_agent
+            )
         self._on_pilots_whitened(
             whitened_per_agent, keys_per_agent, labels_per_agent, prefix
         )
 
         in_warmup = self.current_epoch < self.hparams.warmup_epochs
+        self._step_edge_residuals = {}
         sheaf_penalty, after_comm_task_loss = self._compute_alignment_losses(
             whitened_per_agent,
             keys_per_agent,
@@ -929,15 +1110,39 @@ class SheafFRL(BaseOrchestrator):
             skip=in_warmup,
         )
 
+        # λ handling — fixed/scheduled: one global coefficient applied here;
+        # dual (learn_lmb): every edge term already carries its own λ_e, and
+        # the multipliers take a projected ascent step on the residuals just
+        # recorded (training steps only).
+        if self._dual_lmb_enabled():
+            lmb_coeff = 1.0
+            if prefix == 'train' and self._step_edge_residuals:
+                self._dual_ascent_step()
+        else:
+            lmb_coeff = self._effective_lambda_reg()
+
         total_loss = (
             total_task_loss
-            + self._effective_lambda_reg() * sheaf_penalty
+            + lmb_coeff * sheaf_penalty
             + comm_weight * after_comm_task_loss
         )
 
-        extra: dict[str, Any] = {f'{prefix}/sheaf_penalty': sheaf_penalty}
+        extra: dict[str, Any] = {
+            # Online-learned whitened-coboundary residual at the current
+            # Stiefel/compression maps.  The standardised cross-orchestrator
+            # `misalignment_loss` (with per-edge breakdown) is instead logged
+            # at train/test epoch end through the generic pilot-based
+            # evaluator (see evaluate_communication_accuracy below), so it is
+            # directly comparable with the post-training-alignment baselines.
+            f'{prefix}/sheaf_penalty': sheaf_penalty,
+        }
         if comm_weight > 0.0:
             extra[f'{prefix}/after_comm_task_loss'] = after_comm_task_loss
+        if self._dual_lmb_enabled() and self._step_edge_residuals:
+            extra[f'{prefix}/mean_edge_residual'] = torch.stack(
+                list(self._step_edge_residuals.values())
+            ).mean()
+            extra[f'{prefix}/mean_dual_lmb'] = self.dual_lambdas.mean()
 
         self._log_shared_metrics(
             prefix=prefix,
@@ -1031,6 +1236,26 @@ class SheafFRL(BaseOrchestrator):
         if op_receiver is not None:
             return color(Z_aligned, op_receiver).to(dev)
         return Z_aligned.to(dev)
+
+    def evaluate_communication_accuracy(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
+        """Cross-agent accuracy plus the generic pilot-based misalignment loss.
+
+        Extends the base evaluation with
+        :meth:`BaseOrchestrator.evaluate_misalignment_loss`, routed through
+        this orchestrator's learned ``send_message`` pipeline (whitening →
+        Stiefel map → re-colouring).  This logs the same
+        ``{prefix}/misalignment_loss`` and per-edge
+        ``{prefix}/misalignment_loss_edge_i_j`` keys as the
+        post-training-alignment baselines, computed by the identical
+        evaluator, so the values are directly comparable across
+        orchestrators.  The online whitened-coboundary residual remains
+        available separately as ``{prefix}/sheaf_penalty``.
+        """
+        logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
+        logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+        return logs
 
     def on_test_epoch_end(self) -> None:
         super().on_test_epoch_end()

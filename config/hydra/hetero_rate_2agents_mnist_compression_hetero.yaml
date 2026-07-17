@@ -1,0 +1,169 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: sheaf_cfrl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 2 agents - model heterogeneity"
+
+# ── Compression x model-heterogeneity study grid ──────────────────────────────
+# The orchestrator is the only Hydra multirun dimension (sheaf_cfrl vs comfed).
+# `shift_strength` is held FIXED — this study does not sweep distribution
+# shift (unlike compression_study.py, which sweeps compression factors x
+# shifts). Instead, `compression_factors` is crossed with
+# `heterogeneity_levels`: agent `variable_agent`'s architecture is swept from
+# identical to `fixed_agent`'s architecture (see `model.agents.<fixed_agent>`
+# below, which never changes) up to a completely different model family, and
+# at every level the full `compression_factors` grid is run. Each
+# (orchestrator, compression_factor, heterogeneity_level) combination gets its
+# own dedicated wandb run (see `_run_full_experiment` in the script). There is
+# no lmb_study: max_lmb is read as-is from `orchestrator.max_lmb` below and
+# never tuned.
+study:
+  shift_strength: 0.7
+  compression_factors: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+  fixed_agent: 0
+  variable_agent: 1
+  heterogeneity_levels:
+    # - label: identical
+    #   model:
+    #     _target_: src.agents.CNNClassifier
+    #     encoder_hidden_dims: [64, 128]
+    #     decoder_hidden_dims: [120]
+    #     dropout: 0.1
+    #     use_batchnorm: true
+    # - label: smaller_capacity
+    #   model:
+    #     _target_: src.agents.CNNClassifier
+    #     encoder_hidden_dims: [32, 64]
+    #     decoder_hidden_dims: [120]
+    #     dropout: 0.1
+    #     use_batchnorm: true
+    - label: transformer_small
+      model:
+        _target_: src.agents.TransformerClassifier
+        patch_size: 7
+        embed_dim: 64
+        depth: 2
+        num_heads: 2
+        mlp_ratio: 2.0
+        pool: mean
+        decoder_hidden_dims: [128]
+        dropout: 0.1
+        weight_decay: 1.0e-4
+        use_batchnorm: true
+    - label: transformer_large
+      model:
+        _target_: src.agents.TransformerClassifier
+        patch_size: 14
+        embed_dim: 256
+        depth: 6
+        num_heads: 8
+        mlp_ratio: 4.0
+        pool: cls
+        decoder_hidden_dims: [512, 256]
+        dropout: 0.3
+        weight_decay: 1.0e-3
+        use_batchnorm: true
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.15
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: compression_hetero
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 40
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.7
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+
+# `model.agents.<fixed_agent>` (agent 0 by default) is the fixed baseline
+# architecture and is never touched by the script. `model.agents.<variable_agent>`
+# (agent 1 by default) is overwritten at each sweep step from
+# `study.heterogeneity_levels`; the block below is only its "identical" (level 0)
+# placeholder, kept here so the config is runnable stand-alone without the script.
+model:
+  agents:
+    0:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128]
+      decoder_hidden_dims: [120]
+      dropout: 0.1
+      use_batchnorm: true
+
+orchestrator:
+  pid_logging: false
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0
+  comm_task_coeff: 1
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  learn_whitening: true
+  # CE Sheaf FRL specific
+  phase_a_epochs: 1
+  phase_c_epochs: 2
+  # Sheaf compressed FRL — overwritten every (level, factor) from study.compression_factors
+  compression_factor: 0.5
+  # Post-training alignment
+  alignment_method: procrustes
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # Compare the two compression-efficient orchestrators across the
+      # architecture-heterogeneity grid (swept inside the script, see
+      # `study.heterogeneity_levels` above).
+      orchestrator: sheaf_cfrl, comfed

@@ -11,10 +11,14 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    PostTrainingAlignmentMixin,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
-class DFedU(BaseOrchestrator):
+class DFedU(PostTrainingAlignmentMixin, BaseOrchestrator):
     """
     Decentralized Federated Multi-Task Learning (d-FedU) orchestrator.
 
@@ -32,6 +36,12 @@ class DFedU(BaseOrchestrator):
         Optimizer configuration for training.
     eta : float
         Laplacian step size (learning rate for the consensus step).
+    alignment_method : str or None, optional
+        Post-training alignment method used by the ``send_message`` pipeline
+        at test time (``'general'`` or ``'procrustes'``). When ``None``
+        (default) no maps are fitted and ``send_message`` acts as identity,
+        which is appropriate for this homogeneous consensus method whose
+        agents share a latent space. See :class:`PostTrainingAlignmentMixin`.
     """
 
     def __init__(
@@ -40,8 +50,16 @@ class DFedU(BaseOrchestrator):
         neighbors: dict[int, set[int]],
         optimizer: Any,
         eta: float = 0.05,
+        alignment_method: str | None = None,
         **kwargs,
     ):
+        if alignment_method is not None:
+            alignment_method = str(alignment_method)
+            if alignment_method not in VALID_ALIGNMENT_METHODS:
+                raise ValueError(
+                    f"Unknown alignment_method '{alignment_method}'. "
+                    f'Valid options: {VALID_ALIGNMENT_METHODS}'
+                )
         super().__init__(
             agents=agents,
             neighbors=neighbors,
@@ -156,6 +174,7 @@ class DFedU(BaseOrchestrator):
             vector_to_parameters(new_vectors[idx], trainable_params)
 
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     def _shared_eval(
         self,
@@ -200,20 +219,32 @@ class DFedU(BaseOrchestrator):
             agent_performances=agent_performances,
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
+            skip_task_performance=(prefix == 'test'),
         )
 
         return outputs, total_loss
 
+    # ── Post-hoc alignment evaluation ─────────────────────────────────────────
+    # _fit_alignment_maps, send_message, _cleanup_alignment and
+    # evaluate_communication_accuracy all come from PostTrainingAlignmentMixin.
+    # When alignment_method is None (default) send_message acts as identity and
+    # evaluation delegates to the base-class loop; when it is set, per-agent
+    # whitening + pairwise alignment maps are fitted before evaluation.
 
-    def send_message(
-        self,
-        sender_idx: int,
-        receiver_idx: int,
-        Z_sender: torch.Tensor,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            f'{self.__class__.__name__} does not implement send_message.'
-        )
+    def on_test_epoch_end(self) -> None:
+        super().on_test_epoch_end()
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return
+        logs = self.evaluate_communication_accuracy(dm)
+        if logs:
+            self.log_dict(
+                logs,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
 
 if __name__ == '__main__':

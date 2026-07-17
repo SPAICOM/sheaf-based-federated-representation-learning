@@ -1,0 +1,98 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: hetero_bottleneck_64
+  - orchestrator: ce_sheaf_frl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 2 agents - hetero models, matched bottleneck"
+
+lmb_study:
+  enabled: true         # set to true to run Optuna search before the full training run
+  n_trials: 15          # number of Optuna trials
+  n_tune_epochs: 5      # epochs per trial
+  lmb_low: 1e-4       # lower bound of the log-uniform search interval
+  lmb_high: 5e-3       # upper bound of the log-uniform search interval
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.15
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sfrl_hetero_bottleneck
+  group: ${study_name}
+  name: ${hydra:runtime.choices.model}_${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 20
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.7
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+
+orchestrator:
+  parseval_normalization: false
+  l2_normalization: false
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
+  max_lmb: 1e-2
+  lambda_schedule: null
+  # Sheaf FRL specific
+  warmup_epochs: 0 # just for sheaf_frl
+  comm_task_coeff: 1
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  # Sheaf FMTL specific
+  gamma: 0.001
+  eta: 0.01
+  # Post-training alignment (for methods not working on representations)
+  alignment_method: procrustes # can be "general" or "procrustes"
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # Each choice is a hand-tuned, monotonically telescoping encoder/decoder
+      # pair (config/hydra/model/hetero_bottleneck_*.yaml) sharing that last
+      # encoder dim across both (differently-shaped) agents.
+      model: hetero_bottleneck_128
+      orchestrator: fedmuscle

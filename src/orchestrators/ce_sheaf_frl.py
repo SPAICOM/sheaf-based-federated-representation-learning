@@ -189,11 +189,15 @@ class CESheafFRL(SheafFRL):
             if node_j in frozen:
                 m = self._match_edge(node_i, node_j, src_i, frozen[node_j])
                 if m is not None:
-                    sheaf_penalty += ((torch.matmul(m[0], V) - m[2]) ** 2).sum(dim=1).mean()
+                    sheaf_penalty += self._edge_penalty_term(
+                        edge_key, torch.matmul(m[0], V) - m[2]
+                    )
             if node_i in frozen:
                 m = self._match_edge(node_i, node_j, frozen[node_i], src_j)
                 if m is not None:
-                    sheaf_penalty += ((torch.matmul(m[0], V) - m[2]) ** 2).sum(dim=1).mean()
+                    sheaf_penalty += self._edge_penalty_term(
+                        edge_key, torch.matmul(m[0], V) - m[2]
+                    )
 
         return sheaf_penalty, after_comm
 

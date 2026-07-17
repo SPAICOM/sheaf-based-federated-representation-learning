@@ -1,0 +1,118 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 15 agents"
+
+lmb_study:
+  enabled: false         # set to true to run Optuna search before the full training run
+  efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
+  n_trials: 15          # number of Optuna trials
+  n_tune_epochs: 5     # epochs per trial
+  lmb_low: 1e-4         # lower bound of the log-uniform search interval
+  lmb_high: 1
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
+  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: 2agents_trial_2
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 40
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.7
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 12
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+
+model:
+  agents:
+    0:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128]
+      decoder_hidden_dims: [256, 128, 64]
+      dropout: 0.3
+      use_batchnorm: true
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [16, 32, 64]
+      decoder_hidden_dims: [128, 64]
+      dropout: 0.2
+      use_batchnorm: true
+
+orchestrator:
+  pid_logging: false
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0 # just for sheaf_frl
+  use_general_maps: false
+  soft_maps: false
+  learn_whitening: true
+  # CE Sheaf FRL specific
+  phase_a_epochs: 1
+  phase_c_epochs: 2
+  # Sheaf compressed FRL
+  compression_factor: 0.5
+  # Sheaf FMTL specific
+  gamma: 1e-4
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+  learn_lmb: true
+  comm_task_coeff: 0
+  align_on_intersection: false
+  dual_rho: 0.02
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      dataset.shift_strength: 0.7, 0.8, 0.9
+      # orchestrator.max_lmb: 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1
+      # orchestrator.dual_rho: 0.2, 0.4
+      orchestrator: non_cooperative

@@ -14,10 +14,10 @@ study_name: "HeteroRate MNIST 2 agents"
 # that one λ study can be shared across all shifts of a given factor.
 study:
   compression_factors: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-  shift_strengths: [0.5, 0.6]
+  shift_strengths: [0.5, 0.7, 0.9]
 
 lmb_study:
-  enabled: false         # run one Optuna search per (orchestrator, compression_factor)
+  enabled: true         # run one Optuna search per (orchestrator, compression_factor)
   n_trials: 20          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
   lmb_low: 1.0e-4       # lower bound of the log-uniform search interval
@@ -33,14 +33,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: compressed_sfrl_1
+  project: compressed_sfrl_comfed
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 1
+  max_epochs: 40
   accelerator: auto
   devices: 1
   deterministic: true

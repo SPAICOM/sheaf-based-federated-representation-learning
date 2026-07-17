@@ -232,6 +232,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
 
     def on_train_epoch_end(self) -> None:
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     def _shared_eval(
         self,

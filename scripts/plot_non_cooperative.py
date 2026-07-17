@@ -62,6 +62,7 @@ def add_task_fidelity(df: pd.DataFrame) -> pd.DataFrame:
 def _save(fig: plt.Figure, path: Path, name: str) -> None:
     out = path / name
     fig.savefig(out, dpi=150, bbox_inches='tight')
+    fig.savefig(out.with_suffix('.pdf'), bbox_inches='tight')
     print(f'  saved → {out}')
     plt.close(fig)
 

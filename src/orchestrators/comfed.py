@@ -100,6 +100,7 @@ class ComFed(BaseOrchestrator):
 
     def on_train_epoch_end(self) -> None:
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -272,7 +273,12 @@ class ComFed(BaseOrchestrator):
             batch_size=self._resolve_batch_size(batch),
             agent_sample_counts=self._resolve_agent_sample_counts(batch),
             total_loss=total_loss,
-            extra_metrics={f'{prefix}/alignment_loss': alignment_loss},
+            extra_metrics={
+                f'{prefix}/alignment_loss': alignment_loss,
+                # Standardised alias tracked across all orchestrators (see
+                # BaseOrchestrator.evaluate_misalignment_loss).
+                f'{prefix}/misalignment_loss': alignment_loss,
+            },
             prog_bar=False,
             per_agent_loss_name='task_loss',
             skip_task_performance=(prefix == 'test'),

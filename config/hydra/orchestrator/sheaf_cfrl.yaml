@@ -1,7 +1,16 @@
 _target_: src.orchestrators.SheafCFRL
 
+# ── Sheaf-penalty weight λ: three mutually exclusive modes ────────────────────
+#   fixed     — max_lmb on every edge            (lambda_schedule: null, learn_lmb: false)
+#   scheduled — max_lmb warmed up over training  (lambda_schedule: cosine|exp, learn_lmb: false)
+#   learned   — per-edge λ_e by dual ascent on P_e/(2·c_ij) ≤ dual_rho
+#               (learn_lmb: true; max_lmb and lambda_schedule are ignored)
 max_lmb: 4.76e-4
 lambda_schedule: null
+learn_lmb: false
+dual_rho: 0.1        # tolerated fraction of the unaligned residual energy, in (0, 1)
+dual_lr: 0.01        # per-step dual-ascent rate on the normalised violation
+dual_lmb_max: 100.0  # safety cap per multiplier (guards genuinely infeasible edges)
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
 sparse_communication: False
@@ -22,10 +31,16 @@ align_on_intersection: False  # if True, filter pilots to intersection of target
 # c-dimensional edge stalk (c < min(d_i, d_j)). Phase B refits them by SOC-ADMM,
 # minimising a β-weighted blend of semantic misalignment and communication loss.
 compression_factor: 0.5         # fraction of min(d_i, d_j) retained per edge: c_ij = round(factor·min_d)
-compression_inner_steps: 20     # T_B: SOC-ADMM iterations per edge in Phase B (spec: 10–30)
+compression_inner_steps: 20     # T_B: SOC-ADMM iterations per edge in Phase B (spec: 10–30);
+                                # null = run each Phase-B ADMM to convergence (Boyd primal/dual
+                                # residual criterion, tolerances below, capped at k_max)
 compression_init: pca           # 'pca' (recommended) or 'truncated_identity'
 compression_beta: 0.5           # β ∈ [0,1): semantic-misalignment ↔ communication-loss trade-off
 compression_admm_alpha: 5.0     # α > 0: ADMM penalty on the Stiefel splitting constraint (≥5 → tight primal)
+compression_admm_abs_tol: 1e-3  # ε_abs: absolute tolerance (only used when compression_inner_steps: null)
+compression_admm_rel_tol: 1e-2  # ε_rel: relative tolerance (only used when compression_inner_steps: null)
+compression_admm_max_iter: 500  # k_max: iteration cap when running to convergence
+                                # (nonconvex SOC: the dual residual can plateau; the cap guards that)
 
 # ── Decoupled three-phase schedule (communication-efficient; inherited from CESheafFRL) ─
 # Each outer iteration: T_C Phase-C epochs (compressed coboundary every step, maps

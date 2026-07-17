@@ -483,17 +483,25 @@ def _run_full_experiment(
     run_name = '_'.join(name_parts)
 
     # ── Logger ────────────────────────────────────────────────────────────────
+    # These three are the ground truth for this iteration of the study grid.
+    # They're namespaced with a "sweep_" prefix so they can never collide with
+    # an orchestrator's own hparams: ComFed absorbs the sheaf-only
+    # `orchestrator.compression_factor` override into its **kwargs (it doesn't
+    # use it — proj_dim is what actually drives its bottleneck), and
+    # `self.save_hyperparameters()` captures it as an hparam. Lightning
+    # auto-logs those hparams when `trainer.fit()` starts, which — with an
+    # unprefixed key — silently overwrote this exact metadata with that
+    # stale, never-varying value (proj_dim was unaffected only because it's a
+    # real, correctly-mutated ComFed constructor argument).
+    sweep_metadata = {
+        'orchestrator_name': orch_name,
+        'sweep_compression_factor': float(compression_factor),
+        'sweep_proj_dim': int(proj_dim),
+        'sweep_shift_strength': float(shift_strength),
+    }
     logger = _new_wandb_run_logger(cfg, run_name)
     _update_logger_config(logger, OmegaConf.to_container(cfg, resolve=True))
-    _update_logger_config(
-        logger,
-        {
-            'orchestrator_name': orch_name,
-            'compression_factor': float(compression_factor),
-            'proj_dim': int(proj_dim),
-            'shift_strength': float(shift_strength),
-        },
-    )
+    _update_logger_config(logger, sweep_metadata)
 
     # ── Full training run ─────────────────────────────────────────────────────
     callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
@@ -506,6 +514,12 @@ def _run_full_experiment(
     )
 
     trainer.fit(orchestrator, datamodule=datamodule)
+    # Re-assert after fit(): Lightning's automatic log_hyperparams() call
+    # (triggered inside fit) can overwrite same-named keys with the
+    # orchestrator's own (possibly stale/unused) hparams — see note above.
+    # The "sweep_" prefix already prevents any collision, this is belt-and-
+    # suspenders in case a future orchestrator absorbs one of these exact names.
+    _update_logger_config(logger, sweep_metadata)
     trainer.test(orchestrator, datamodule=datamodule)
 
     # ── Collect per-agent metrics logged by the orchestrator ──────────────────

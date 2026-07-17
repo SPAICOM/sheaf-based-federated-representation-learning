@@ -387,13 +387,28 @@ def main(cfg: DictConfig) -> None:
     n_agents = len(datamodule.models)
 
     # ── Graph ─────────────────────────────────────────────────────────────────
+    target_classes = None
+    if cfg.graph.neighbors_mode == 'class_overlap':
+        agent_classes = getattr(datamodule, 'agent_classes', None)
+        if not agent_classes:
+            raise ValueError(
+                "graph.neighbors_mode='class_overlap' requires the datamodule "
+                'to expose per-agent target classes (agent_classes).'
+            )
+        target_classes = {
+            agent_id: set(classes) for agent_id, classes in agent_classes.items()
+        }
+
     neighbors = generate_neighbors(
         mode=cfg.graph.neighbors_mode,
         n_agents=n_agents,
-        seed=cfg.graph.seed,
-        p=cfg.graph.p,
-        m=cfg.graph.m,
+        seed=cfg.graph.get('seed', 42),
+        p=cfg.graph.get('p', 0.3),
+        m=cfg.graph.get('m', 3),
         manual=cfg.graph.get('neighbors', {}),
+        target_classes=target_classes,
+        max_edge_frac=cfg.graph.get('max_edge_frac', 0.4),
+        similarity=cfg.graph.get('similarity', 'intersection'),
     )
 
     per_agents_cfg = _parse_per_agent_cfg(cfg)

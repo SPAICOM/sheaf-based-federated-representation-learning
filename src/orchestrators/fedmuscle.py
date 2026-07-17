@@ -358,6 +358,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
             self._cl_epoch_count = 0
 
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
 
     def _shared_eval(
         self,

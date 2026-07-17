@@ -1,7 +1,7 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: ce_sheaf_frl
+  - orchestrator: sheaf_frl
   - optimizer: sgd
   - _self_
 
@@ -17,36 +17,25 @@ lmb_study:
   lmb_high: 1
 
 graph:
-  # "class_overlap": sparse, connected graph that keeps only the edges between
-  # the agents sharing the most target classes, capped at max_edge_frac of all
-  # possible edges. A maximum-weight spanning tree is always retained so the
-  # graph stays connected. Other modes: fully_connected, erdos_renyi, barabasi,
-  # manual (hand-written `neighbors` dict below).
   neighbors_mode: "class_overlap"
   max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
   similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
-  # Extra knobs the other modes need (optional — sensible defaults in
-  # generate_neighbors): erdos_renyi → seed, p ; barabasi → seed, m ;
-  # manual → neighbors: {i: [j, k], ...}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: multi_homo
+  project: multi_trial
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 40
+  max_epochs: 80
   accelerator: auto
   devices: 1
   deterministic: true
   num_sanity_val_steps: 2
   log_every_n_steps: 25
-  # Bound gradient norm so a single exploding step can't push an agent's
-  # weights to inf/NaN (SGD momentum=0.9 + comm_task_coeff=1 + no warmup makes
-  # this easy early on). Applied natively by Lightning (automatic optimization).
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 
@@ -67,147 +56,144 @@ dataset:
   pilot_split: 0.1
   pilot_batch_size: 64
   comm_data: shared_global_pilots
-  # 15 single-agent groups. Each agent skews (shift_strength) toward its
-  # target_classes; every set has >= 6 of the 10 MNIST digits, with
-  # overlap across agents so the sheaf maps have shared structure to align.
+
   groups:
     0:
       agents: [0]
-      target_classes: [4, 5, 6, 7, 8, 9]
+      target_classes: [4, 5, 6, 7, 8]
     1:
       agents: [1]
-      target_classes: [0, 1, 2, 3, 4, 5]
+      target_classes: [0, 1, 2, 3, 4]
     2:
       agents: [2]
-      target_classes: [0, 1, 2, 3, 4, 5, 6]
+      target_classes: [0, 1, 2, 3, 4, 5]
     3:
       agents: [3]
-      target_classes: [3, 4, 5, 6, 7, 8, 9]
+      target_classes: [4, 5, 6, 7, 8, 9]
     4:
       agents: [4]
-      target_classes: [0, 1, 2, 3, 6, 7, 8, 9]
+      target_classes: [0, 1, 2, 7, 8, 9]
     5:
       agents: [5]
-      target_classes: [2, 3, 4, 5, 6, 7]
+      target_classes: [2, 3, 4, 5, 6]
     6:
       agents: [6]
-      target_classes: [0, 1, 2, 3, 4, 5, 6, 7]
+      target_classes: [1, 2, 3, 4, 5, 6]
     7:
       agents: [7]
-      target_classes: [1, 2, 3, 4, 5, 6]
+      target_classes: [3, 4, 5, 6, 7]
     8:
       agents: [8]
-      target_classes: [0, 2, 4, 6, 7, 8, 9]
+      target_classes: [0, 2, 4, 6, 8]
     9:
       agents: [9]
-      target_classes: [0, 1, 2, 5, 6, 7, 8, 9]
+      target_classes: [5, 6, 7, 8, 9]
     10:
       agents: [10]
-      target_classes: [1, 2, 3, 4, 5, 6, 7]
+      target_classes: [1, 2, 3, 4, 5]
     11:
       agents: [11]
-      target_classes: [0, 1, 2, 3, 4, 5, 8, 9]
+      target_classes: [0, 1, 2, 8, 9]
     12:
       agents: [12]
       target_classes: [3, 4, 5, 6, 7, 8]
     13:
       agents: [13]
-      target_classes: [0, 1, 4, 5, 6, 7, 8, 9]
+      target_classes: [1, 4, 6, 8, 9]
     14:
       agents: [14]
-      target_classes: [0, 1, 2, 3, 7, 8, 9]
+      target_classes: [0, 1, 2, 3, 7]
 
 model:
-  # 15 homogeneous CNN classifiers — all agents share the same architecture.
   agents:
     0:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [32, 64, 128]
+      decoder_hidden_dims: [256, 128, 64]
+      dropout: 0.3
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
+      encoder_hidden_dims: [32, 64, 128, 224]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
     2:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [16, 32, 64]
+      decoder_hidden_dims: [128]
+      dropout: 0.2
       use_batchnorm: true
     3:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [64, 128, 128]  # +3rd block: pools 7x7 -> 3x3
+      decoder_hidden_dims: [256, 128]
+      dropout: 0.25
       use_batchnorm: true
     4:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [32, 48, 96, 192]
+      decoder_hidden_dims: [192, 96]
+      dropout: 0.3
       use_batchnorm: true
     5:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [24, 48, 96]
+      decoder_hidden_dims: [96]
+      dropout: 0.15
       use_batchnorm: true
     6:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [32, 64, 128, 256]
+      decoder_hidden_dims: [256]
+      dropout: 0.4
       use_batchnorm: true
     7:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
+      encoder_hidden_dims: [24, 48, 96, 144]  # deepened to 4 blocks (was [32,64,128], dup of 0/1)
+      decoder_hidden_dims: [64, 32]
       dropout: 0.1
       use_batchnorm: true
     8:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [48, 96, 160]
+      decoder_hidden_dims: [160, 80]
+      dropout: 0.2
       use_batchnorm: true
     9:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [32, 80]
+      decoder_hidden_dims: [100]
+      dropout: 0.05
       use_batchnorm: true
     10:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [40, 80, 120]
+      decoder_hidden_dims: [120, 60]
+      dropout: 0.2  # lowered from 0.3: was converging slowly, not capacity-bound
       use_batchnorm: true
     11:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [48, 96, 192, 240]  # deepened to 4 blocks (was [64,128,128], near-dup of 3)
+      decoder_hidden_dims: [256, 128]
+      dropout: 0.2  # lowered from 0.35: was converging slowly, not capacity-bound
       use_batchnorm: true
     12:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [20, 40, 60, 80]
+      decoder_hidden_dims: [80]
+      dropout: 0.2
       use_batchnorm: true
     13:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
-      dropout: 0.1
+      encoder_hidden_dims: [32, 64, 96]
+      decoder_hidden_dims: [192, 96]
+      dropout: 0.25
       use_batchnorm: true
     14:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64]
-      decoder_hidden_dims: [120]
+      encoder_hidden_dims: [56, 112, 160]  # +3rd block: pools 7x7 -> 3x3
+      decoder_hidden_dims: [128]
       dropout: 0.1
       use_batchnorm: true
 
@@ -215,12 +201,8 @@ orchestrator:
   pid_logging: false
   use_prototypes: false
   log_latent_diagnostics: true
-  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  # max_lmb: 1e-02
-  # lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl
-  comm_task_coeff: 1
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
@@ -231,10 +213,14 @@ orchestrator:
   # Sheaf compressed FRL
   compression_factor: 0.5
   # Sheaf FMTL specific
-  gamma: 0.001
+  gamma: 1e-4
   eta: 0.01
   # Post-training alignment
   alignment_method: procrustes
+  max_lmb: 1e-2
+  learn_lmb: true
+  dual_rho: 0.4
+  comm_task_coeff: 0
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch
@@ -244,6 +230,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # dataset.shift_strength: 0.6, 0.7, 0.8, 0.9
-      # orchestrator: sheaf_frl, sheaf_cfrl, ce_sheaf_frl, fedproto, fedmuscle, federated, non_cooperative, sheaf_fmtl, comfed
+      # orchestrator.dual_rho: 0.01, 0.1, 0.3
+      orchestrator.learn_lmb: true, false
       dataset.shift_strength: 0.9
+      orchestrator: sheaf_frl

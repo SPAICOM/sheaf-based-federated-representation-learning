@@ -229,7 +229,9 @@ class PostTrainingAlignmentMixin:
         self._alignment_maps = {}
 
     @torch.no_grad()
-    def evaluate_communication_accuracy(self, dm) -> dict[str, float]:
+    def evaluate_communication_accuracy(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
         """Compute cross-agent accuracy, fitting alignment maps when configured.
 
         When ``hparams.alignment_method`` is set, per-agent whitening operators
@@ -238,20 +240,34 @@ class PostTrainingAlignmentMixin:
         are cleaned up afterward.  When it is ``None`` evaluation delegates to
         the base-class loop with an identity ``send_message`` (safe only when
         all agents share a latent space, e.g. FedAvg).
+
+        Either way, the returned logs are merged with
+        ``self.evaluate_misalignment_loss`` (computed while any fitted maps
+        are still active, before cleanup) so the coboundary misalignment loss
+        is always evaluated with the post-training alignment maps when those
+        exist, matching the quantity SheafFRL calls ``sheaf_penalty``.
+
+        ``prefix`` namespaces the returned metric keys (default ``'test'``).
         """
         alignment_method = getattr(self.hparams, 'alignment_method', None)
         if alignment_method is None:
-            return super().evaluate_communication_accuracy(dm)
+            logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
+            logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+            return logs
 
         if not self._fit_alignment_maps(dm):
             return {}
         try:
-            return self._comm_accuracy_with_fitted_maps(dm)
+            logs = dict(self._comm_accuracy_with_fitted_maps(dm, prefix=prefix))
+            logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+            return logs
         finally:
             self._cleanup_alignment()
 
     @torch.no_grad()
-    def _comm_accuracy_with_fitted_maps(self, dm) -> dict[str, float]:
+    def _comm_accuracy_with_fitted_maps(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
         """Measure cross-agent accuracy over edges with a fitted alignment map.
 
         Assumes ``_fit_alignment_maps`` has already populated
@@ -354,10 +370,10 @@ class PostTrainingAlignmentMixin:
             self_accs[idx] = float(
                 (preds == test_y[idx]).float().mean().item()
             )
-            logs[f'test/private_task_perf_agent_{idx}'] = self_accs[idx]
+            logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
 
         if self_accs:
-            logs['test/avg_private_task_perf'] = (
+            logs[f'{prefix}/avg_private_task_perf'] = (
                 sum(self_accs.values()) / len(self_accs)
             )
 
@@ -401,19 +417,19 @@ class PostTrainingAlignmentMixin:
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
-                logs[f'test/comm_task_perf_agent_{receiver_idx}'] = avg_acc
+                logs[f'{prefix}/comm_task_perf_agent_{receiver_idx}'] = avg_acc
 
                 self_acc = self_accs.get(receiver_idx, 0.0)
                 fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
                 task_fidelities[receiver_idx] = fidelity
-                logs[f'test/task_fidelity_agent_{receiver_idx}'] = fidelity
+                logs[f'{prefix}/task_fidelity_agent_{receiver_idx}'] = fidelity
 
         if receiver_comm_accs:
-            logs['test/avg_comm_task_perf'] = (
+            logs[f'{prefix}/avg_comm_task_perf'] = (
                 sum(receiver_comm_accs.values()) / len(receiver_comm_accs)
             )
         if task_fidelities:
-            logs['test/avg_task_fidelity'] = (
+            logs[f'{prefix}/avg_task_fidelity'] = (
                 sum(task_fidelities.values()) / len(task_fidelities)
             )
 

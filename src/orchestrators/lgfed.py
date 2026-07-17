@@ -344,6 +344,7 @@ class LGFed(PostTrainingAlignmentMixin, BaseOrchestrator):
                 self._maybe_stop_after_global_aggregation()
 
         self._finalize_train_epoch_communication()
+        self._log_train_comm_task_perf()
         return None
 
     def on_train_batch_end(
