@@ -228,6 +228,28 @@ class PostTrainingAlignmentMixin:
         self._train_whitening_ops = {}
         self._alignment_maps = {}
 
+    def _whiten_own_latents(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Whiten with this agent's own post-hoc-fitted training-set operator."""
+        op = getattr(self, '_train_whitening_ops', {}).get(idx)
+        if op is None:
+            raise NotImplementedError(
+                f'no whitening operator fitted for agent {idx}'
+            )
+        return whiten(Z, op)
+
+    def _directed_alignment_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """The map fitted for exactly sender_idx -> receiver_idx.
+
+        ``_fit_alignment_maps`` fits one independent map per *directed* edge
+        (never derives one direction from the other's transpose), so this is
+        already direction-respecting by construction.
+        """
+        return getattr(self, '_alignment_maps', {}).get(sender_idx, {}).get(
+            receiver_idx
+        )
+
     @torch.no_grad()
     def evaluate_communication_accuracy(
         self, dm, prefix: str = 'test'

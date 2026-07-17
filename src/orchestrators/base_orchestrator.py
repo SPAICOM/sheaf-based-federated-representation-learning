@@ -733,25 +733,64 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 add_dataloader_idx=False,
             )
 
+    def _whiten_own_latents(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Whiten agent ``idx``'s own raw latents with its own whitening operator.
+
+        Used by :meth:`evaluate_misalignment_loss` to stay in the *whitened*
+        coboundary space — the same space SheafFRL's ``sheaf_penalty`` is
+        computed in — rather than the raw, re-coloured space ``send_message``
+        produces. Concrete orchestrators with a fitted/learned whitening
+        operator per agent must override this; the default raises
+        ``NotImplementedError`` so callers can skip cleanly.
+        """
+        raise NotImplementedError(
+            f'{self.__class__.__name__} does not implement _whiten_own_latents'
+        )
+
+    def _directed_alignment_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """The map fitted/learned for exactly the sender → receiver direction.
+
+        Returns ``None`` when no map exists in that exact orientation — in
+        particular, this must *never* fall back to a transpose or
+        pseudo-inverse of the reverse edge's map (that is a communication
+        convenience ``send_message`` uses, not a valid alignment-quality
+        measurement for the direction it wasn't fit for). Concrete
+        orchestrators must override; the default raises
+        ``NotImplementedError`` so callers can skip cleanly.
+        """
+        raise NotImplementedError(
+            f'{self.__class__.__name__} does not implement _directed_alignment_map'
+        )
+
     @torch.no_grad()
     def evaluate_misalignment_loss(self, dm, prefix: str = 'test') -> dict[str, float]:
         """Cross-agent coboundary misalignment loss on matched pilot pairs.
 
-        For every directed edge (sender → receiver), projects the sender's
-        pilot latents into the receiver's space via ``self.send_message`` and
-        compares the result against the receiver's own pilot latents on the
-        samples common to both pilot sets (matched by sample id via
-        ``common_pilot_indices``).  This is the same quantity SheafFRL calls
-        ``sheaf_penalty`` (there evaluated in the whitened coboundary space
-        via its own online-learned Stiefel maps every step); here it is
-        evaluated generically through whatever ``send_message`` the concrete
-        orchestrator implements — with a post-training-fitted alignment map,
-        or as an identity fallback when none is fitted.
+        For every directed edge (sender → receiver) that has a map fitted
+        exactly in that orientation (via ``self._directed_alignment_map`` —
+        never a transpose/pseudo-inverse of the reverse edge), whitens both
+        sender and receiver pilot latents with their own whitening operators
+        (via ``self._whiten_own_latents``), applies the map, and diffs
+        against the receiver's own whitened latents on the pilot samples
+        common to both (matched by sample id via ``common_pilot_indices``).
 
-        Normalised by ``2·d_receiver`` (see
-        :meth:`SheafFRL._edge_penalty_term`) for scale comparability.
-        Orchestrators without a working ``send_message`` (raising
-        ``NotImplementedError``) are silently skipped edge by edge.
+        This is computed entirely in whitened space — no re-colouring back
+        into raw scale, no decoder involved — so it is *exactly* the
+        quantity SheafFRL calls ``sheaf_penalty`` (there evaluated online via
+        its own learned Stiefel maps every step); here it is evaluated
+        generically so post-training-alignment baselines are directly
+        comparable to it, not merely analogous.
+
+        Normalised by ``2·d_e`` — for whitened (unit-variance, uncorrelated)
+        latents this is the expected residual under *no* alignment, so the
+        result is a dimension-free "fraction of total variation left
+        unaligned" (see :meth:`SheafFRL._edge_penalty_term`).
+
+        Orchestrators without both hooks implemented (raising
+        ``NotImplementedError``), or edges with no map fitted in the queried
+        direction, are silently skipped.
 
         Returns a dict of metric name → value; the caller logs it.
         """
@@ -817,6 +856,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 if pi is None or pj is None:
                     continue
 
+                try:
+                    M = self._directed_alignment_map(sender_idx, receiver_idx)
+                except NotImplementedError:
+                    continue
+                if M is None:
+                    continue
+
                 idx_i, idx_j = common_pilot_indices(pi, pj)
                 if len(idx_i) < 2:
                     continue
@@ -824,12 +870,14 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 Z_i = pilot_Z[sender_idx][idx_i]
                 Z_j = pilot_Z[receiver_idx][idx_j]
                 try:
-                    Z_pred = (
-                        self.send_message(
-                            sender_idx=sender_idx,
-                            receiver_idx=receiver_idx,
-                            Z_sender=Z_i.to(self.device),
-                        )
+                    Z_i_w = (
+                        self._whiten_own_latents(sender_idx, Z_i.to(self.device))
+                        .detach()
+                        .cpu()
+                        .float()
+                    )
+                    Z_j_w = (
+                        self._whiten_own_latents(receiver_idx, Z_j.to(self.device))
                         .detach()
                         .cpu()
                         .float()
@@ -837,7 +885,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 except NotImplementedError:
                     continue
 
-                diff = Z_pred - Z_j
+                diff = Z_i_w @ M.detach().cpu().float() - Z_j_w
                 d_e = diff.shape[1]
                 if d_e == 0:
                     continue

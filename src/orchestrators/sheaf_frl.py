@@ -1237,21 +1237,55 @@ class SheafFRL(BaseOrchestrator):
             return color(Z_aligned, op_receiver).to(dev)
         return Z_aligned.to(dev)
 
+    @torch.no_grad()
+    def _whiten_own_latents(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Whiten with agent ``idx``'s current whitening operator (frozen, applied not re-fit)."""
+        if self._use_learnable_whitening():
+            return self._whiten_pilots_frozen(idx, Z)
+        op = self._whitening_ops.get(idx)
+        if op is None:
+            raise NotImplementedError(
+                f'no whitening operator fitted for agent {idx}'
+            )
+        return whiten(Z, op)
+
+    def _directed_alignment_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """The Stiefel/general map stored for exactly sender_idx -> receiver_idx.
+
+        Edges are stored once per pair under a single canonical key (see
+        ``send_message``'s convention). Only the direction matching that
+        stored key returns a map; the reverse direction returns ``None``
+        rather than falling back to ``V.T``/``pinv(V)`` — those are a
+        communication convenience, not a fitted map for that orientation, so
+        they must not be used to score alignment quality.
+        """
+        edge_key = f'{sender_idx}_{receiver_idx}'
+        V = self.stiefel_matrices.get(edge_key)
+        if V is None:
+            return None
+        return V.float()
+
     def evaluate_communication_accuracy(
         self, dm, prefix: str = 'test'
     ) -> dict[str, float]:
         """Cross-agent accuracy plus the generic pilot-based misalignment loss.
 
         Extends the base evaluation with
-        :meth:`BaseOrchestrator.evaluate_misalignment_loss`, routed through
-        this orchestrator's learned ``send_message`` pipeline (whitening →
-        Stiefel map → re-colouring).  This logs the same
-        ``{prefix}/misalignment_loss`` and per-edge
+        :meth:`BaseOrchestrator.evaluate_misalignment_loss`, which (via
+        ``_whiten_own_latents`` / ``_directed_alignment_map`` above) measures
+        the coboundary residual in the same whitened space and the same
+        single stored direction per edge that ``{prefix}/sheaf_penalty``
+        uses during training — no re-colouring, no decoder, no
+        transpose/pseudo-inverse fallback for the reverse direction. This
+        logs the same ``{prefix}/misalignment_loss`` and per-edge
         ``{prefix}/misalignment_loss_edge_i_j`` keys as the
         post-training-alignment baselines, computed by the identical
-        evaluator, so the values are directly comparable across
-        orchestrators.  The online whitened-coboundary residual remains
-        available separately as ``{prefix}/sheaf_penalty``.
+        evaluator, so the values are now *exactly* the same quantity as
+        ``{prefix}/sheaf_penalty`` (up to which pilot samples/whitening
+        operator snapshot are current at evaluation time) and directly
+        comparable across orchestrators.
         """
         logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
         logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
