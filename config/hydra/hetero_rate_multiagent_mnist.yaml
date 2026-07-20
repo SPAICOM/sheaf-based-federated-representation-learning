@@ -1,7 +1,7 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: comfed
+  - orchestrator: sheaf_frl
   - optimizer: sgd
   - _self_
 
@@ -17,17 +17,9 @@ lmb_study:
   lmb_high: 1
 
 graph:
-  # "class_overlap": sparse, connected graph that keeps only the edges between
-  # the agents sharing the most target classes, capped at max_edge_frac of all
-  # possible edges. A maximum-weight spanning tree is always retained so the
-  # graph stays connected. Other modes: fully_connected, erdos_renyi, barabasi,
-  # manual (hand-written `neighbors` dict below).
   neighbors_mode: "class_overlap"
   max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
   similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
-  # Extra knobs the other modes need (optional — sensible defaults in
-  # generate_neighbors): erdos_renyi → seed, p ; barabasi → seed, m ;
-  # manual → neighbors: {i: [j, k], ...}
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
@@ -44,9 +36,6 @@ trainer:
   deterministic: true
   num_sanity_val_steps: 2
   log_every_n_steps: 25
-  # Bound gradient norm so a single exploding step can't push an agent's
-  # weights to inf/NaN (SGD momentum=0.9 + comm_task_coeff=1 + no warmup makes
-  # this easy early on). Applied natively by Lightning (automatic optimization).
   gradient_clip_val: 1.0
   gradient_clip_algorithm: norm
 
@@ -217,11 +206,11 @@ model:
       use_batchnorm: true
 
 orchestrator:
+  pid_logging: false
   use_prototypes: false
   log_latent_diagnostics: true
   # Sheaf FRL specific
-  warmup_epochs: 0 # just for sheaf_frl
-  comm_task_coeff: 1
+  warmup_epochs: 0
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
@@ -236,6 +225,10 @@ orchestrator:
   eta: 0.01
   # Post-training alignment
   alignment_method: procrustes
+  max_lmb: 1
+  learn_lmb: false
+  dual_rho: null
+  comm_task_coeff: 0
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch

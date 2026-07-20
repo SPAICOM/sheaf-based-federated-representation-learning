@@ -23,11 +23,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: multi_trial
+  project: shift_distr
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
+
+optimizer:
+  lr: 1e-1
 
 trainer:
   max_epochs: 40
@@ -56,7 +59,6 @@ dataset:
   pilot_split: 0.1
   pilot_batch_size: 64
   comm_data: shared_global_pilots
-
   groups:
     0:
       agents: [0]
@@ -150,7 +152,7 @@ model:
       use_batchnorm: true
     7:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [24, 48, 96, 144]  # deepened to 4 blocks (was [32,64,128], dup of 0/1)
+      encoder_hidden_dims: [24, 48, 96, 144]
       decoder_hidden_dims: [64, 32]
       dropout: 0.1
       use_batchnorm: true
@@ -170,13 +172,13 @@ model:
       _target_: src.agents.CNNClassifier
       encoder_hidden_dims: [40, 80, 120]
       decoder_hidden_dims: [120, 60]
-      dropout: 0.2  # lowered from 0.3: was converging slowly, not capacity-bound
+      dropout: 0.2
       use_batchnorm: true
     11:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [48, 96, 192, 240]  # deepened to 4 blocks (was [64,128,128], near-dup of 3)
+      encoder_hidden_dims: [48, 96, 192, 240]
       decoder_hidden_dims: [256, 128]
-      dropout: 0.2  # lowered from 0.35: was converging slowly, not capacity-bound
+      dropout: 0.2
       use_batchnorm: true
     12:
       _target_: src.agents.CNNClassifier
@@ -192,7 +194,7 @@ model:
       use_batchnorm: true
     14:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [56, 112, 160]  # +3rd block: pools 7x7 -> 3x3
+      encoder_hidden_dims: [56, 112, 160]
       decoder_hidden_dims: [128]
       dropout: 0.1
       use_batchnorm: true
@@ -202,16 +204,16 @@ orchestrator:
   use_prototypes: false
   log_latent_diagnostics: true
   # Sheaf FRL specific
-  warmup_epochs: 0 # just for sheaf_frl
+  warmup_epochs: 0
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
   learn_whitening: true
-  # CE Sheaf FRL specific
-  phase_a_epochs: 1
-  phase_c_epochs: 2
-  # Sheaf compressed FRL
-  compression_factor: 0.5
+  # # CE Sheaf FRL specific
+  # phase_a_epochs: 1
+  # phase_c_epochs: 2
+  # # Sheaf compressed FRL
+  # compression_factor: 0.5
   # Sheaf FMTL specific
   gamma: 1e-4
   eta: 0.01
@@ -230,7 +232,5 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # orchestrator.dual_rho: 0.01, 0.1, 0.3
-      orchestrator.learn_lmb: false
-      dataset.shift_strength: 0.7, 0.8, 0.9
-      orchestrator: sheaf_frl
+      # dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
+      orchestrator: non_cooperative, sheaf_frl

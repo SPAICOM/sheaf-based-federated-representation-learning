@@ -37,13 +37,22 @@ class PostTrainingAlignmentMixin:
         Steps:
           1. Encode each agent's full training set, fit a whitening operator.
           2. Encode each agent's pilot set, whiten with training operator.
-          3. For every directed edge (sender→receiver), find common pilot
-             samples and fit M_{receiver←sender} using the configured method:
+          3. For every *undirected* edge, find common pilot samples and fit
+             exactly one map M_{receiver←sender} using the configured method:
              - 'general'    : unconstrained least-squares (fit_alignment).
              - 'procrustes' : semi-orthogonal map (fit_procrustes).
+             The (sender, receiver) orientation is fixed by latent dimension
+             — sender = the endpoint with the larger latent dim, ties broken
+             by the larger agent index — the same canonical convention
+             ``SheafFRL._build_restriction_maps`` uses for its single shared
+             restriction map per edge. This keeps the number of fitted maps,
+             and their orientation, identical across baselines and SheafFRL
+             so ``evaluate_misalignment_loss`` scores the exact same edges.
 
         Alignment maps are stored as right-multiply matrices M such that
-        ``Z_white_sender @ M ≈ Z_white_receiver``.
+        ``Z_white_sender @ M ≈ Z_white_receiver``. ``send_message`` covers
+        the reverse direction by inverting this single map (transpose for
+        'procrustes', pseudo-inverse for 'general') — see its docstring.
 
         Returns True if at least one alignment map was successfully fitted.
         """
@@ -136,23 +145,41 @@ class PostTrainingAlignmentMixin:
                 d = self._train_whitening_ops[idx].W.shape[0]
                 pilot_Z[idx] = torch.empty(0, d)
 
-        # Step 3 — fit directed alignment maps M_{receiver←sender} per edge.
+        # Step 3 — fit one alignment map per undirected edge.
         method = str(getattr(self.hparams, 'alignment_method', 'general'))
         neighbors_map: dict[int, set[int]] = {
             int(k): {int(n) for n in v}
             for k, v in self.hparams.neighbors.items()
+        }
+        latent_dims = {
+            idx: op.W.shape[0] for idx, op in self._train_whitening_ops.items()
         }
         self._alignment_maps: dict[int, dict[int, torch.Tensor]] = {
             idx: {} for idx in pilot_Z
         }
 
         any_fitted = False
-        for sender_idx, receiver_set in neighbors_map.items():
-            if sender_idx not in pilot_Z:
+        seen_edges: set[frozenset[int]] = set()
+        for i, receiver_set in neighbors_map.items():
+            if i not in pilot_Z:
                 continue
-            for receiver_idx in receiver_set:
-                if receiver_idx == sender_idx or receiver_idx not in pilot_Z:
+            for j in receiver_set:
+                if j == i or j not in pilot_Z:
                     continue
+                edge = frozenset((i, j))
+                if edge in seen_edges:
+                    continue
+                seen_edges.add(edge)
+
+                # Canonical orientation — mirrors SheafFRL's node_i/node_j
+                # rule exactly (larger latent dim wins; ties go to the
+                # larger agent index).
+                if latent_dims[i] > latent_dims[j]:
+                    sender_idx, receiver_idx = i, j
+                elif latent_dims[i] < latent_dims[j]:
+                    sender_idx, receiver_idx = j, i
+                else:
+                    sender_idx, receiver_idx = max(i, j), min(i, j)
 
                 pi = pilot_datasets.get(sender_idx)
                 pj = pilot_datasets.get(receiver_idx)
@@ -188,8 +215,15 @@ class PostTrainingAlignmentMixin:
         """Transform sender's test latents into the receiver's latent space.
 
         Pipeline: whiten (sender stats) → align (M_{receiver←sender}) →
-        re-colour (receiver stats).  When alignment_method is None or no maps
-        have been fitted, the method degrades to identity (returns Z_sender).
+        re-colour (receiver stats).  Only one map is fitted per undirected
+        edge (see ``_fit_alignment_maps``); when queried in the opposite
+        orientation, that single map is inverted instead — ``M.T`` for
+        ``alignment_method == 'procrustes'`` (semi-orthogonal, so the
+        transpose is exact) or ``pinv(M)`` otherwise — exactly mirroring
+        ``SheafFRL.send_message``'s ``V.T``/``pinv(V)`` fallback for the
+        edge's non-canonical direction. When alignment_method is None or no
+        maps have been fitted, the method degrades to identity (returns
+        Z_sender).
 
         Parameters
         ----------
@@ -208,7 +242,17 @@ class PostTrainingAlignmentMixin:
 
         op_sender = train_ops.get(sender_idx)
         op_receiver = train_ops.get(receiver_idx)
+
         M = alignment_maps.get(sender_idx, {}).get(receiver_idx)
+        if M is None:
+            M_rev = alignment_maps.get(receiver_idx, {}).get(sender_idx)
+            if M_rev is not None:
+                method = str(getattr(self.hparams, 'alignment_method', 'general'))
+                M = (
+                    M_rev.T
+                    if method == 'procrustes'
+                    else torch.linalg.pinv(M_rev)
+                )
 
         dev = Z_sender.device
 
@@ -242,9 +286,15 @@ class PostTrainingAlignmentMixin:
     ) -> torch.Tensor | None:
         """The map fitted for exactly sender_idx -> receiver_idx.
 
-        ``_fit_alignment_maps`` fits one independent map per *directed* edge
-        (never derives one direction from the other's transpose), so this is
-        already direction-respecting by construction.
+        ``_fit_alignment_maps`` fits exactly one map per undirected edge, in
+        the canonical orientation described there (mirroring SheafFRL's
+        node_i/node_j rule). This returns that map only when queried in
+        that exact orientation, and ``None`` for the reverse direction
+        (never a transpose/pseudo-inverse of it — that inversion is a
+        ``send_message`` communication convenience, not a valid alignment-
+        quality measurement for the direction it wasn't fit for). So
+        misalignment-loss scoring covers exactly one direction per edge,
+        the same edges and orientation as ``SheafFRL._directed_alignment_map``.
         """
         return getattr(self, '_alignment_maps', {}).get(sender_idx, {}).get(
             receiver_idx
@@ -415,8 +465,14 @@ class PostTrainingAlignmentMixin:
             for sender_idx in neighbors_map.get(receiver_idx, set()):
                 if sender_idx not in test_Z:
                     continue
-                # Only report metrics for edges where a map was fitted.
-                if receiver_idx not in self._alignment_maps.get(sender_idx, {}):
+                # Only report metrics for edges where a map was fitted, in
+                # either orientation — send_message inverts the map when
+                # queried in the edge's non-canonical direction.
+                if receiver_idx not in self._alignment_maps.get(
+                    sender_idx, {}
+                ) and sender_idx not in self._alignment_maps.get(
+                    receiver_idx, {}
+                ):
                     continue
 
                 Z_colored = self.send_message(
