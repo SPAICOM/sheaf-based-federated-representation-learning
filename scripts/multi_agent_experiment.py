@@ -481,7 +481,7 @@ def tune_max_lmb(
     config_name='hetero_rate_multiagent_mnist',
     version_base='1.3',
 )
-def main(cfg: DictConfig) -> None:
+def main(cfg: DictConfig) -> float:
     seed_everything(cfg.seed, workers=True)
 
     shift_strength = float(
@@ -652,6 +652,19 @@ def main(cfg: DictConfig) -> None:
     # ── Collect per-agent metrics logged by the orchestrator ──────────────────
     cb = {k: float(v) for k, v in trainer.callback_metrics.items()}
 
+    # Harmonic mean of task performance and comm-task performance: the
+    # objective a `hydra/sweeper: optuna` multirun (e.g. config/hydra/hpo/
+    # sweep_sheaf_fmtl*.yaml) maximizes. Mirrors the max_lmb-tuning objective
+    # in `_tune_max_lmb` above. Ignored (unused) for a plain single run.
+    task_perf = cb.get('test/avg_private_task_perf', 0.0)
+    comm_perf = cb.get('test/avg_comm_task_perf', 0.0)
+    objective_denom = task_perf + comm_perf
+    objective = (
+        2.0 * task_perf * comm_perf / objective_denom
+        if objective_denom > 0.0
+        else 0.0
+    )
+
     rows = []
     for i in range(n_agents):
         rows.append(
@@ -704,6 +717,8 @@ def main(cfg: DictConfig) -> None:
     remove_non_empty_dir('~/.cache/wandb/')
     remove_non_empty_dir(cfg.logger.project)
     _finish_active_wandb_run()
+
+    return objective
 
 
 if __name__ == '__main__':

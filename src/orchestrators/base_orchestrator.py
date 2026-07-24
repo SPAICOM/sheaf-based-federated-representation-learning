@@ -20,7 +20,14 @@ from hydra.utils import instantiate
 from PIL import Image as _PILImage
 from torchvision.transforms.functional import to_tensor as _pil_to_tensor
 
-from src.communication.whitening import common_pilot_indices
+from src.communication.whitening import (
+    color,
+    common_pilot_indices,
+    fit_alignment,
+    fit_procrustes,
+    fit_whitening,
+    whiten,
+)
 from src.utils import calculate_communication_cost
 
 
@@ -695,6 +702,260 @@ class BaseOrchestrator(l.LightningModule, ABC):
             logs[f'{prefix}/avg_task_fidelity'] = sum(
                 task_fidelities.values()
             ) / len(task_fidelities)
+
+        # Non-neighbour cross-agent accuracy is a test-only metric: it always
+        # requires post-hoc map fitting (no orchestrator trains maps for
+        # non-edges), so it is evaluated once rather than every train epoch.
+        if prefix == 'test':
+            logs.update(
+                self.evaluate_heterophil_communication_accuracy(
+                    dm, prefix=prefix
+                )
+            )
+
+        return logs
+
+    @torch.no_grad()
+    def evaluate_heterophil_communication_accuracy(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
+        """Cross-agent accuracy over *non*-edges via post-hoc alignment maps.
+
+        Counterpart to ``evaluate_communication_accuracy``: measures how well
+        each agent's decoder classifies test latents received from the agents
+        it is NOT connected to in the communication graph. Since no
+        orchestrator fits or learns maps for non-edges during training, the
+        maps here are always fitted post hoc, with the identical procedure for
+        every orchestrator:
+
+          1. Fit a whitening operator per agent on its training latents.
+          2. Whiten pilot latents; for every unordered non-neighbour pair fit
+             exactly one alignment map on the common pilot samples, in the
+             same canonical orientation used for graph edges (sender = the
+             endpoint with the larger latent dim, ties broken by the larger
+             agent index — the convention shared by
+             ``SheafFRL._build_restriction_maps`` and
+             ``PostTrainingAlignmentMixin._fit_alignment_maps``).
+          3. For each receiver and each non-neighbour sender, transform the
+             sender's test latents (whiten → align → re-colour) and measure
+             the receiver's decoder accuracy against the sender's labels.
+             The pair's non-canonical direction reuses the single fitted map
+             inverted — transpose for 'procrustes', pseudo-inverse otherwise
+             — mirroring ``send_message``.
+
+        The map type follows ``hparams.alignment_method`` when set and
+        defaults to 'procrustes' otherwise. All fitted state is local to this
+        call — no orchestrator attributes are read or written — so it is safe
+        regardless of any alignment machinery the orchestrator itself carries.
+
+        Returns ``{prefix}/heterophil_comm_task_perf_agent_{j}`` per receiver
+        and their mean ``{prefix}/avg_heterophil_comm_task_perf``; the caller
+        is responsible for logging.
+        """
+        train_datasets = getattr(dm, 'train_datasets', None)
+        pilot_datasets = getattr(dm, 'pilot_datasets', None)
+        test_datasets = getattr(dm, 'test_datasets', None)
+        if not train_datasets or not pilot_datasets or not test_datasets:
+            return {}
+
+        def _collate_xy(batch):
+            xs, ys = [], []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+                y = item[1]
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
+            return torch.stack(xs), torch.stack(ys)
+
+        def _encode(agent, dataset):
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_collate_xy,
+            )
+            was_training = agent.training
+            agent.eval()
+            Zs, ys = [], []
+            for x_batch, y_batch in loader:
+                Zs.append(
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
+                )
+                ys.append(y_batch.cpu())
+            agent.train(was_training)
+            if not Zs:
+                return None, None
+            return torch.cat(Zs, dim=0), torch.cat(ys, dim=0)
+
+        # Step 1 — post-hoc whitening operators from training latents.
+        whitening_ops = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            train_ds = train_datasets.get(idx)
+            if train_ds is None or len(train_ds) == 0:
+                continue
+            Z, _ = _encode(agent, train_ds)
+            if Z is not None:
+                whitening_ops[idx] = fit_whitening(Z)
+
+        if not whitening_ops:
+            return {}
+
+        # Step 2 — whitened pilot latents.
+        pilot_Z: dict[int, torch.Tensor] = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            if idx not in whitening_ops:
+                continue
+            pilot_ds = pilot_datasets.get(idx)
+            if pilot_ds is None or len(pilot_ds) == 0:
+                continue
+            Z, _ = _encode(agent, pilot_ds)
+            if Z is not None:
+                pilot_Z[idx] = whiten(Z, whitening_ops[idx])
+
+        neighbors_map: dict[int, set[int]] = {
+            int(k): {int(n) for n in v}
+            for k, v in self.hparams.neighbors.items()
+        }
+        latent_dims = {
+            idx: op.W.shape[0] for idx, op in whitening_ops.items()
+        }
+
+        method = getattr(self.hparams, 'alignment_method', None)
+        method = str(method) if method is not None else 'procrustes'
+
+        # Step 3 — one map per unordered non-neighbour pair, canonical
+        # orientation (larger latent dim wins; ties go to the larger index).
+        hetero_maps: dict[tuple[int, int], torch.Tensor] = {}
+        agent_ids = sorted(pilot_Z)
+        for pos, i in enumerate(agent_ids):
+            for j in agent_ids[pos + 1:]:
+                if j in neighbors_map.get(i, set()) or i in neighbors_map.get(
+                    j, set()
+                ):
+                    continue
+
+                if latent_dims[i] > latent_dims[j]:
+                    sender_idx, receiver_idx = i, j
+                elif latent_dims[i] < latent_dims[j]:
+                    sender_idx, receiver_idx = j, i
+                else:
+                    sender_idx, receiver_idx = max(i, j), min(i, j)
+
+                pi = pilot_datasets.get(sender_idx)
+                pj = pilot_datasets.get(receiver_idx)
+                if pi is None or pj is None:
+                    continue
+                idx_i, idx_j = common_pilot_indices(pi, pj)
+                if len(idx_i) < 2:
+                    continue
+
+                X_i = pilot_Z[sender_idx][idx_i]
+                X_j = pilot_Z[receiver_idx][idx_j]
+                if method == 'procrustes':
+                    M = fit_procrustes(X_i, X_j)
+                else:
+                    M = fit_alignment(X_i, X_j).T
+                hetero_maps[(sender_idx, receiver_idx)] = M
+
+        if not hetero_maps:
+            return {}
+
+        # Step 4 — encode test latents and labels.
+        test_Z: dict[int, torch.Tensor] = {}
+        test_y: dict[int, torch.Tensor] = {}
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            if idx not in whitening_ops:
+                continue
+            test_ds = test_datasets.get(idx)
+            if test_ds is None or len(test_ds) == 0:
+                continue
+            Z, y = _encode(agent, test_ds)
+            if Z is not None:
+                test_Z[idx] = Z
+                test_y[idx] = y
+
+        if not test_Z:
+            return {}
+
+        def _is_classifier(agent) -> bool:
+            return (
+                getattr(agent, 'task_type', 'classification')
+                == 'classification'
+            )
+
+        # Step 5 — receiver decodes each non-neighbour sender's test latents.
+        receiver_accs: dict[int, float] = {}
+        logs: dict[str, float] = {}
+        for idx_str, agent_receiver in self.agents.items():
+            receiver_idx = int(idx_str)
+            if not hasattr(agent_receiver, 'decoder'):
+                continue
+            if not _is_classifier(agent_receiver):
+                continue
+            if receiver_idx not in test_Z:
+                continue
+
+            accs: list[float] = []
+            for sender_idx in test_Z:
+                if sender_idx == receiver_idx:
+                    continue
+                if sender_idx in neighbors_map.get(receiver_idx, set()):
+                    continue
+
+                M = hetero_maps.get((sender_idx, receiver_idx))
+                if M is None:
+                    M_rev = hetero_maps.get((receiver_idx, sender_idx))
+                    if M_rev is None:
+                        continue
+                    M = (
+                        M_rev.T
+                        if method == 'procrustes'
+                        else torch.linalg.pinv(M_rev)
+                    )
+
+                Z_white = whiten(
+                    test_Z[sender_idx], whitening_ops[sender_idx]
+                )
+                Z_recv = color(Z_white @ M, whitening_ops[receiver_idx])
+
+                was_training = agent_receiver.training
+                agent_receiver.eval()
+                logits = agent_receiver.decoder(Z_recv.to(self.device))
+                agent_receiver.train(was_training)
+
+                preds = logits.argmax(dim=1).cpu()
+                accs.append(
+                    float((preds == test_y[sender_idx]).float().mean().item())
+                )
+
+            if accs:
+                avg_acc = sum(accs) / len(accs)
+                receiver_accs[receiver_idx] = avg_acc
+                logs[
+                    f'{prefix}/heterophil_comm_task_perf_agent_{receiver_idx}'
+                ] = avg_acc
+
+        if receiver_accs:
+            logs[f'{prefix}/avg_heterophil_comm_task_perf'] = sum(
+                receiver_accs.values()
+            ) / len(receiver_accs)
 
         return logs
 

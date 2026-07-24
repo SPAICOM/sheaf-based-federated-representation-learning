@@ -1,0 +1,41 @@
+# @package _global_
+# Communication-strength study for the 15-agent
+# hetero_rate_multiagent_mnist_sheaf_fmtl experiment.
+#
+# gamma (shared-space dimension ratio) and max_lmb (Sheaf-Laplacian penalty
+# strength) are the two hparams that actually control "how much to force
+# communication"; eta is only the restriction-map fitting step size, so it
+# is swept alongside as a secondary/stability axis rather than the headline
+# variable. Objective: harmonic mean of avg task perf and avg comm-task
+# perf, returned by scripts/multi_agent_experiment.py::main.
+#
+# Usage:
+#   uv run scripts/multi_agent_experiment.py \
+#     --config-name hetero_rate_multiagent_mnist_sheaf_fmtl \
+#     +hpo=sweep_sheaf_fmtl_15agents_comm --multirun
+defaults:
+  - override /hydra/sweeper: optuna
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    direction: maximize
+    study_name: ${study_name}_comm_study
+    n_trials: 40
+    n_jobs: 1
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: ${seed}
+    params:
+      # Capped at 3e-3: on this 15-agent/84-edge graph the P_ij restriction
+      # matrices (CPU-resident, fp16 — see src/orchestrators/sheaf_fmtl.py)
+      # already need ~17GB at gamma=3e-3; higher values don't fit in the
+      # 31GB of system RAM this study runs on.
+      orchestrator.gamma: choice(1e-4, 3e-4, 1e-3, 2e-3, 3e-3)
+      orchestrator.max_lmb: choice(1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2)
+      orchestrator.eta: choice(1e-4, 1e-3, 1e-2, 5e-2, 1e-1)
+
+# Distinct project so this study's runs can be queried in WandB by
+# project rather than study_name (study_name gets reused across studies).
+logger:
+  project: sheaf_fmtl_comm_study

@@ -8,12 +8,15 @@ defaults:
 seed: 42
 study_name: "HeteroRate MNIST 2 agents - hetero models, matched bottleneck"
 
+optimizer:
+  lr: 0.01
+
 lmb_study:
-  enabled: true         # set to true to run Optuna search before the full training run
+  enabled: false         # set to true to run Optuna search before the full training run
   n_trials: 15          # number of Optuna trials
   n_tune_epochs: 5      # epochs per trial
-  lmb_low: 1e-4       # lower bound of the log-uniform search interval
-  lmb_high: 5e-3       # upper bound of the log-uniform search interval
+  lmb_low: 1e-2         # lower bound of the log-uniform search interval
+  lmb_high: 1           # upper bound of the log-uniform search interval
 
 graph:
   neighbors_mode: "fully_connected"
@@ -31,7 +34,7 @@ logger:
   log_model: false
 
 trainer:
-  max_epochs: 20
+  max_epochs: 100
   accelerator: auto
   devices: 1
   deterministic: true
@@ -47,7 +50,7 @@ dataset:
   split_strategy: grouped_non_iid
   n_agents: 2
   classes_per_agent: 10
-  shift_strength: 0.7
+  shift_strength: 0.9
   monitor_test_during_fit: true
   batch_size: 64
   num_workers: 0
@@ -64,16 +67,13 @@ dataset:
       target_classes: [0, 1, 2, 3, 4, 5]
 
 orchestrator:
+  pid_logging: false
   parseval_normalization: false
   l2_normalization: false
   use_prototypes: false
   log_latent_diagnostics: true
-  # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
-  max_lmb: 1e-2
-  lambda_schedule: null
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl
-  comm_task_coeff: 1
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
@@ -82,6 +82,9 @@ orchestrator:
   eta: 0.01
   # Post-training alignment (for methods not working on representations)
   alignment_method: procrustes # can be "general" or "procrustes"
+  comm_task_coeff: 0
+  learn_lmb: false
+  max_lmb: 1e-3
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch
@@ -94,5 +97,5 @@ hydra:
       # Each choice is a hand-tuned, monotonically telescoping encoder/decoder
       # pair (config/hydra/model/hetero_bottleneck_*.yaml) sharing that last
       # encoder dim across both (differently-shaped) agents.
-      model: hetero_bottleneck_128
-      orchestrator: fedmuscle
+      model: hetero_bottleneck_16 # hetero_bottleneck_8, hetero_bottleneck_16, hetero_bottleneck_32, hetero_bottleneck_64, hetero_bottleneck_128, hetero_bottleneck_256
+      orchestrator: sheaf_frl

@@ -29,6 +29,16 @@ Implementation Details:
     - One epoch-end synchronization therefore incurs two projected-vector
       exchange rounds: one before the agent update and one before the
       restriction-map update
+
+Memory note:
+    d_i is the *full* flattened parameter count of an agent's model, so
+    P_ij is O(gamma * d^2) per edge. For many agents/large models this does
+    not fit in accelerator memory even at small gamma. The equations above
+    are unchanged, but purely for memory reasons P_ij lives permanently on
+    CPU in a reduced-precision dtype (``matrix_dtype``), is upcast to fp32
+    only transiently (one edge at a time) for each matmul/outer-product,
+    and edges are updated in place one at a time rather than staging every
+    edge's update in memory simultaneously.
 """
 
 from typing import Any
@@ -64,7 +74,19 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
         Scheduling strategy for lambda: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     eta : float
         Learning rate for the manual P_ij matrix update step.
+    matrix_dtype : str
+        Storage dtype for the (potentially huge) P_ij matrices: ``'float16'``
+        (default), ``'bfloat16'``, or ``'float32'``. Matrices always live on
+        CPU regardless of accelerator, and are upcast to fp32 transiently
+        (one edge at a time) for each matmul/outer-product, so this only
+        controls resting memory, not numerical behaviour of the matmuls.
     """
+
+    _MATRIX_DTYPES = {
+        'float16': torch.float16,
+        'bfloat16': torch.bfloat16,
+        'float32': torch.float32,
+    }
 
     def __init__(
         self,
@@ -76,6 +98,7 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
         eta: float = 0.01,
         lambda_schedule: str | None = None,
         alignment_method: str = 'general',
+        matrix_dtype: str = 'float16',
         **kwargs,
     ):
         alignment_method = str(alignment_method)
@@ -83,6 +106,11 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
             raise ValueError(
                 f"Unknown alignment_method '{alignment_method}'. "
                 f'Valid options: {VALID_ALIGNMENT_METHODS}'
+            )
+        if matrix_dtype not in self._MATRIX_DTYPES:
+            raise ValueError(
+                f"Unknown matrix_dtype '{matrix_dtype}'. "
+                f'Valid options: {sorted(self._MATRIX_DTYPES)}'
             )
 
         super().__init__(
@@ -93,7 +121,13 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
         )
         self.save_hyperparameters(ignore=['agents'])
 
-        self.projection_matrices = nn.ParameterDict()
+        # Plain dict (not nn.ParameterDict): P_ij is never touched by
+        # autograd (manual .data-style updates only, see on_train_epoch_end)
+        # and must stay pinned to CPU regardless of accelerator, so it must
+        # not be swept up by Lightning's automatic module.to(device) at
+        # setup time.
+        storage_dtype = self._MATRIX_DTYPES[matrix_dtype]
+        self.projection_matrices: dict[str, torch.Tensor] = {}
 
         # Count trainable parameters for each agent (d_i)
         d = {}
@@ -113,14 +147,23 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 # Projection dimension d_ij
                 d_ij = max(1, int(self.hparams.gamma * min(d_i, d_j)))
 
-                # Rectangular projection matrix P_ij (d_ij x d_i)
-                P_ij = nn.Parameter(torch.empty(d_ij, d_i), requires_grad=True)
+                # Rectangular projection matrix P_ij (d_ij x d_i), CPU-resident
+                P_ij = torch.empty(
+                    d_ij, d_i, dtype=torch.float32, device='cpu'
+                )
                 nn.init.normal_(P_ij, mean=0.0, std=0.01)
 
-                self.projection_matrices[f'{i}_{j}'] = P_ij
+                self.projection_matrices[f'{i}_{j}'] = P_ij.to(storage_dtype)
 
     def on_train_epoch_end(self) -> None:
-        """Synchronize agent parameters and restriction maps once per epoch."""
+        """Synchronize agent parameters and restriction maps once per epoch.
+
+        The P_ij matrices are CPU-resident (see __init__), so this whole
+        synchronization runs on CPU: agent parameter vectors are copied to
+        CPU once per epoch (cheap relative to a P_ij matrix), and each P_ij
+        is upcast to fp32 transiently, one edge at a time, rather than all
+        at once, to keep peak memory to O(one edge) instead of O(all edges).
+        """
         agent_vectors = self._collect_agent_vectors()
         projected_vectors = self._projected_edge_vectors(agent_vectors)
         self._record_projected_vector_exchange(
@@ -145,7 +188,7 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                     )
                     sheaf_penalty_i += (
                         self._effective_lambda_reg()
-                        * torch.matmul(P_ij.t(), diff_ij)
+                        * torch.matmul(P_ij.float().t(), diff_ij)
                     )
 
                 updated_agent_vectors[i] = theta_i - lr * sheaf_penalty_i
@@ -155,10 +198,12 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 trainable_params = [
                     p for p in agent.parameters() if p.requires_grad
                 ]
-                vector_to_parameters(
-                    updated_agent_vectors[i],
-                    trainable_params,
+                reference_param = trainable_params[0]
+                updated_vector = updated_agent_vectors[i].to(
+                    device=reference_param.device,
+                    dtype=reference_param.dtype,
                 )
+                vector_to_parameters(updated_vector, trainable_params)
 
             updated_projected_vectors = self._projected_edge_vectors(
                 updated_agent_vectors
@@ -168,8 +213,9 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 prefix='train',
             )
 
-            projection_updates = {}
-            for edge_key in self.projection_matrices:
+            # Update each restriction map in place, one edge at a time:
+            # never stage every edge's update matrix in memory at once.
+            for edge_key in list(self.projection_matrices.keys()):
                 i_str, j_str = edge_key.split('_')
                 i, j = int(i_str), int(j_str)
                 theta_i = updated_agent_vectors[i]
@@ -177,20 +223,23 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                     updated_projected_vectors[edge_key]
                     - updated_projected_vectors[f'{j}_{i}']
                 )
-                projection_updates[edge_key] = (
+                update_matrix = (
                     self.hparams.eta
                     * self._effective_lambda_reg()
                     * torch.outer(diff, theta_i)
                 )
-
-            for edge_key, update_matrix in projection_updates.items():
-                self.projection_matrices[edge_key].data -= update_matrix
+                P_ij = self.projection_matrices[edge_key]
+                P_ij -= update_matrix.to(P_ij.dtype)
 
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
 
     def _collect_agent_vectors(self) -> dict[int, torch.Tensor]:
-        """Return flattened trainable parameter vectors for each agent."""
+        """Return flattened trainable parameter vectors for each agent.
+
+        Vectors are moved to CPU (fp32) since they are combined with the
+        CPU-resident P_ij matrices for the sheaf computation below.
+        """
         agent_vectors = {}
         with torch.no_grad():
             for idx_str, agent in self.agents.items():
@@ -198,7 +247,11 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 trainable_params = [
                     p for p in agent.parameters() if p.requires_grad
                 ]
-                agent_vectors[idx] = parameters_to_vector(trainable_params)
+                agent_vectors[idx] = (
+                    parameters_to_vector(trainable_params)
+                    .detach()
+                    .to(device='cpu', dtype=torch.float32)
+                )
         return agent_vectors
 
     def _projected_edge_vectors(
@@ -211,7 +264,7 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
                 i_str, _j_str = edge_key.split('_')
                 i = int(i_str)
                 projected_vectors[edge_key] = torch.matmul(
-                    P_ij, agent_vectors[i]
+                    P_ij.float(), agent_vectors[i]
                 )
         return projected_vectors
 

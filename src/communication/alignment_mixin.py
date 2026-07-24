@@ -332,9 +332,18 @@ class PostTrainingAlignmentMixin:
         try:
             logs = dict(self._comm_accuracy_with_fitted_maps(dm, prefix=prefix))
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
-            return logs
         finally:
             self._cleanup_alignment()
+
+        # Non-neighbour (heterophil) accuracy: test-only, fitted post hoc for
+        # non-edges with its own local state (see BaseOrchestrator).
+        if prefix == 'test':
+            logs.update(
+                self.evaluate_heterophil_communication_accuracy(
+                    dm, prefix=prefix
+                )
+            )
+        return logs
 
     @torch.no_grad()
     def _comm_accuracy_with_fitted_maps(

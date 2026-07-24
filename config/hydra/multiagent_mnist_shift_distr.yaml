@@ -23,17 +23,17 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: shift_distr
+  project: shift_distr_lr0.05
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 optimizer:
-  lr: 1e-1
+  lr: 5e-2
 
 trainer:
-  max_epochs: 40
+  max_epochs: 100
   accelerator: auto
   devices: 1
   deterministic: true
@@ -54,7 +54,7 @@ dataset:
   shift_strength: 0.7
   monitor_test_during_fit: true
   batch_size: 64
-  num_workers: 0
+  num_workers: 2
   mode: min_size
   pilot_split: 0.1
   pilot_batch_size: 64
@@ -219,7 +219,7 @@ orchestrator:
   eta: 0.01
   # Post-training alignment
   alignment_method: procrustes
-  max_lmb: 1e-1
+  max_lmb: 1e-2
   learn_lmb: false
   dual_rho: null
   comm_task_coeff: 0
@@ -232,5 +232,5 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
-      orchestrator: non_cooperative, sheaf_frl
+      dataset.shift_strength: 0.5, 0.6 # 0.7, 0.8, 0.9
+      orchestrator: sheaf_frl # non_cooperative, sheaf_frl
