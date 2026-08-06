@@ -44,22 +44,6 @@ The `setup` recipe will:
 
 After the command completes, the development environment will be ready to use. 🚀
 
-## Current Implementation Notes
-
-The most recent federated-learning changes are:
-
-- `SheafFRL` now exposes `anchor_strategy` with two supported modes:
-  - `pilots`: uses the shared pilot loaders already aligned by pilot sample ids; `use_prototypes=true` compresses each pilot batch to one prototype per observed class before alignment.
-  - `batch_anchors`: reuses each agent's current task-batch latents, compresses them immediately to per-class prototypes, logs communication on those prototype payloads, and aligns neighboring agents by class labels across independent local batches.
-- During training, `SheafFRL` computes the sheaf penalty with the current frozen Stiefel matrices `V`; the matrices themselves are updated only in `on_train_epoch_end()` from the cached training anchors accumulated during the epoch.
-- `ClassificationDataModule` now supports `split_strategy=non_iid_with_margin`, which assigns every agent exactly `K` classes while ensuring every global class is assigned to at least one agent. For each assigned class, the partitioner reserves a safety margin of samples before applying the skewed allocation, and it uses the same partitioner for train, validation, and test. `starve_clients=true` still subsamples only the training split afterward.
-
-For more detailed module-level documentation, see:
-
-- [`src/orchestrators/README.md`](src/orchestrators/README.md)
-- [`src/datamodules/README.md`](src/datamodules/README.md)
-- [`src/utils/README.md`](src/utils/README.md)
-
 ## Citation
 
 If you find this code useful for your research, please consider citing the following paper:
