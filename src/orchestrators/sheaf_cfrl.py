@@ -166,6 +166,7 @@ class SheafCFRL(CESheafFRL):
         self.compression_maps = nn.ParameterDict()
         # Each entry: (edge_key, node_a, node_b, c_ij).
         self._compression_edges: list[tuple[str, int, int, int]] = []
+        self._edge_c_ij: dict[str, int] = {}
         self._initialized_edges = set()
         factor = self._compression_factor
         seen: set[str] = set()
@@ -210,6 +211,7 @@ class SheafCFRL(CESheafFRL):
                     )
                 )
                 self._compression_edges.append((edge_key, a, b, c_ij))
+                self._edge_c_ij[edge_key] = c_ij
 
     def _find_edge(self, s: int, r: int) -> str | None:
         for edge_key, a, b, _c in self._compression_edges:
@@ -217,37 +219,37 @@ class SheafCFRL(CESheafFRL):
                 return edge_key
         return None
 
-    def _record_pilot_exchange(
-        self,
-        payloads_per_agent: dict,
-        latents_per_agent: dict,
-        prefix: str,
-    ) -> None:
-        """Record one pilot exchange using compressed c_ij-dimensional payloads.
+    def _edge_pairs(self) -> list[tuple[str, int, int]]:
+        """Canonical ``(edge_key, node_i, node_j)`` triples, from the compression edges.
 
-        Each directed edge (i→j) carries latents_i projected into the c_ij-
-        dimensional edge stalk (V_ji Z_i^T), not the full d_i-dimensional
-        embedding.  Both directions of every undirected edge are recorded
-        separately: a→b transmits K_a×c_ij scalars, b→a transmits K_b×c_ij.
+        Overrides :meth:`SheafFRL._edge_pairs` (which reads ``stiefel_matrices``,
+        kept empty here) so ``_rebuild_edge_anchor_caches`` works unchanged for
+        the compressed edge stalks.
         """
-        self._record_communication_round(n_rounds=1, prefix=prefix)
-        for _edge_key, a, b, c_ij in self._compression_edges:
-            if a in payloads_per_agent:
-                payload_a = payloads_per_agent[a]
-                n_rows_a = (
-                    payload_a.shape[0]
-                    if isinstance(payload_a, torch.Tensor)
-                    else latents_per_agent[a].shape[0]
-                )
-                self._record_communication(int(n_rows_a) * c_ij, prefix=prefix)
-            if b in payloads_per_agent:
-                payload_b = payloads_per_agent[b]
-                n_rows_b = (
-                    payload_b.shape[0]
-                    if isinstance(payload_b, torch.Tensor)
-                    else latents_per_agent[b].shape[0]
-                )
-                self._record_communication(int(n_rows_b) * c_ij, prefix=prefix)
+        return [(k, a, b) for k, a, b, _c in self._compression_edges]
+
+    def _record_edge_exchange(
+        self,
+        edge_key: str,
+        Z_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        prefix: str = 'train',
+    ) -> None:
+        """Record one edge's refresh using compressed ``c_ij``-dimensional payloads.
+
+        Overrides :meth:`SheafFRL._record_edge_exchange`: each direction
+        carries ``n_rows`` rows of the *shared* compressed edge-stalk
+        dimension ``c_ij`` (looked up via ``self._edge_c_ij``), not ``Z_i``/
+        ``Z_j``'s own raw ``d_a``/``d_b`` dims — both directions send the same
+        ``n_rows*c_ij`` scalars, unlike :class:`SheafFRL`'s heterogeneous
+        ``d_i``/``d_j``.
+        """
+        n_rows = int(Z_i.shape[0])
+        c_ij = self._edge_c_ij.get(edge_key)
+        if n_rows <= 0 or c_ij is None:
+            return
+        self._record_communication(n_rows * c_ij, prefix=prefix)
+        self._record_communication(n_rows * c_ij, prefix=prefix)
 
     def on_train_start(self) -> None:
         super().on_train_start()
@@ -313,44 +315,30 @@ class SheafCFRL(CESheafFRL):
     # ── Compressed coboundary penalties (both-live + Phase-A frozen) ──────────
 
     def _both_live_alignment_losses(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-        comm_weight: float,
-        skip: bool,
+        self, comm_weight: float, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Phase-C / per-step compressed coboundary ‖Z_a V_aᵀ − Z_b V_bᵀ‖² + after-comm."""
+        """Phase-C / per-step compressed coboundary ‖Z_a V_aᵀ − Z_b V_bᵀ‖² + after-comm.
+
+        Both stalks re-encoded fresh from their fixed anchor cache
+        (:meth:`~src.orchestrators.sheaf_frl.SheafFRL._edge_live_anchors`).
+        """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm_task_loss = torch.tensor(0.0, device=self.device)
         if skip:
             return sheaf_penalty, after_comm_task_loss
 
         for edge_key, a, b, _c in self._compression_edges:
-            if a not in whitened_per_agent or b not in whitened_per_agent:
-                continue
-
             V_a = self.compression_maps[
                 self._proj_key(edge_key, a)
             ]  # (c, d_a)
             V_b = self.compression_maps[
                 self._proj_key(edge_key, b)
             ]  # (c, d_b)
-            src_a = (
-                whitened_per_agent[a],
-                keys_per_agent[a],
-                labels_per_agent[a],
-            )
-            src_b = (
-                whitened_per_agent[b],
-                keys_per_agent[b],
-                labels_per_agent[b],
-            )
-            matched = self._match_edge(a, b, src_a, src_b)
+            matched = self._edge_live_anchors(a, b)
             if matched is None:
                 continue
 
-            # Rows are already whitened (whitening was applied per node upstream).
+            # Rows are already whitened (inside _edge_live_anchors).
             Z_a, y_a_shared, Z_b, y_b_shared = matched
 
             # Compressed coboundary: project both stalks into the c-dim edge space.
@@ -397,31 +385,32 @@ class SheafCFRL(CESheafFRL):
         return sheaf_penalty, after_comm_task_loss
 
     def _frozen_alignment_losses(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-        skip: bool,
+        self, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Phase-A compressed coboundary against FROZEN neighbours.
 
-        Two terms per edge, each projecting a live node and a detached frozen
-        neighbour into the edge stalk; gradient reaches only the live node, and no
-        pilot is communicated this step.
+        Mirrors :meth:`CESheafFRL._frozen_alignment_losses`: each term pairs
+        one side's fresh re-encoding of the fixed anchor cache
+        (:meth:`~src.orchestrators.sheaf_frl.SheafFRL._edge_live_anchors`)
+        against the *other* side's snapshot as of the last Phase-C refresh
+        (``self._frozen_edge_anchors``), then projects both into the shared
+        ``c``-dim edge stalk before differencing — gradient reaches only the
+        live node, and no pilot is communicated this step.
         """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm = torch.tensor(0.0, device=self.device)
         if skip:
             return sheaf_penalty, after_comm
 
-        frozen = getattr(self, '_frozen_pilots', None)
-        if not frozen:
-            return self._both_live_alignment_losses(
-                whitened_per_agent, keys_per_agent, labels_per_agent, 0.0, skip
-            )
+        if not self._frozen_edge_anchors:
+            return self._both_live_alignment_losses(0.0, skip)
 
         for edge_key, a, b, _c in self._compression_edges:
-            if a not in whitened_per_agent or b not in whitened_per_agent:
+            frozen = self._frozen_edge_anchors.get((a, b))
+            if frozen is None:
+                continue
+            live = self._edge_live_anchors(a, b)
+            if live is None:
                 continue
             V_a = self.compression_maps[
                 self._proj_key(edge_key, a)
@@ -429,31 +418,19 @@ class SheafCFRL(CESheafFRL):
             V_b = self.compression_maps[
                 self._proj_key(edge_key, b)
             ]  # (c, d_b)
-            src_a = (
-                whitened_per_agent[a],
-                keys_per_agent[a],
-                labels_per_agent[a],
+            Z_a_live, _y_a_live, Z_b_live, _y_b_live = live
+            Z_a_frozen, _y_a_frozen, Z_b_frozen, _y_b_frozen = frozen
+
+            # node a live, pulled toward b's last-known (frozen) state.
+            d_a = torch.matmul(Z_a_live, V_a.t()) - torch.matmul(
+                Z_b_frozen, V_b.t()
             )
-            src_b = (
-                whitened_per_agent[b],
-                keys_per_agent[b],
-                labels_per_agent[b],
+            sheaf_penalty += self._edge_penalty_term(edge_key, d_a)
+            # node b live, pulled toward a's last-known (frozen) state.
+            d_b = torch.matmul(Z_a_frozen, V_a.t()) - torch.matmul(
+                Z_b_live, V_b.t()
             )
-            # Pull node a (live) toward frozen b; then node b (live) toward frozen a.
-            if b in frozen:
-                m = self._match_edge(a, b, src_a, frozen[b])
-                if m is not None:
-                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(
-                        m[2], V_b.t()
-                    )
-                    sheaf_penalty += self._edge_penalty_term(edge_key, d)
-            if a in frozen:
-                m = self._match_edge(a, b, frozen[a], src_b)
-                if m is not None:
-                    d = torch.matmul(m[0], V_a.t()) - torch.matmul(
-                        m[2], V_b.t()
-                    )
-                    sheaf_penalty += self._edge_penalty_term(edge_key, d)
+            sheaf_penalty += self._edge_penalty_term(edge_key, d_b)
 
         return sheaf_penalty, after_comm
 
@@ -594,89 +571,74 @@ class SheafCFRL(CESheafFRL):
         return Y_a.t().contiguous(), Y_b.t().contiguous(), primal, n_iters
 
     @torch.no_grad()
-    def _update_stiefel_matrices(
+    def _fit_edge_map(
         self,
-        latents_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        whitening_ops=None,
-        update_maps: bool = True,
-    ) -> tuple[dict[str, float], dict]:
-        if not self._compression_edges:
-            return {}, {}
+        edge_key: str,
+        node_i: int,
+        node_j: int,
+        Z_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        update_maps: bool,
+    ) -> dict[str, float]:
+        """SOC-ADMM Phase-B refit of the compressed edge-stalk maps from one edge's fixed anchor pair.
 
+        Overrides :meth:`~src.orchestrators.sheaf_frl.SheafFRL._fit_edge_map`:
+        same role (called once per edge per refresh from
+        ``_rebuild_edge_anchor_caches``, on the same ``(Z_i, Z_j)`` pair that
+        also drives the per-step compressed coboundary penalty), but refits
+        the two fat semi-orthogonal projectors ``(V_a, V_b)`` via SOC-ADMM
+        instead of a single Stiefel map via SVD.
+        """
         edge_metrics: dict[str, float] = {}
-        agent_normed, fitted_ops = self._whiten_epoch_latents(
-            latents_per_agent, whitening_ops
+        c_ij = self._edge_c_ij.get(edge_key)
+        if c_ij is None or Z_i.shape[0] == 0:
+            return edge_metrics
+        a, b = node_i, node_j
+
+        param_a = self.compression_maps[self._proj_key(edge_key, a)]
+        param_b = self.compression_maps[self._proj_key(edge_key, b)]
+        dev = param_a.device
+        Z_a, Z_b = Z_i.float().to(dev), Z_j.float().to(dev)
+
+        V_a = param_a.data.clone()  # (c, d_a)
+        V_b = param_b.data.clone()  # (c, d_b)
+        # PCA warm start on the first Phase B for this edge (if requested);
+        # later refreshes warm-start from the maps already on the manifold.
+        if (
+            self._compression_init == 'pca'
+            and edge_key not in self._initialized_edges
+        ):
+            V_a = self._pca_init(Z_a, c_ij)
+            V_b = self._pca_init(Z_b, c_ij)
+
+        if update_maps:
+            # Normalised second-/cross-moment matrices (Σ ≈ I after
+            # whitening).  The 1/n scaling — relative to the spec's raw ÃᵀÃ —
+            # keeps the ADMM penalty α scale-free in the anchor count.
+            n = max(1, Z_a.shape[0])
+            Sigma_a = (Z_a.t() @ Z_a) / n  # (d_a, d_a) = Σ_i
+            Sigma_b = (Z_b.t() @ Z_b) / n  # (d_b, d_b) = Σ_j
+            Sigma_ab = (Z_a.t() @ Z_b) / n  # (d_a, d_b) = Σ_ij
+            V_a, V_b, primal, n_iters = self._admm_phase_b(
+                V_a, V_b, Sigma_a, Sigma_b, Sigma_ab, c_ij,
+                self._compression_inner_steps,
+            )
+            param_a.copy_(V_a.to(dtype=param_a.dtype, device=dev))
+            param_b.copy_(V_b.to(dtype=param_b.dtype, device=dev))
+            edge_metrics[
+                f'compressed_admm_primal_resid_edge_{edge_key}'
+            ] = primal
+            edge_metrics[f'compressed_admm_iters_edge_{edge_key}'] = float(
+                n_iters
+            )
+            self._initialized_edges.add(edge_key)
+
+        resid = ((Z_a @ V_a.t() - Z_b @ V_b.t()) ** 2).sum(dim=1).mean()
+        edge_metrics[f'compressed_residual_edge_{edge_key}'] = float(
+            resid.item()
         )
-        t_b = self._compression_inner_steps
 
-        for edge_key, a, b, c_ij in self._compression_edges:
-            if a not in agent_normed or b not in agent_normed:
-                continue
-
-            # Epoch keys double as labels (they are class labels at epoch level).
-            Z_a_f, keys_a_f, _la, Z_b_f, keys_b_f, _lb = (
-                self._apply_edge_class_filter(
-                    a,
-                    b,
-                    agent_normed[a],
-                    keys_per_agent[a],
-                    keys_per_agent[a],
-                    agent_normed[b],
-                    keys_per_agent[b],
-                    keys_per_agent[b],
-                )
-            )
-            shared = self._match_keys(
-                A_i=Z_a_f, A_j=Z_b_f, keys_i=keys_a_f, keys_j=keys_b_f
-            )
-            if shared is None:
-                continue
-            Z_a, Z_b = shared
-
-            param_a = self.compression_maps[self._proj_key(edge_key, a)]
-            param_b = self.compression_maps[self._proj_key(edge_key, b)]
-            dev = param_a.device
-            Z_a, Z_b = Z_a.float().to(dev), Z_b.float().to(dev)
-
-            V_a = param_a.data.clone()  # (c, d_a)
-            V_b = param_b.data.clone()  # (c, d_b)
-            # PCA warm start on the first Phase B for this edge (if requested);
-            # later epochs warm-start from the maps already on the manifold.
-            if (
-                self._compression_init == 'pca'
-                and edge_key not in self._initialized_edges
-            ):
-                V_a = self._pca_init(Z_a, c_ij)
-                V_b = self._pca_init(Z_b, c_ij)
-
-            if update_maps:
-                # Normalised second-/cross-moment matrices (Σ ≈ I after
-                # whitening).  The 1/n scaling — relative to the spec's raw ÃᵀÃ —
-                # keeps the ADMM penalty α scale-free in the matched-pilot count.
-                n = max(1, Z_a.shape[0])
-                Sigma_a = (Z_a.t() @ Z_a) / n  # (d_a, d_a) = Σ_i
-                Sigma_b = (Z_b.t() @ Z_b) / n  # (d_b, d_b) = Σ_j
-                Sigma_ab = (Z_a.t() @ Z_b) / n  # (d_a, d_b) = Σ_ij
-                V_a, V_b, primal, n_iters = self._admm_phase_b(
-                    V_a, V_b, Sigma_a, Sigma_b, Sigma_ab, c_ij, t_b
-                )
-                param_a.copy_(V_a.to(dtype=param_a.dtype, device=dev))
-                param_b.copy_(V_b.to(dtype=param_b.dtype, device=dev))
-                edge_metrics[
-                    f'compressed_admm_primal_resid_edge_{edge_key}'
-                ] = primal
-                edge_metrics[f'compressed_admm_iters_edge_{edge_key}'] = float(
-                    n_iters
-                )
-                self._initialized_edges.add(edge_key)
-
-            resid = ((Z_a @ V_a.t() - Z_b @ V_b.t()) ** 2).sum(dim=1).mean()
-            edge_metrics[f'compressed_residual_edge_{edge_key}'] = float(
-                resid.item()
-            )
-
-        return edge_metrics, fitted_ops
+        return edge_metrics
 
     # ── send_message: project sender into the edge stalk, lift into receiver ──
 

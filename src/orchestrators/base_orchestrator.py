@@ -25,10 +25,12 @@ from src.communication.whitening import (
     common_pilot_indices,
     fit_alignment,
     fit_procrustes,
+    fit_relative_alignment,
     fit_whitening,
     whiten,
 )
 from src.utils import calculate_communication_cost
+from src.utils.anchors import select_paired_anchors
 
 
 class BaseOrchestrator(l.LightningModule, ABC):
@@ -715,6 +717,43 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         return logs
 
+    def _alignment_anchor_kwargs(self, method: str) -> dict[str, Any]:
+        """Anchor-extraction options for post-hoc alignment map fitting.
+
+        Read from hparams under the same names SheafFRL uses for its own
+        anchor machinery (``anchor_selection`` / ``num_anchors`` /
+        ``protos_per_class`` / ``anchor_parseval_normalize``) so sweeps can
+        apply one override set across orchestrators; orchestrators that do
+        not declare them fall back to the defaults here.  Applies to all
+        three ``alignment_method`` values — 'general' and 'procrustes' get
+        the same edge anchor budget/strategy SheafFRL uses at train time
+        instead of fitting on the full matched-pilot pool, and 'relative'
+        additionally needs the anchors' analysis/synthesis-pair property.
+
+        ``anchor_parseval_normalize`` left unset (``None``) auto-selects a
+        per-method default — True for 'relative', where the frame property
+        Parseval buys is exactly what the analysis/synthesis pair needs;
+        False for 'general'/'procrustes', where the anchors only ever feed
+        a least-squares/SVD fit — re-whitening an already-whitened, possibly
+        small (proto_*) anchor subset first is redundant at best and can
+        distort the class-prototype geometry the fit relies on (same
+        caveat as ``SheafFRL.anchor_parseval_normalize``). An explicit
+        True/False overrides this default for every method.
+        """
+        parseval = getattr(self.hparams, 'anchor_parseval_normalize', None)
+        if parseval is None:
+            parseval = method == 'relative'
+        return {
+            'selection': str(
+                getattr(self.hparams, 'anchor_selection', 'all')
+            ),
+            'num_anchors': int(getattr(self.hparams, 'num_anchors', 128)),
+            'protos_per_class': int(
+                getattr(self.hparams, 'protos_per_class', 1)
+            ),
+            'parseval': bool(parseval),
+        }
+
     @torch.no_grad()
     def evaluate_heterophil_communication_accuracy(
         self, dm, prefix: str = 'test'
@@ -740,8 +779,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
              sender's test latents (whiten → align → re-colour) and measure
              the receiver's decoder accuracy against the sender's labels.
              The pair's non-canonical direction reuses the single fitted map
-             inverted — transpose for 'procrustes', pseudo-inverse otherwise
-             — mirroring ``send_message``.
+             inverted — transpose for 'procrustes', pseudo-inverse for
+             'general' — mirroring ``send_message``; 'relative' instead
+             stores both directions outright (its reverse is the same
+             anchor construction with the analysis/synthesis roles swapped,
+             not an inversion).
 
         The map type follows ``hparams.alignment_method`` when set and
         defaults to 'procrustes' otherwise. All fitted state is local to this
@@ -811,8 +853,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if not whitening_ops:
             return {}
 
-        # Step 2 — whitened pilot latents.
+        # Step 2 — whitened pilot latents (+ labels, for the 'relative'
+        # method's proto_class anchor selection).
         pilot_Z: dict[int, torch.Tensor] = {}
+        pilot_y: dict[int, torch.Tensor] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -822,9 +866,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             pilot_ds = pilot_datasets.get(idx)
             if pilot_ds is None or len(pilot_ds) == 0:
                 continue
-            Z, _ = _encode(agent, pilot_ds)
+            Z, y = _encode(agent, pilot_ds)
             if Z is not None:
                 pilot_Z[idx] = whiten(Z, whitening_ops[idx])
+                pilot_y[idx] = y
 
         neighbors_map: dict[int, set[int]] = {
             int(k): {int(n) for n in v}
@@ -865,11 +910,31 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
                 X_i = pilot_Z[sender_idx][idx_i]
                 X_j = pilot_Z[receiver_idx][idx_j]
-                if method == 'procrustes':
-                    M = fit_procrustes(X_i, X_j)
+                A_s, A_r = select_paired_anchors(
+                    X_i,
+                    X_j,
+                    labels=pilot_y[sender_idx][idx_i],
+                    **self._alignment_anchor_kwargs(method),
+                )
+                if method == 'relative':
+                    # Zero-shot anchor frames (see fit_relative_alignment):
+                    # both directions exist by construction (roles swapped),
+                    # so store them directly and the inversion fallback in
+                    # step 5 never triggers for this method.
+                    hetero_maps[(sender_idx, receiver_idx)] = (
+                        fit_relative_alignment(A_s, A_r)
+                    )
+                    hetero_maps[(receiver_idx, sender_idx)] = (
+                        fit_relative_alignment(A_r, A_s)
+                    )
+                elif method == 'procrustes':
+                    hetero_maps[(sender_idx, receiver_idx)] = fit_procrustes(
+                        A_s, A_r
+                    )
                 else:
-                    M = fit_alignment(X_i, X_j).T
-                hetero_maps[(sender_idx, receiver_idx)] = M
+                    hetero_maps[(sender_idx, receiver_idx)] = fit_alignment(
+                        A_s, A_r
+                    ).T
 
         if not hetero_maps:
             return {}

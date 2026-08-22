@@ -88,7 +88,7 @@ orchestrator:
   parseval_normalization: false
   l2_normalization: false
   filter_unseen_classes: true
-  use_prototypes: true
+  anchor_selection: proto_class
   log_latent_diagnostics: True
   # sheaf_fmtl defaults (active when orchestrator=sheaf_fmtl)
   gamma: 0.001

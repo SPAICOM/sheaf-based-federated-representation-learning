@@ -330,6 +330,37 @@ def fit_procrustes(
     return (U @ W_T).cpu()
 
 
+def fit_relative_alignment(
+    A_i: torch.Tensor,
+    A_j: torch.Tensor,
+) -> torch.Tensor:
+    """Zero-shot map M (d_i, d_j) s.t. Z_i @ M ≈ Z_j via relative representations.
+
+    ``A_i``/``A_j`` are (K, d_i)/(K, d_j) whitened anchor matrices encoding
+    the *same* K pilot samples on the sender/receiver side. Unlike
+    :func:`fit_alignment`/:func:`fit_procrustes`, nothing is regressed — the
+    anchors themselves are the operators (Fiorellino et al. 2025,
+    arXiv:2507.17835): the sender *analyses* its latent against its own
+    anchors, ``r = z @ A_i.T`` (the relative representation, invariant across
+    the two whitened spaces up to the approximately orthogonal transform
+    relating them), and the receiver *synthesises* from those shared
+    coordinates with the canonical dual of its own anchor frame,
+    ``z_hat = r @ pinv(A_j).T``.  The composition is the single right-multiply
+    map
+
+        M = A_i.T @ pinv(A_j).T
+
+    which exists as soon as the anchors are exchanged.  With K < d_j the
+    synthesis reconstructs only within span(A_j) — the paper's compression
+    regime, not a failure mode.
+
+    Returns M on CPU.
+    """
+    A_i = A_i.float()
+    A_j = A_j.float()
+    return (A_i.T @ torch.linalg.pinv(A_j).T).cpu()
+
+
 # ── Latent extraction ─────────────────────────────────────────────────────────
 
 

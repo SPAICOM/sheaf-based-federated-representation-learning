@@ -36,7 +36,6 @@ orchestrator:
   local_steps: 5
   parseval_normalization: false
   l2_normalization: false
-  use_prototypes: false
 
 optimization:
   run_test: false

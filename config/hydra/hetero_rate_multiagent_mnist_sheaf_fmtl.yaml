@@ -217,7 +217,6 @@ model:
       use_batchnorm: true
 
 orchestrator:
-  use_prototypes: false
   log_latent_diagnostics: true
   # Sheaf FRL specific
   warmup_epochs: 0 # just for sheaf_frl

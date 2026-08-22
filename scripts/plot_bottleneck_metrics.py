@@ -283,6 +283,8 @@ def main() -> None:
         xlabel='Latent (bottleneck) dimension',
         xticklabel_fmt=lambda x: str(int(x)),
         xticklabel_rotation=45,
+        estimator='mean',
+        errorbar=('sd', 1),
     )
 
     summary = metric_summary_df(

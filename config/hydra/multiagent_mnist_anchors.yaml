@@ -9,23 +9,23 @@ seed: 42
 study_name: "HeteroRate MNIST 15 agents"
 
 lmb_study:
-  enabled: true         # set to true to run Optuna search before the full training run
-  efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
-  n_trials: 15          # number of Optuna trials
-  n_tune_epochs: 5     # epochs per trial
-  lmb_low: 1e-4         # lower bound of the log-uniform search interval
-  lmb_high: 1e-1
+  enabled: false
+  # efficient: true
+  # n_trials: 15
+  # n_tune_epochs: 5
+  # lmb_low: 1e-4
+  # lmb_high: 1e-1
 
 graph:
   neighbors_mode: "class_overlap"
-  max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
-  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
+  max_edge_frac: 0.4
+  similarity: intersection
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: shift_distr
+  project: anchor_selection_sfrl
   group: ${study_name}
-  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  name: anchor_${orchestrator.anchor_selection}_na${orchestrator.num_anchors}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -51,13 +51,18 @@ dataset:
   split_strategy: grouped_non_iid
   n_agents: 15
   classes_per_agent: 10
-  shift_strength: 0.7
+  shift_strength: 0.9
   monitor_test_during_fit: true
   batch_size: 64
   num_workers: 0
   mode: min_size
   pilot_split: 0.1
-  pilot_batch_size: 64
+  # Must stay above the top of the num_anchors sweep (64) below, otherwise
+  # random/proto_kmeans have nothing left to subsample from each step (every
+  # communication round only ever sees pilot_batch_size pilots, regardless of
+  # how large the underlying epoch pilot pool is) and silently collapse to
+  # the same behaviour as anchor_selection=all.
+  pilot_batch_size: 512
   comm_data: shared_global_pilots
   groups:
     0:
@@ -116,7 +121,7 @@ model:
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128, 224]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
+      encoder_hidden_dims: [32, 64, 128, 224]
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
@@ -128,7 +133,7 @@ model:
       use_batchnorm: true
     3:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128, 128]  # +3rd block: pools 7x7 -> 3x3
+      encoder_hidden_dims: [64, 128, 128]
       decoder_hidden_dims: [256, 128]
       dropout: 0.25
       use_batchnorm: true
@@ -208,12 +213,6 @@ orchestrator:
   soft_maps: false
   align_on_intersection: false
   learn_whitening: true
-  # # CE Sheaf FRL specific
-  # phase_a_epochs: 1
-  # phase_c_epochs: 2
-  # # Sheaf compressed FRL
-  # compression_factor: 0.5
-  # Sheaf FMTL specific
   gamma: 1e-3
   eta: 0.01
   # Post-training alignment
@@ -231,5 +230,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
-      orchestrator: comfed # non_cooperative, sheaf_frl
+      orchestrator: non_cooperative
+      orchestrator.alignment_method: procrustes
+      orchestrator.num_anchors: 512, 1024
+      orchestrator.anchor_selection: proto_kmeans, random

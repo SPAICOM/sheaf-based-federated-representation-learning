@@ -213,7 +213,6 @@ model:
 
 orchestrator:
   pid_logging: false
-  use_prototypes: false
   log_latent_diagnostics: true
   # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
   # max_lmb: 1e-02

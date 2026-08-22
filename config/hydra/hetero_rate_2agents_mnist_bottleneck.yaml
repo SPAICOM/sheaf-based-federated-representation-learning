@@ -81,7 +81,6 @@ model:
 orchestrator:
   parseval_normalization: false
   l2_normalization: false
-  use_prototypes: false
   log_latent_diagnostics: true
   # Used by Sheaf FRL, Sheaf FMTL, ComFed, FedProto and FedMuscle --> I need model-specific tuning for this
   max_lmb: 1e-2

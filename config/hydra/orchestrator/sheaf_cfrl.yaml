@@ -16,13 +16,22 @@ learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for close
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
-num_anchors: 32
+# ── Per-edge anchor selection: what gets aligned each communication step ──────
+#   all          — every matched, class-filtered pilot row (default)
+#   random       — a fresh random subset of size num_anchors, resampled every step
+#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype per
+#                  class present on the edge, à la FedProto
+#   proto_kmeans — unsupervised: k-means (K=num_anchors) fit once on the edge's
+#                  canonical higher-dim node, assignment reused for the rest of training
+anchor_selection: all
+num_anchors: 32          # edge anchor budget: subset size (random) / K (proto_kmeans)
+protos_per_class: 1      # only used by proto_class
+anchor_parseval_normalize: False  # Parseval-prewhiten the selected anchors per side
 local_steps: 1
 update_v_every_n_epochs: 1
 warmup_epochs: 0
 neighbors: {}
 filter_unseen_classes: False
-use_prototypes: False
 comm_task_coeff: 0.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
 

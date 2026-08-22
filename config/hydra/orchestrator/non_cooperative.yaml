@@ -1,5 +1,23 @@
 _target_: src.orchestrators.NonCooperativeLearning
 
+# Post-hoc alignment for the communication-accuracy evaluation.
+alignment_method: general  # 'general' | 'procrustes' | 'relative'
+# Edge anchor extraction, applied before fitting — same names/semantics as
+# SheafFRL's anchor_selection, so this baseline can be swept over the same
+# anchor budget/strategy as a SheafFRL run (one-shot here: post-hoc alignment
+# has no refresh cadence):
+#   all          — every matched pilot row (num_anchors ignored)
+#   random       — num_anchors rows, subsampled once
+#   proto_class  — protos_per_class prototypes per class (within-class k-means)
+#   proto_kmeans — unsupervised k-means (K=num_anchors) prototypes
+anchor_selection: all
+num_anchors: 128
+protos_per_class: 1
+anchor_parseval_normalize: null  # Parseval-prewhiten each side's anchor frame.
+                                 # null = auto (True for 'relative', False for
+                                 # 'general'/'procrustes'); set true/false to
+                                 # override for every method.
+
 # Information-theoretic PID logging (Liang et al. 2023).
 # Implemented in BaseOrchestrator → applies to *every* orchestrator that
 # forwards **kwargs to super().__init__.  Toggle pid_logging to enable.

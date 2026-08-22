@@ -83,7 +83,6 @@ orchestrator:
   l2_normalization: false
   #filter_unseen_classes: false   
   local_steps: 5
-  use_prototypes: false
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch

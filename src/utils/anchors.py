@@ -84,53 +84,160 @@ def parseval_normalize(
     *,
     eps: float = 1e-4,
 ) -> torch.Tensor:
-    """Apply Parseval prewhitening to pilot anchor rows.
+    """Whiten anchor rows into a Parseval frame.
 
-    `anchor_matrix` is `[num_pilots, latent_dim]`
-    The prewhitening formulation treats latent dimensions as variables and
-    pilots as observations, so it operates on `anchor_matrix.T`. The final
-    `sqrt(num_pilots - 1)` scaling converts unit covariance into the
-    Parseval frame convention ``A.T @ A ~= I`` for the returned row-major
-    anchor matrix.
+    Follows Fiorellino et al. 2025, "Frame-Based Zero-Shot Semantic Channel
+    Equalization for AI-Native Communications" (arXiv:2507.17835), Prop. 3
+    plus its compression treatment: ``F̃ = F @ S^{†1/2}`` with ``S = F.T @ F``
+    the *uncentered* frame/Gram operator (``F`` = ``anchor_matrix``, rows are
+    anchor vectors) and ``S^{†1/2}`` its Moore-Penrose pseudo-inverse square
+    root. No mean-centering: the frame's exact reconstruction property
+    ``x = sum_n <x, f_n> f_n`` (Prop. 2) requires the raw anchor vectors, not
+    a mean-removed version.
+
+    One unified formula covers both regimes the paper describes:
+
+    - ``num_anchors`` (rows) >= ``latent_dim`` (columns): ``S`` is full rank,
+      this reduces to the ordinary inverse square root and
+      ``F̃.T @ F̃ ~= I`` (a full Parseval frame spanning the latent space).
+    - ``num_anchors`` < ``latent_dim`` ("compression", explicitly supported
+      by the paper): ``S`` is rank-deficient; eigenvalues at or below
+      ``eps * largest eigenvalue`` are treated as null and zeroed rather than
+      inverted, so ``F̃`` becomes the orthogonal projection onto
+      ``span(F)`` — ``F̃.T @ F̃`` is then a rank-``N`` projection (not a full
+      identity) and ``F̃ @ F̃.T ~= I``. This is an intentional lossy-
+      compression mode, not a numerical failure, and — since near-null
+      directions are dropped rather than amplified — the result is always
+      finite.
     """
     if anchor_matrix.ndim != 2:
         raise ValueError('anchor_matrix must be a 2D tensor')
 
-    num_pilots = anchor_matrix.size(0)
-    if num_pilots <= 1 or anchor_matrix.numel() == 0:
+    if anchor_matrix.size(0) == 0 or anchor_matrix.numel() == 0:
         return anchor_matrix
     if eps < 0:
         raise ValueError('eps must be non-negative')
 
     original_dtype = anchor_matrix.dtype
-    feature_by_pilot = anchor_matrix.T.to(torch.float64)
-    mean = feature_by_pilot.mean(dim=1, keepdim=True)
-    centered = feature_by_pilot - mean
+    F = anchor_matrix.to(torch.float64)
+    S = F.T @ F  # (D, D) uncentered frame/Gram operator
 
-    covariance_denominator = num_pilots - 1
-    covariance = torch.matmul(centered, centered.T) / covariance_denominator
-    jitter = float(eps)
-    eye = torch.eye(
-        covariance.size(0),
-        device=covariance.device,
-        dtype=covariance.dtype,
+    eigvals, eigvecs = torch.linalg.eigh(S)  # ascending order; S is PSD
+    threshold = float(eps) * eigvals.clamp(min=0).max()
+    tiny = torch.finfo(eigvals.dtype).tiny
+    inv_sqrt_eigvals = torch.where(
+        eigvals > threshold,
+        eigvals.clamp(min=tiny).rsqrt(),
+        torch.zeros_like(eigvals),
     )
-    covariance = covariance + jitter * eye
+    S_pinv_sqrt = (eigvecs * inv_sqrt_eigvals.unsqueeze(0)) @ eigvecs.T
 
-    cholesky, info = torch.linalg.cholesky_ex(covariance)
-    if bool(torch.any(info != 0)):
-        fallback_jitter = max(jitter * 10, 1e-12)
-        cholesky = torch.linalg.cholesky(covariance + fallback_jitter * eye)
+    return (F @ S_pinv_sqrt).to(dtype=original_dtype)
 
-    whitened = torch.linalg.solve(cholesky, centered)
-    parseval_rows = whitened.T / torch.sqrt(
-        torch.tensor(
-            covariance_denominator,
-            device=anchor_matrix.device,
-            dtype=torch.float64,
+
+VALID_PAIRED_ANCHOR_SELECTIONS = ('all', 'random', 'proto_class', 'proto_kmeans')
+
+
+def select_paired_anchors(
+    X_i: torch.Tensor,
+    X_j: torch.Tensor,
+    *,
+    labels: torch.Tensor | None = None,
+    selection: str = 'all',
+    num_anchors: int = 128,
+    protos_per_class: int = 1,
+    parseval: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce matched pilot rows to a paired anchor set for relative alignment.
+
+    ``X_i``/``X_j`` are row-aligned encodings of the *same* pilot samples on
+    two agents; every reduction below picks/averages the same row groups on
+    both sides so the anchors stay paired.  ``selection`` mirrors SheafFRL's
+    ``anchor_selection`` strategies (one-shot here — post-hoc alignment has
+    no refresh cadence to cache across):
+
+    * ``'all'`` — the full matched pool (``num_anchors`` ignored);
+    * ``'random'`` — ``num_anchors`` rows subsampled once;
+    * ``'proto_class'`` — one (or ``protos_per_class``, via within-class
+      k-means on the ``X_i`` rows) prototype pair per class in ``labels``;
+    * ``'proto_kmeans'`` — unsupervised: k-means (``K=num_anchors``) fit on
+      ``X_i``, both sides averaged per cluster.
+
+    With ``parseval=True`` each side is then independently prewhitened into a
+    Parseval frame (:func:`parseval_normalize`), the construction the frame
+    equalizer of Fiorellino et al. 2025 (arXiv:2507.17835) is built on: each
+    frame's canonical dual becomes (numerically) its transpose, keeping the
+    analysis/synthesis pair well conditioned even for the small anchor counts
+    the ``random``/``proto_*`` strategies produce.
+    """
+    if X_i.shape[0] != X_j.shape[0]:
+        raise ValueError('X_i and X_j must have the same number of rows')
+    selection = str(selection)
+    if selection not in VALID_PAIRED_ANCHOR_SELECTIONS:
+        raise ValueError(
+            f'Unknown selection: {selection}. '
+            f'Valid options: {list(VALID_PAIRED_ANCHOR_SELECTIONS)}'
         )
-    )
-    return parseval_rows.to(dtype=original_dtype)
+    num_anchors = int(num_anchors)
+    if num_anchors < 1:
+        raise ValueError('num_anchors must be at least 1')
+    protos_per_class = int(protos_per_class)
+    if protos_per_class < 1:
+        raise ValueError('protos_per_class must be at least 1')
+
+    n = X_i.shape[0]
+    if selection == 'random' and n > num_anchors:
+        sel = torch.randperm(n, device=X_i.device)[:num_anchors]
+        X_i, X_j = X_i[sel], X_j[sel]
+    elif selection == 'proto_class' and n > 0:
+        if labels is None:
+            raise ValueError("selection='proto_class' requires labels")
+        from src.mutualinfo._common import kmeans_cluster
+
+        rows_i, rows_j = [], []
+        for c in torch.unique(labels, sorted=True).tolist():
+            mask = labels == c
+            Xi_c, Xj_c = X_i[mask], X_j[mask]
+            if protos_per_class <= 1 or Xi_c.shape[0] <= protos_per_class:
+                rows_i.append(Xi_c.mean(dim=0, keepdim=True))
+                rows_j.append(Xj_c.mean(dim=0, keepdim=True))
+                continue
+            cluster_ids = torch.as_tensor(
+                kmeans_cluster(
+                    Xi_c.detach().float().cpu().numpy(),
+                    n_clusters=protos_per_class,
+                ),
+                device=X_i.device,
+                dtype=torch.long,
+            )
+            for cl in torch.unique(cluster_ids).tolist():
+                cmask = cluster_ids == cl
+                rows_i.append(Xi_c[cmask].mean(dim=0, keepdim=True))
+                rows_j.append(Xj_c[cmask].mean(dim=0, keepdim=True))
+        X_i = torch.cat(rows_i, dim=0)
+        X_j = torch.cat(rows_j, dim=0)
+    elif selection == 'proto_kmeans' and n > 0:
+        from src.mutualinfo._common import kmeans_cluster
+
+        cluster_ids = torch.as_tensor(
+            kmeans_cluster(
+                X_i.detach().float().cpu().numpy(), n_clusters=num_anchors
+            ),
+            device=X_i.device,
+            dtype=torch.long,
+        )
+        rows_i, rows_j = [], []
+        for cl in torch.unique(cluster_ids).tolist():
+            mask = cluster_ids == cl
+            rows_i.append(X_i[mask].mean(dim=0, keepdim=True))
+            rows_j.append(X_j[mask].mean(dim=0, keepdim=True))
+        X_i = torch.cat(rows_i, dim=0)
+        X_j = torch.cat(rows_j, dim=0)
+
+    if parseval:
+        X_i = parseval_normalize(X_i)
+        X_j = parseval_normalize(X_j)
+    return X_i, X_j
 
 
 def l2_normalize(anchor_matrix: torch.Tensor) -> torch.Tensor:
@@ -681,8 +788,10 @@ __all__ = [
 
 __all__ = [
     'AnchorConfig',
+    'VALID_PAIRED_ANCHOR_SELECTIONS',
     'l2_normalize',
     'normalize_anchor_matrix',
     'parseval_normalize',
+    'select_paired_anchors',
     'shared_anchor_rows',
 ]

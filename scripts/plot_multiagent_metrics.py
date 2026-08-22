@@ -12,18 +12,30 @@ built — edit that set directly to bring one back. Either way it produces:
 
   1. ``test/avg_comm_task_perf`` vs ``shift_strength``, one curve per
      orchestrator, and a companion figure of ``test/avg_private_task_perf``
-     vs ``shift_strength`` the same way. ComFed is never plotted here — it
-     sits far below the others and squashes the y-axis; its numbers instead
-     go in the dedicated ComFed table (part 4 below). Pass ``--together`` to
+     vs ``shift_strength`` the same way. ComFed is left out of this plot by
+     default — it sits far below the others and squashes the y-axis; its
+     numbers instead go in the dedicated ComFed table (part 4 below). Pass
+     ``--include-comfed`` to draw it here anyway. Pass ``--together`` to
      draw the two metrics side by side in one figure (same per-panel
-     proportions as the standalone plots) with a single shared legend sitting
-     just above both panels, in three columns, instead of two separate
-     figures.
-     By default (``adjusted=True``) each orchestrator's points are dodged
-     slightly off the shared shift value and the spread across agents is
-     drawn as small std error-bar caps (bar-plot style) rather than
-     seaborn's translucent band, so overlapping curves stay legible; pass
-     ``adjusted=False`` for the original undodged line + std-band rendering.
+     proportions as the standalone plots) with a single shared legend drawn
+     inside the left panel, instead of two separate figures.
+     By default the comm-task-perf line is each orchestrator's per-agent
+     **degree-weighted mean** (``--comm-estimator weighted_mean``, the
+     default — each agent weighted by its share of total communication-graph
+     degree, ``degree_i / sum(degrees)``, reconstructed from the run's
+     stored graph config) and the private-task-perf line is the plain
+     **mean** (``--priv-estimator mean``, the default, unweighted); pass
+     ``mean``/``median``/``weighted_mean`` to either flag to change it. The
+     spread across agents is a **percentile interval spanning the full
+     min-max range** (``--errorbar-pi 100``, the default; pass e.g.
+     ``--errorbar-pi 50`` for the interquartile range, or ``--errorbar-pi 0``
+     to hide the interval), drawn as a light translucent ``fill_between``
+     band around the line so overlapping bands stay legible. Points sit
+     exactly on the shared shift value (no dodge) by default; pass
+     ``adjusted=True`` to instead dodge each orchestrator's points slightly
+     off the shared shift value and draw the interval as bold error-bar caps
+     (bar-plot style), which is more legible when many overlapping curves
+     share the same x value.
      All shift-strength plots use xticks restricted to the shifts actually
      run.
 
@@ -341,6 +353,18 @@ def _per_agent_values(
     ]
 
 
+def _per_agent_indexed_values(
+    summary: dict[str, Any], pattern: re.Pattern
+) -> list[tuple[int, float]]:
+    """Like :func:`_per_agent_values` but keeping each value's agent index."""
+    out = []
+    for k, v in summary.items():
+        m = pattern.match(k)
+        if m and isinstance(v, (int, float)):
+            out.append((int(m.group(1)), float(v)))
+    return out
+
+
 # ── Discovery / dedup ─────────────────────────────────────────────────────────
 
 
@@ -365,12 +389,15 @@ def _dedup_runs(
     select: str,
     select_metric: str,
     label: Callable[[dict[str, Any]], str],
+    x_label: str = 'shift',
 ) -> dict[tuple[str, float], dict[str, Any]]:
-    """Pick one run per ``(orch, shift)`` cell and report discarded duplicates.
+    """Pick one run per ``(orch, x)`` cell and report discarded duplicates.
 
     Shared by the local and remote discovery paths — both produce the same
     ``candidates`` shape (meta dicts with ``summary``/``mtime``), so the
-    selection logic (and its printout) only needs to live once.
+    selection logic (and its printout) only needs to live once. ``x_label``
+    only names the second key component in that printout, for scripts keyed on
+    something other than shift strength (e.g. graph density).
     """
     best: dict[tuple[str, float], dict[str, Any]] = {}
     for key, metas in candidates.items():
@@ -380,10 +407,10 @@ def _dedup_runs(
         )
         best[key] = chosen
         if len(metas) > 1:
-            orch, shift = key
+            orch, xval = key
             score = chosen['summary'].get(select_metric)
             print(
-                f'  {orch} @ shift {shift:g}: {len(metas)} runs → kept '
+                f'  {orch} @ {x_label} {xval:g}: {len(metas)} runs → kept '
                 f'{label(chosen)} ({select}'
                 + (
                     f', {select_metric}={score:.3f}'
@@ -580,6 +607,106 @@ def _load_mae():
     return _MAE
 
 
+_NEIGHBORS_CACHE: dict[str, dict[int, set[int]] | None] = {}
+
+
+def _graph_signature(raw_config: dict[str, Any]) -> str:
+    """Config subset that determines the communication graph (and thus degrees)."""
+    ds = _unwrap(raw_config, 'dataset') or {}
+    sig = {
+        'graph': _unwrap(raw_config, 'graph'),
+        'seed': _unwrap(raw_config, 'seed'),
+        'dataset': (
+            {k: ds.get(k) for k in ('name', 'n_agents', 'groups')}
+            if isinstance(ds, dict)
+            else ds
+        ),
+    }
+    return json.dumps(sig, sort_keys=True, default=str)
+
+
+def reconstruct_neighbors(
+    raw_config: dict[str, Any],
+) -> dict[int, set[int]] | None:
+    """Rebuild a run's communication graph from its stored wandb config.
+
+    Mirrors what ``multi_agent_experiment.py`` does at run time
+    (``generate_neighbors`` over the stored ``graph``/``dataset`` config), so
+    any graph-derived quantity can be recovered from a finished run — per-agent
+    degrees for the ``'weighted_mean'`` estimator (:func:`agent_degree_weights`)
+    and edge density for ``plot_network_density_metrics.py``. Returns ``None``
+    if the graph can't be rebuilt, e.g. an older run missing graph config
+    fields; callers are expected to degrade gracefully.
+    """
+    sig = _graph_signature(raw_config)
+    if sig in _NEIGHBORS_CACHE:
+        return _NEIGHBORS_CACHE[sig]
+
+    neighbors: dict[int, set[int]] | None = None
+    try:
+        import sys
+
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+
+        from omegaconf import OmegaConf
+
+        from src.utils.graph_generator import generate_neighbors
+
+        mae = _load_mae()
+        cfg = OmegaConf.create(
+            {
+                k: _unwrap(raw_config, k)
+                for k in raw_config
+                if k not in ('_wandb', 'wandb_version')
+            }
+        )
+        n = int(cfg.dataset.n_agents)
+        atc = mae._parse_agent_target_classes(cfg)
+        if atc is not None:
+            for i in range(n):
+                atc.setdefault(i, set())
+        neighbors = generate_neighbors(
+            mode=cfg.graph.neighbors_mode,
+            n_agents=n,
+            seed=cfg.graph.get('seed', 42),
+            p=cfg.graph.get('p', 0.3),
+            m=cfg.graph.get('m', 3),
+            manual=cfg.graph.get('neighbors', {}),
+            target_classes=atc,
+            max_edge_frac=cfg.graph.get('max_edge_frac', 0.4),
+            similarity=cfg.graph.get('similarity', 'intersection'),
+        )
+        neighbors = {i: set(neighbors.get(i, ())) for i in range(n)}
+    except Exception as exc:  # noqa: BLE001 — callers degrade gracefully
+        print(f'  [warn] communication-graph reconstruction failed: {exc}')
+        neighbors = None
+
+    _NEIGHBORS_CACHE[sig] = neighbors
+    return neighbors
+
+
+def agent_degree_weights(raw_config: dict[str, Any]) -> dict[int, float] | None:
+    """Return ``{agent_idx: degree_i / sum(degrees)}`` from a run's stored config.
+
+    Built on the communication graph rebuilt by
+    :func:`reconstruct_neighbors`, so the ``'weighted_mean'`` estimator (see
+    :func:`_center_and_bounds`) can weight each agent's metric value by its
+    share of total graph degree — agents with more neighbors count for more.
+    Returns ``None`` (callers fall back to a uniform weight) when the graph
+    can't be reconstructed, e.g. an older run missing graph config fields.
+    """
+    neighbors = reconstruct_neighbors(raw_config)
+    if neighbors is None:
+        return None
+    degrees = {i: len(nb) for i, nb in neighbors.items()}
+    total = sum(degrees.values())
+    if total <= 0:
+        return None
+    return {i: d / total for i, d in degrees.items()}
+
+
 class _StubDatamodule:
     """Minimal datamodule stand-in so _build_agents can size the encoders."""
 
@@ -742,16 +869,35 @@ def _agent_metric_long_df(
     value_col: str,
     x_col: str = 'shift',
 ) -> pd.DataFrame:
-    """One row per (orchestrator, x, agent) with a per-agent metric value."""
+    """One row per (orchestrator, x, agent) with a per-agent metric value.
+
+    Also carries a ``weight`` column — that agent's share of total
+    communication-graph degree in that run (``degree_i / sum(degrees)``,
+    via :func:`agent_degree_weights`), used by the ``'weighted_mean'``
+    estimator (see :func:`_center_and_bounds`). Falls back to a uniform
+    weight (``1 / n_agents`` for that run) wherever the graph can't be
+    reconstructed, or ``meta`` has no ``raw_config`` at all (some callers'
+    ``discover_runs``/``discover_runs_remote`` don't stash one, since they
+    never select the ``'weighted_mean'`` estimator).
+    """
     rows = []
     for (orch, x), meta in runs.items():
-        for val in _per_agent_values(meta['summary'], pattern):
+        indexed = _per_agent_indexed_values(meta['summary'], pattern)
+        raw_config = meta.get('raw_config')
+        weights = agent_degree_weights(raw_config) if raw_config is not None else None
+        n = len(indexed)
+        for agent_idx, val in indexed:
+            if weights is not None and agent_idx in weights:
+                w = weights[agent_idx]
+            else:
+                w = 1.0 / n if n else 0.0
             rows.append(
                 {
                     'orchestrator': ORCH_LABELS.get(orch, orch),
                     '_orch': orch,
                     x_col: x,
                     value_col: val,
+                    'weight': w,
                 }
             )
     return pd.DataFrame(rows)
@@ -801,6 +947,79 @@ def _dodge_offsets(n: int, xvals: list[float]) -> np.ndarray:
     return np.linspace(-width / 2, width / 2, n)
 
 
+def _center_and_bounds(
+    values: np.ndarray,
+    estimator: str,
+    errorbar: tuple[str, float] | None,
+    weights: np.ndarray | None = None,
+) -> tuple[float, float, float]:
+    """Return ``(center, lower, upper)`` for one (orch, x) cell's values.
+
+    ``estimator`` picks the point/line statistic: ``'mean'``, ``'median'``,
+    or ``'weighted_mean'`` — a per-agent weighted average using ``weights``
+    (each agent's share of total communication-graph degree,
+    ``degree_i / sum(degrees)``, see :func:`agent_degree_weights`); falls
+    back to a plain mean if ``weights`` is ``None`` or sums to zero.
+    ``errorbar`` picks the interval around it (always computed unweighted):
+    ``('pi', p)`` is a percentile interval covering the middle ``p`` % of
+    values (``('pi', 100)`` spans the full min-max range; this is the
+    default), ``('sd', k)`` is ``center ± k`` standard deviations
+    (``ddof=0``), and ``None`` collapses the interval onto ``center`` (i.e.
+    no spread).
+    """
+    if estimator == 'weighted_mean' and weights is not None and weights.sum() > 0:
+        center = float(np.average(values, weights=weights))
+    elif estimator == 'median':
+        center = float(np.median(values))
+    else:
+        center = float(np.mean(values))
+    if errorbar is None:
+        return center, center, center
+    kind, width = errorbar
+    if kind == 'pi':
+        lower = float(np.percentile(values, (100 - width) / 2))
+        upper = float(np.percentile(values, 100 - (100 - width) / 2))
+    elif kind == 'sd':
+        std = float(np.std(values, ddof=0))
+        lower = center - width * std
+        upper = center + width * std
+    else:
+        raise ValueError(f'Unknown errorbar kind: {kind!r}')
+    return center, lower, upper
+
+
+def _grouped_center_bounds(
+    sub: pd.DataFrame,
+    value_col: str,
+    x_col: str,
+    xvals: list[float],
+    estimator: str,
+    errorbar: tuple[str, float] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-``x`` ``(center, lower, upper)`` arrays for one orchestrator's rows.
+
+    All three are NaN at any ``x`` with no data for this orchestrator, so
+    callers mask on ``~np.isnan(center)``. When ``sub`` has a ``weight``
+    column (see :func:`_agent_metric_long_df`), it's forwarded to
+    :func:`_center_and_bounds` for the ``'weighted_mean'`` estimator.
+    """
+    has_weight = 'weight' in sub.columns
+    groups = dict(tuple(sub.groupby(x_col)))
+    centers = np.full(len(xvals), np.nan)
+    lowers = np.full(len(xvals), np.nan)
+    uppers = np.full(len(xvals), np.nan)
+    for i, x in enumerate(xvals):
+        g = groups.get(x)
+        if g is None or g.empty:
+            continue
+        vals = g[value_col].to_numpy()
+        weights = g['weight'].to_numpy() if has_weight else None
+        centers[i], lowers[i], uppers[i] = _center_and_bounds(
+            vals, estimator, errorbar, weights=weights
+        )
+    return centers, lowers, uppers
+
+
 def _plot_metric_on_ax(
     ax: plt.Axes,
     df: pd.DataFrame,
@@ -815,17 +1034,29 @@ def _plot_metric_on_ax(
     xscale: str = 'linear',
     xticklabel_fmt: Callable[[float], str] | None = None,
     xticklabel_rotation: float = 0,
+    show_error: bool = True,
+    estimator: str = 'mean',
+    errorbar: tuple[str, float] | None = ('pi', 100),
 ) -> None:
     """Draw one metric-vs-x panel on ``ax``.
 
     Shared by the standalone (:func:`plot_metric_vs_x`) and combined
-    (:func:`plot_two_metrics_vs_x`) figures. ``adjusted=True`` dodges each
-    orchestrator's points a little off the shared x value — so markers
-    landing on the same x tick don't stack on top of each other — and draws
-    the per-x agent std as small error-bar caps (as in a bar plot) instead of
-    seaborn's translucent band, which is hard to read once curves are
-    dodged. ``adjusted=False`` keeps the original undodged line + std-band
-    rendering.
+    (:func:`plot_two_metrics_vs_x`) figures. ``estimator`` ('mean', 'median',
+    or 'weighted_mean') picks the per-x point/line statistic drawn across
+    agents — see :func:`_center_and_bounds`; ``errorbar`` picks the interval
+    drawn around it — the default ``('pi', 100)`` is a percentile interval
+    spanning the full min-max range, ``('sd', k)`` is ``estimator ± k``
+    standard deviations, and ``None`` disables the interval outright (see
+    :func:`_center_and_bounds`). ``adjusted=True`` dodges each orchestrator's
+    points a little off the shared x value — so markers landing on the same
+    x tick don't stack on top of each other — and draws the interval as bold
+    error-bar caps (as in a bar plot), which stays legible once curves are
+    dodged. ``adjusted=False`` (default) keeps every orchestrator's points on
+    the true x value and draws the interval as a light translucent
+    ``fill_between`` band (same idea as :func:`plot_train_curves_per_shift`'s
+    training curves), kept faint so overlapping bands stay legible.
+    ``show_error=False`` drops the interval entirely and just plots the
+    point estimate.
     """
     order = [o for o in orchs if o in set(df['_orch'])]
     df = df[df['_orch'].isin(order)]
@@ -835,15 +1066,23 @@ def _plot_metric_on_ax(
         offsets = _dodge_offsets(len(order), xvals)
         for off, orch in zip(offsets, order):
             sub = df[df['_orch'] == orch]
-            grouped = sub.groupby(x_col)[value_col]
-            means = grouped.mean().reindex(xvals)
-            stds = grouped.std(ddof=0).reindex(xvals).fillna(0.0)
-            mask = means.notna().to_numpy()
+            centers, lowers, uppers = _grouped_center_bounds(
+                sub, value_col, x_col, xvals, estimator, errorbar
+            )
+            mask = ~np.isnan(centers)
             xs = np.asarray(xvals, dtype=float) + off
+            yerr = None
+            if show_error:
+                yerr = np.vstack(
+                    [
+                        np.clip(centers[mask] - lowers[mask], 0, None),
+                        np.clip(uppers[mask] - centers[mask], 0, None),
+                    ]
+                )
             ax.errorbar(
                 xs[mask],
-                means.to_numpy()[mask],
-                yerr=stds.to_numpy()[mask],
+                centers[mask],
+                yerr=yerr,
                 color=colors[orch],
                 marker=markers[orch],
                 linestyle='-',
@@ -852,24 +1091,31 @@ def _plot_metric_on_ax(
                 label=ORCH_LABELS.get(orch, orch),
             )
     else:
-        palette = {ORCH_LABELS.get(o, o): colors[o] for o in order}
-        marker_map = {ORCH_LABELS.get(o, o): markers[o] for o in order}
-        hue_order = [ORCH_LABELS.get(o, o) for o in order]
-        sns.lineplot(
-            data=df,
-            x=x_col,
-            y=value_col,
-            hue='orchestrator',
-            style='orchestrator',
-            hue_order=hue_order,
-            style_order=hue_order,
-            palette=palette,
-            markers=marker_map,
-            dashes=False,
-            errorbar='sd',
-            estimator='mean',
-            ax=ax,
-        )
+        for orch in order:
+            sub = df[df['_orch'] == orch]
+            centers, lowers, uppers = _grouped_center_bounds(
+                sub, value_col, x_col, xvals, estimator, errorbar
+            )
+            mask = ~np.isnan(centers)
+            xs = np.asarray(xvals, dtype=float)[mask]
+            m = centers[mask]
+            ax.plot(
+                xs,
+                m,
+                color=colors[orch],
+                marker=markers[orch],
+                linestyle='-',
+                label=ORCH_LABELS.get(orch, orch),
+            )
+            if show_error:
+                ax.fill_between(
+                    xs,
+                    lowers[mask],
+                    uppers[mask],
+                    color=colors[orch],
+                    alpha=0.12,
+                    linewidth=0,
+                )
     if xscale == 'log':
         ax.set_xscale('log')
     ax.set_xticks(xvals)
@@ -909,8 +1155,15 @@ def plot_metric_vs_x(
     xscale: str = 'linear',
     xticklabel_fmt: Callable[[float], str] | None = None,
     xticklabel_rotation: float = 0,
+    show_error: bool = True,
+    estimator: str = 'mean',
+    errorbar: tuple[str, float] | None = ('pi', 100),
 ) -> None:
-    """Plot ``value_col`` (mean across agents) vs ``x_col``, one curve per orch."""
+    """Plot ``value_col`` (``estimator`` across agents) vs ``x_col``, one curve per orch.
+
+    See :func:`_plot_metric_on_ax` for what ``estimator``/``errorbar``/
+    ``show_error`` control.
+    """
     with plt.style.context(str(_MPLSTYLE)):
         fig, ax = plt.subplots()
         _plot_metric_on_ax(
@@ -927,6 +1180,9 @@ def plot_metric_vs_x(
             xscale=xscale,
             xticklabel_fmt=xticklabel_fmt,
             xticklabel_rotation=xticklabel_rotation,
+            show_error=show_error,
+            estimator=estimator,
+            errorbar=errorbar,
         )
         handles, labels = ax.get_legend_handles_labels()
         ax.legend(
@@ -958,22 +1214,41 @@ def plot_two_metrics_vs_x(
     xticklabel_rotation: float = 0,
     comm_ylabel: str = 'Avg. communication accuracy',
     priv_ylabel: str = 'Avg. private accuracy',
+    show_error: bool = True,
+    comm_estimator: str = 'weighted_mean',
+    priv_estimator: str = 'mean',
+    errorbar: tuple[str, float] | None = ('pi', 100),
+    legend_loc: str = 'inside',
+    legend_anchor: str | None = None,
 ) -> None:
-    """Comm + private accuracy vs x, side by side in one figure.
+    """Private + comm accuracy vs x, side by side in one figure.
 
-    Each panel keeps the same size/proportions as the corresponding
-    standalone plot (the figure is just twice as wide, one row of two axes),
-    and the two per-panel legends are merged into a single legend, in three
-    columns, sitting just above both axes.
+    The private-accuracy panel is drawn first (left axis), the communication
+    panel second (right axis). Each panel keeps the same size/proportions as
+    the corresponding standalone plot (the figure is just twice as wide, one
+    row of two axes), and the two per-panel legends are merged into a single
+    legend. ``legend_loc`` selects which axis it's drawn in: ``'inside'``
+    (default) draws it inside the left axis, ``'right'`` draws it inside the
+    right axis instead — both single-column; ``'outside'`` draws it above
+    both axes, spanning their combined width, in one row with one column per
+    orchestrator actually present. ``legend_anchor`` optionally pins the
+    in-axis legend to a specific matplotlib ``loc`` (e.g. ``'center left'``)
+    instead of letting it auto-place with ``'best'``, which is useful when
+    the auto-placed box ends up overlapping a curve. ``comm_estimator``
+    (default ``'weighted_mean'``, each agent weighted by its share of total
+    communication-graph degree) and ``priv_estimator`` (default ``'mean'``,
+    unweighted) independently pick each panel's point/line statistic — see
+    :func:`_plot_metric_on_ax` for what ``estimator``/``errorbar``/
+    ``show_error`` control.
     """
     specs = [
-        (comm_df, 'comm_task_perf', comm_ylabel),
-        (priv_df, 'private_task_perf', priv_ylabel),
+        (priv_df, 'private_task_perf', priv_ylabel, priv_estimator),
+        (comm_df, 'comm_task_perf', comm_ylabel, comm_estimator),
     ]
     with plt.style.context(str(_MPLSTYLE)):
         base_w, base_h = plt.rcParams['figure.figsize']
         fig, axes = plt.subplots(1, 2, figsize=(2 * base_w, base_h))
-        for ax, (df, value_col, ylabel) in zip(axes, specs):
+        for ax, (df, value_col, ylabel, metric_estimator) in zip(axes, specs):
             _plot_metric_on_ax(
                 ax,
                 df,
@@ -988,19 +1263,30 @@ def plot_two_metrics_vs_x(
                 xscale=xscale,
                 xticklabel_fmt=xticklabel_fmt,
                 xticklabel_rotation=xticklabel_rotation,
+                show_error=show_error,
+                estimator=metric_estimator,
+                errorbar=errorbar,
             )
         handles, labels = axes[0].get_legend_handles_labels()
-        top = max(ax.get_position().y1 for ax in axes)
-        fig.legend(
-            _strip_errorbar_caps(handles),
-            labels,
-            title='Method',
-            loc='lower center',
-            bbox_to_anchor=(0.5, top + 0.03),
-            ncol=3,
-            frameon=True,
-            borderaxespad=0.0,
-        )
+        handles = _strip_errorbar_caps(handles)
+        if legend_loc == 'outside':
+            top = max(ax.get_position().y1 for ax in axes)
+            fig.legend(
+                handles,
+                labels,
+                title='Method',
+                loc='lower center',
+                bbox_to_anchor=(0.5, top + 0.03),
+                ncol=len(labels),
+                frameon=True,
+                borderaxespad=0.0,
+            )
+        else:
+            target = axes[1] if legend_loc == 'right' else axes[0]
+            legend_kwargs = {'title': 'Method', 'frameon': True}
+            if legend_anchor is not None:
+                legend_kwargs['loc'] = legend_anchor
+            target.legend(handles, labels, **legend_kwargs)
         out = out_dir / fname
         _savefig(fig, out)
         plt.close(fig)
@@ -1326,10 +1612,45 @@ def main() -> None:
         '--together',
         action='store_true',
         help='Draw comm + private accuracy vs shift side by side in one '
-        'figure (shared legend on top, 2 columns) instead of two separate '
-        'figures.',
+        'figure (shared legend inside the left panel) instead of two '
+        'separate figures.',
+    )
+    parser.add_argument(
+        '--include-comfed',
+        action='store_true',
+        help='Also draw ComFed in Plot 1 (comm/private task perf vs shift) '
+        'alongside the other orchestrators. By default it is left out of '
+        'that plot because its accuracy sits far below the rest and '
+        'squashes the y-axis — it still appears in Plot 2 and the Part 3/4 '
+        'tables either way.',
+    )
+    parser.add_argument(
+        '--comm-estimator',
+        choices=['mean', 'median', 'weighted_mean'],
+        default='weighted_mean',
+        help='Point/line statistic drawn across agents for the Plot 1 comm '
+        "task perf curve (default: weighted_mean — weights each agent by "
+        'its share of total communication-graph degree, '
+        'degree_i / sum(degrees)).',
+    )
+    parser.add_argument(
+        '--priv-estimator',
+        choices=['mean', 'median', 'weighted_mean'],
+        default='mean',
+        help='Point/line statistic drawn across agents for the Plot 1 '
+        'private task perf curve (default: mean, unweighted).',
+    )
+    parser.add_argument(
+        '--errorbar-pi',
+        type=float,
+        default=100.0,
+        help='Percentile-interval width (0-100) drawn around the Plot 1 '
+        'line, e.g. 100 (default) spans the full min-max range across '
+        'agents, 50 spans the interquartile range. Pass 0 to hide the '
+        'interval entirely.',
     )
     args = parser.parse_args()
+    errorbar = ('pi', args.errorbar_pi) if args.errorbar_pi > 0 else None
 
     project = None if args.project.lower() == 'none' else args.project
     study = None if args.study_name.lower() == 'none' else args.study_name
@@ -1405,10 +1726,11 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style='whitegrid', context='paper', font_scale=1.4)
 
-    # ComFed is never drawn in the shift plots (it sits far below the other
-    # methods and squashes the y-axis) — its own accuracy across shifts goes
-    # in the dedicated table (part 4) instead.
-    plot_orchs = [o for o in orchs if o != 'ComFed']
+    # ComFed is dropped from the shift plots by default (it sits far below
+    # the other methods and squashes the y-axis) — its own accuracy across
+    # shifts goes in the dedicated table (part 4) instead. Pass
+    # --include-comfed to draw it here too.
+    plot_orchs = orchs if args.include_comfed else [o for o in orchs if o != 'ComFed']
 
     # ── Plot 1: comm + private task performance vs shift ──────────────────────
     print('\nPlot 1: communication + private task performance vs shift …')
@@ -1423,6 +1745,12 @@ def main() -> None:
             markers,
             args.out_dir,
             'comm_and_priv_task_perf_vs_shift.png',
+            adjusted=False,
+            comm_estimator=args.comm_estimator,
+            priv_estimator=args.priv_estimator,
+            errorbar=errorbar,
+            legend_loc='inside',
+            legend_anchor='upper right',
         )
     else:
         plot_metric_vs_x(
@@ -1434,6 +1762,9 @@ def main() -> None:
             'comm_task_perf_vs_shift.png',
             'comm_task_perf',
             'Avg. communication accuracy',
+            adjusted=False,
+            estimator=args.comm_estimator,
+            errorbar=errorbar,
         )
         plot_metric_vs_x(
             priv_df,
@@ -1444,6 +1775,9 @@ def main() -> None:
             'private_task_perf_vs_shift.png',
             'private_task_perf',
             'Avg. private accuracy',
+            adjusted=False,
+            estimator=args.priv_estimator,
+            errorbar=errorbar,
         )
 
     # ── Plot 2 (per-shift training curves) ────────────────────────────────────

@@ -74,7 +74,6 @@ model:
 orchestrator:
   parseval_normalization: false
   l2_normalization: false
-  use_prototypes: false
   log_latent_diagnostics: True
   max_lmb: 0.5
   warmup_epochs: 25

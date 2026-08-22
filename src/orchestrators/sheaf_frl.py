@@ -23,10 +23,12 @@ from src.communication.whitening import (
     fit_whitening,
     whiten,
 )
+from src.mutualinfo._common import kmeans_cluster
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 from src.utils.anchors import (
     AnchorConfig,
     communication_anchor_payload,
+    parseval_normalize,
 )
 
 
@@ -51,6 +53,45 @@ class SheafFRL(BaseOrchestrator):
       Each ``λ_e`` grows while its edge violates the tolerance and decays to
       exactly 0 once inside it, so warmup and schedules emerge automatically
       and hard (e.g. cross-group) edges receive more weight than easy ones.
+
+    Communication is a *per-edge fixed anchor set*, re-selected every time the
+    alignment map refreshes (:meth:`_rebuild_edge_anchor_caches`, on the same
+    ``update_v_every_n_epochs`` / ``warmup_epochs`` cadence as
+    ``_should_update_maps_at_epoch_end``) — **not** every step.  At each
+    refresh, for every edge, matched pilot rows (already restricted to the
+    union — or, with ``align_on_intersection=True``, the intersection — of the
+    two endpoints' target classes via :meth:`_apply_edge_class_filter`) are
+    reduced by one of four mutually exclusive ``anchor_selection`` strategies
+    into a *fixed set of pilot identities* cached in ``self._edge_anchor_cache``:
+
+    * **all** (default) — the full matched pool, unchanged;
+    * **random** — exactly ``num_anchors`` rows, subsampled once at the
+      refresh and reused verbatim (same physical samples) for every step
+      until the next refresh;
+    * **proto_class** — one (or ``protos_per_class``, via within-class
+      k-means) prototype per class present on the edge, à la FedProto — the
+      *membership* of each class group is fixed at the refresh, but its mean
+      is recomputed every step from the members' current encodings;
+    * **proto_kmeans** — unsupervised: k-means (``K=num_anchors``) is fit
+      *once ever* (not every refresh) on the canonical higher-dimensional
+      endpoint's pilots; the resulting sample-id → cluster assignment is
+      cached and reused for the rest of training to induce matching
+      prototypes on the other endpoint by averaging its rows under the same
+      assignment — a one-shot, broadcast-once protocol.
+
+    Between refreshes, every step re-encodes the *same* underlying pilot
+    samples through each agent's current (still-training) parameters
+    (:meth:`_edge_live_anchors`) — values change every step, identities don't
+    — and this fresh re-encoding drives both the per-step sheaf penalty and,
+    at the next refresh, the alignment-map refit itself
+    (:meth:`_fit_edge_map`): the same anchors that were communicated build
+    both.  ``num_anchors`` is therefore the *total* volume communicated per
+    edge per refresh window, not a per-step recurring cost.
+
+    With ``anchor_parseval_normalize=True`` the selected anchors are further
+    prewhitened per side via :func:`~src.utils.anchors.parseval_normalize`
+    before the penalty/after-comm terms are computed — most useful for the
+    small anchor counts the ``random``/``proto_*`` strategies produce.
     """
 
     def __init__(
@@ -63,7 +104,9 @@ class SheafFRL(BaseOrchestrator):
         # local_steps: int = 1,
         anchor_strategy: str = 'pilots',
         num_anchors: int = 128,
-        use_prototypes: bool = False,
+        anchor_selection: str = 'all',
+        protos_per_class: int = 1,
+        anchor_parseval_normalize: bool = False,
         lambda_schedule: str | None = None,
         sparse_communication: bool = False,
         sparse_epsilon: float = 1e-2,
@@ -92,6 +135,9 @@ class SheafFRL(BaseOrchestrator):
         anchor_strategy = str(anchor_strategy)
         update_v_every_n_epochs = int(update_v_every_n_epochs)
         warmup_epochs = int(warmup_epochs)
+        num_anchors = int(num_anchors)
+        anchor_selection = str(anchor_selection)
+        protos_per_class = int(protos_per_class)
 
         if anchor_strategy != 'pilots':
             raise ValueError(
@@ -102,6 +148,18 @@ class SheafFRL(BaseOrchestrator):
             raise ValueError('update_v_every_n_epochs must be at least 1')
         if warmup_epochs < 0:
             raise ValueError('warmup_epochs must be non-negative')
+        if num_anchors < 1:
+            raise ValueError('num_anchors must be at least 1')
+        _valid_anchor_selections = (
+            'all', 'random', 'proto_class', 'proto_kmeans'
+        )
+        if anchor_selection not in _valid_anchor_selections:
+            raise ValueError(
+                f'Unknown anchor_selection: {anchor_selection}. '
+                f'Valid options: {list(_valid_anchor_selections)}'
+            )
+        if protos_per_class < 1:
+            raise ValueError('protos_per_class must be at least 1')
         if learn_lmb:
             if lambda_schedule:
                 raise ValueError(
@@ -129,8 +187,12 @@ class SheafFRL(BaseOrchestrator):
             use_general_maps = True
 
         self.save_hyperparameters()
-        self.anchor_config = AnchorConfig(
-            use_prototypes=bool(use_prototypes),
+        # Sparse-vs-dense byte comparison for the (rare) sparse_communication=True
+        # path in _record_edge_exchange.  use_prototypes is always False here:
+        # any prototype/random/k-means row reduction already happened upstream
+        # via anchor_selection (_select_edge_anchors) before this is applied.
+        self._sparse_payload_config = AnchorConfig(
+            use_prototypes=False,
             sparse_communication=bool(sparse_communication),
             sparse_epsilon=float(sparse_epsilon),
         )
@@ -138,6 +200,23 @@ class SheafFRL(BaseOrchestrator):
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
         ] = {}
         self._whitening_ops: dict[int, WhiteningOp] = {}
+        # anchor_selection='proto_kmeans' state: per-edge sample-id -> cluster-id
+        # assignment, fit once (lazily, at the first refresh with enough pooled
+        # pilots) and reused for the rest of a fit() call.
+        self._edge_kmeans_assign: dict[tuple[int, int], dict[int, int]] = {}
+        # Fixed per-edge anchor mechanism (selection cadence == map-refresh
+        # cadence, see class docstring).  All three must exist from
+        # construction, not just on_train_start: Lightning's sanity-check
+        # validation pass runs _shared_eval (and therefore _edge_live_anchors)
+        # *before* on_train_start fires.
+        self._latest_train_pilots: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._edge_anchor_cache: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        self._frozen_edge_anchors: dict[
+            tuple[int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
         self._build_restriction_maps(neighbors, latent_dims_int)
 
@@ -363,240 +442,73 @@ class SheafFRL(BaseOrchestrator):
 
         raise ValueError(f'Pilot batch missing for agent {idx}.')
 
-    def _compute_class_prototypes(
-        self,
-        anchor_matrix: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if anchor_matrix.numel() == 0 or labels.numel() == 0:
-            return anchor_matrix[:0], labels[:0]
-
-        prototypes, prototype_labels = [], []
-        for class_label in torch.unique(labels, sorted=True).tolist():
-            mask = labels == class_label
-            if mask.any():
-                prototypes.append(anchor_matrix[mask].mean(dim=0))
-                prototype_labels.append(class_label)
-
-        if not prototypes:
-            return anchor_matrix[:0], labels[:0]
-
-        return torch.stack(prototypes, dim=0), torch.tensor(
-            prototype_labels,
-            device=labels.device,
-            dtype=labels.dtype,
-        )
-
-    def _apply_prototype_collapse(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-    ) -> None:
-        """Collapse each node's whitened pilot rows to one prototype per class.
-
-        In prototype mode the per-step sheaf penalty aligns class prototypes
-        rather than individual pilot rows.  The collapse runs *after* whitening:
-        the SWBN online update keeps estimating its statistics on per-sample
-        rows, and — whitening being affine — it commutes exactly with the class
-        mean, so these prototypes equal whitened raw-latent prototypes.
-
-        Keys and labels are both replaced by the prototype class labels
-        (in-place in the dicts), so the downstream edge class filter
-        (union/intersection of target classes via ``align_on_intersection``)
-        and ``_match_keys`` operate class-wise: one matched row per shared
-        class per edge.  Gradients flow through the class means.
-        """
-        for idx in list(whitened_per_agent):
-            protos, proto_labels = self._compute_class_prototypes(
-                whitened_per_agent[idx], labels_per_agent[idx]
-            )
-            whitened_per_agent[idx] = protos
-            keys_per_agent[idx] = proto_labels
-            labels_per_agent[idx] = proto_labels
-
-    def _pilot_match_keys(
-        self, y_pilot: torch.Tensor, sample_ids: torch.Tensor | None
-    ) -> torch.Tensor:
-        if sample_ids is not None:
-            return sample_ids
-        return y_pilot
-
     @torch.no_grad()
-    def _encode_pilots_eval(
-        self, agent: nn.Module, x_pilot: torch.Tensor
-    ) -> torch.Tensor:
-        was_training = agent.training
-        agent.eval()
-        try:
-            return agent.encode(x_pilot)
-        finally:
-            agent.train(was_training)
-
-    def _match_keys(
+    def _fit_edge_map(
         self,
-        A_i: torch.Tensor,
-        A_j: torch.Tensor,
-        keys_i: torch.Tensor,
-        keys_j: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Universal geometric matcher: pairs up matrices via Sample IDs or Classes."""
-        target_keys = set(keys_i.tolist()) & set(keys_j.tolist())
+        edge_key: str,
+        node_i: int,
+        node_j: int,
+        Z_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        update_maps: bool,
+    ) -> dict[str, float]:
+        """Refit the Stiefel map for one edge from its fixed, already-whitened anchor pair.
 
-        if not target_keys:
-            return None
-
-        matched_i, matched_j = [], []
-        for k in sorted(target_keys):
-            idx_i = torch.where(keys_i == k)[0]
-            idx_j = torch.where(keys_j == k)[0]
-            matched_count = min(len(idx_i), len(idx_j))
-            if matched_count > 0:
-                matched_i.append(A_i[idx_i[:matched_count]])
-                matched_j.append(A_j[idx_j[:matched_count]])
-
-        if not matched_i:
-            return None
-        return torch.cat(matched_i, dim=0), torch.cat(matched_j, dim=0)
-
-    @torch.no_grad()
-    def _whiten_epoch_latents(
-        self,
-        latents_per_agent: dict[int, torch.Tensor],
-        whitening_ops: dict[int, WhiteningOp] | None,
-    ) -> tuple[dict[int, torch.Tensor], dict[int, WhiteningOp]]:
-        """Whiten each agent's epoch-accumulated pilots once for the Phase-B update.
-
-        SWBN layers are applied frozen (current phi_i, not re-estimated); closed-
-        form ZCA uses the supplied ops or fits on the spot when not supplied.
-        Returns whitened latents and any newly fitted ZCA ops (empty for SWBN).
+        ``Z_i``/``Z_j`` are the fresh re-encoding of that edge's fixed anchor
+        cache (:meth:`_edge_live_anchors`), called once per refresh from
+        :meth:`_rebuild_edge_anchor_caches` — replaces the old epoch-pooled
+        cross-covariance computation with the SVD/least-squares fit run
+        directly on the anchors that also drive the per-step penalty.
+        Overridden by :class:`SheafCFRL` to run its SOC-ADMM Phase-B update on
+        the same pair instead.  ``update_maps=False`` (learnable general maps
+        trained by gradient descent, ``use_general_maps and soft_maps``) still
+        computes the diagnostic metrics but leaves the map parameter alone.
         """
-        use_learnable = self._use_learnable_whitening()
-        agent_normed: dict[int, torch.Tensor] = {}
-        fitted_ops: dict[int, WhiteningOp] = {}
-        for idx, A in latents_per_agent.items():
-            if use_learnable:
-                normed = self._whiten_pilots_frozen(idx, A).to(
-                    dtype=A.dtype, device=A.device
-                )
-            else:
-                op = (
-                    whitening_ops[idx]
-                    if (whitening_ops and idx in whitening_ops)
-                    else fit_whitening(A.float())
-                )
-                fitted_ops[idx] = op
-                normed = whiten(A, op).to(dtype=A.dtype, device=A.device)
-            if not torch.isfinite(normed).all():
+        edge_metrics: dict[str, float] = {}
+        V_param = self.stiefel_matrices.get(edge_key)
+        if V_param is None or Z_i.shape[0] == 0:
+            return edge_metrics
+        param_device = V_param.device
+        A_i, A_j = Z_i.float(), Z_j.float()
+
+        C = torch.matmul(A_i.T, A_j)
+        edge_metrics[f'crosscov_effective_rank_edge_{edge_key}'] = self._effective_rank(C)
+
+        if self.hparams.use_general_maps:
+            # Unconstrained least-squares: A s.t. A_i @ A.T ≈ A_j.
+            # fit_alignment returns A of shape (d_j, d_i); V = A.T is (d_i, d_j).
+            if update_maps:
+                A = fit_alignment(A_i, A_j)
+                V_param.copy_(A.T.to(dtype=V_param.dtype, device=param_device))
+        else:
+            C_svd = C + torch.randn_like(C) * 1e-6
+            if not torch.isfinite(C_svd).all():
                 warnings.warn(
-                    f"_whiten_epoch_latents: whitened latents for agent {idx} "
-                    f"contain non-finite values "
-                    f"({(~torch.isfinite(normed)).sum().item()} entries). "
-                    "Replacing with 0.0 — check for training instability.",
+                    f"_fit_edge_map: cross-covariance for edge {edge_key} "
+                    f"contains non-finite values "
+                    f"({(~torch.isfinite(C_svd)).sum().item()} entries). "
+                    "Replacing with 0.0 — Stiefel update for this edge may be unreliable.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                normed = torch.nan_to_num(normed, nan=0.0, posinf=0.0, neginf=0.0)
-            agent_normed[idx] = normed
-        return agent_normed, fitted_ops
+                C_svd = torch.nan_to_num(C_svd, nan=0.0, posinf=0.0, neginf=0.0)
+            try:
+                U, S, W_T = torch.linalg.svd(C_svd, full_matrices=False)
+            except RuntimeError:
+                C_svd = C_svd.cpu()
+                U_cpu, S, W_T_cpu = torch.linalg.svd(C_svd, full_matrices=False)
+                U, W_T = U_cpu.to(param_device), W_T_cpu.to(param_device)
+            n_matched = A_i.shape[0]
+            if n_matched > 1:
+                edge_metrics[f'mean_canonical_correlation_edge_{edge_key}'] = (
+                    float(S.float().mean().item()) / (n_matched - 1)
+                )
+            if update_maps:
+                V_param.copy_(
+                    torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
+                )
 
-    @torch.no_grad()
-    def _update_stiefel_matrices(
-        self,
-        latents_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        whitening_ops: dict[int, WhiteningOp] | None = None,
-        update_maps: bool = True,
-    ) -> tuple[dict[str, float], dict[int, WhiteningOp]]:
-        """Update Stiefel matrices via SVD of the whitened cross-covariance.
-
-        Returns
-        -------
-        edge_metrics : dict mapping metric keys to float values.
-            Contains both ``crosscov_effective_rank_edge_{k}`` (effective rank
-            of the cross-covariance matrix C) and
-            ``mean_canonical_correlation_edge_{k}`` (mean(S)/(n-1)) per edge.
-        whitening_ops  : dict[agent_idx → WhiteningOp] fitted on the full-epoch
-            latents passed in.  Callers should cache these for use in the next
-            epoch's forward pass so whitening is never computed on a single
-            mini-batch.
-        """
-        if not self.stiefel_matrices:
-            return {}, {}
-
-        edge_metrics: dict[str, float] = {}
-        param_device = next(iter(self.stiefel_matrices.values())).device
-
-        agent_normed, fitted_ops = self._whiten_epoch_latents(
-            latents_per_agent, whitening_ops
-        )
-
-        for edge_key, V_param in self.stiefel_matrices.items():
-            node_i, node_j = map(int, edge_key.split('_'))
-
-            if node_i not in agent_normed or node_j not in agent_normed:
-                continue
-
-            # At epoch level keys_per_agent are class labels (not sample IDs),
-            # so they double as both keys and labels for class-based filtering.
-            A_i_f, keys_i_f, _, A_j_f, keys_j_f, _ = self._apply_edge_class_filter(
-                node_i, node_j,
-                agent_normed[node_i], keys_per_agent[node_i], keys_per_agent[node_i],
-                agent_normed[node_j], keys_per_agent[node_j], keys_per_agent[node_j],
-            )
-            shared_rows = self._match_keys(
-                A_i=A_i_f,
-                A_j=A_j_f,
-                keys_i=keys_i_f,
-                keys_j=keys_j_f,
-            )
-            if shared_rows is None:
-                continue
-
-            A_i, A_j = shared_rows
-
-            # Cross-covariance diagnostics are meaningful regardless of map type.
-            C = torch.matmul(A_i.float().T, A_j.float())
-            edge_metrics[f'crosscov_effective_rank_edge_{edge_key}'] = self._effective_rank(C)
-
-            if self.hparams.use_general_maps:
-                # Unconstrained least-squares: A s.t. A_i @ A.T ≈ A_j.
-                # fit_alignment returns A of shape (d_j, d_i); V = A.T is (d_i, d_j).
-                if update_maps:
-                    A = fit_alignment(A_i.float(), A_j.float())
-                    V_param.copy_(
-                        A.T.to(dtype=V_param.dtype, device=param_device)
-                    )
-            else:
-                C_svd = C + torch.randn_like(C) * 1e-6
-                if not torch.isfinite(C_svd).all():
-                    import warnings
-                    warnings.warn(
-                        f"_update_stiefel_matrices: cross-covariance for edge {edge_key} "
-                        f"contains non-finite values "
-                        f"({(~torch.isfinite(C_svd)).sum().item()} entries). "
-                        "Replacing with 0.0 — Stiefel update for this edge may be unreliable.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    C_svd = torch.nan_to_num(C_svd, nan=0.0, posinf=0.0, neginf=0.0)
-                try:
-                    U, S, W_T = torch.linalg.svd(C_svd, full_matrices=False)
-                except RuntimeError:
-                    C_svd = C_svd.cpu()
-                    U_cpu, S, W_T_cpu = torch.linalg.svd(C_svd, full_matrices=False)
-                    U, W_T = U_cpu.to(param_device), W_T_cpu.to(param_device)
-                n_matched = A_i.shape[0]
-                if n_matched > 1:
-                    edge_metrics[f'mean_canonical_correlation_edge_{edge_key}'] = (
-                        float(S.float().mean().item()) / (n_matched - 1)
-                    )
-                if update_maps:
-                    V_param.copy_(
-                        torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
-                    )
-
-        return edge_metrics, fitted_ops
+        return edge_metrics
 
     def _build_agent_target_classes(self) -> dict[int, set[int]] | None:
         """Build per-agent target-class sets from the datamodule, or return None."""
@@ -664,16 +576,22 @@ class SheafFRL(BaseOrchestrator):
         A_j: torch.Tensor,
         keys_j: torch.Tensor,
         labels_j: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Match pilot rows by shared key; return (A_i, y_i, A_j, y_j) for matched rows.
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None
+    ):
+        """Match pilot rows by shared key; return (A_i, y_i, A_j, y_j, keys) for matched rows.
 
-        Extends _match_keys to also collect the per-row class labels, which are
-        needed for the after-communication task loss.
+        Geometric matcher: pairs up rows via shared sample id (or class label,
+        depending on what ``keys`` carries), also collecting the per-row class
+        labels (needed for the after-communication task loss) and the matched
+        keys themselves (needed by the ``proto_kmeans`` anchor-selection
+        strategy to look up its cached sample-id -> cluster-id assignment).
         """
         target_keys = set(keys_i.tolist()) & set(keys_j.tolist())
         if not target_keys:
             return None
-        m_i, y_i_m, m_j, y_j_m = [], [], [], []
+        m_i, y_i_m, m_j, y_j_m, k_m = [], [], [], [], []
         for k in sorted(target_keys):
             idx_i = torch.where(keys_i == k)[0]
             idx_j = torch.where(keys_j == k)[0]
@@ -683,6 +601,11 @@ class SheafFRL(BaseOrchestrator):
                 y_i_m.append(labels_i[idx_i[:mc]])
                 m_j.append(A_j[idx_j[:mc]])
                 y_j_m.append(labels_j[idx_j[:mc]])
+                k_m.append(
+                    torch.full(
+                        (mc,), k, dtype=keys_i.dtype, device=keys_i.device
+                    )
+                )
         if not m_i:
             return None
         return (
@@ -690,45 +613,363 @@ class SheafFRL(BaseOrchestrator):
             torch.cat(y_i_m, dim=0),
             torch.cat(m_j, dim=0),
             torch.cat(y_j_m, dim=0),
+            torch.cat(k_m, dim=0),
         )
 
-    def _match_edge(
+    # ── Edge-scoped anchor selection (anchor_selection) ────────────────────────
+
+    def _edge_pairs(self) -> list[tuple[str, int, int]]:
+        """Canonical ``(edge_key, node_i, node_j)`` triples for every alignment edge.
+
+        Overridden by :class:`SheafCFRL`, whose edges live in
+        ``_compression_edges`` rather than ``stiefel_matrices``.
+        """
+        return [(k, *map(int, k.split('_'))) for k in self.stiefel_matrices]
+
+    def _select_edge_anchors(
         self,
         node_i: int,
         node_j: int,
-        src_i: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        src_j: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Class-filter + key-match two pilot sources for edge (node_i, node_j).
+        Z_i: torch.Tensor,
+        y_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        y_j: torch.Tensor,
+        keys: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reduce matched, class-filtered edge rows to the actual alignment anchors.
 
-        Each source is ``(A, keys, labels)``.  Returns ``(Z_i, y_i, Z_j, y_j)`` for
-        the matched rows, or ``None``.  Used for both the live/live penalty and the
-        live/frozen (Phase-A) penalty, so one source may be a frozen snapshot.
+        Dispatches on ``anchor_selection`` (see the class docstring for the four
+        modes), then optionally Parseval-prewhitens each side independently via
+        :func:`~src.utils.anchors.parseval_normalize`.
         """
-        A_i, k_i, l_i = src_i
-        A_j, k_j, l_j = src_j
-        A_i_f, k_i_f, l_i_f, A_j_f, k_j_f, l_j_f = self._apply_edge_class_filter(
-            node_i, node_j, A_i, k_i, l_i, A_j, k_j, l_j
+        strategy = self.hparams.anchor_selection
+        if strategy == 'all' or Z_i.shape[0] == 0:
+            sel = (Z_i, y_i, Z_j, y_j)
+        elif strategy == 'random':
+            sel = self._random_edge_anchors(Z_i, y_i, Z_j, y_j)
+        elif strategy == 'proto_class':
+            sel = self._class_proto_edge_anchors(Z_i, y_i, Z_j, y_j)
+        else:  # 'proto_kmeans'
+            sel = self._kmeans_proto_edge_anchors(
+                node_i, node_j, Z_i, y_i, Z_j, y_j, keys
+            )
+        if self.hparams.anchor_parseval_normalize:
+            Zi_s, yi_s, Zj_s, yj_s = sel
+            sel = (
+                parseval_normalize(Zi_s),
+                yi_s,
+                parseval_normalize(Zj_s),
+                yj_s,
+            )
+        return sel
+
+    def _random_edge_anchors(
+        self,
+        Z_i: torch.Tensor,
+        y_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        y_j: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fresh random subset of ``num_anchors`` matched rows, resampled every step."""
+        budget = int(self.hparams.num_anchors)
+        n = Z_i.shape[0]
+        if n <= budget:
+            return Z_i, y_i, Z_j, y_j
+        idx = torch.randperm(n, device=Z_i.device)[:budget]
+        return Z_i[idx], y_i[idx], Z_j[idx], y_j[idx]
+
+    def _class_proto_edge_anchors(
+        self,
+        Z_i: torch.Tensor,
+        y_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        y_j: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One (or ``protos_per_class``) prototype pair per class present on the edge.
+
+        Rows are already matched by shared sample id, so ``y_i`` and ``y_j``
+        agree per row; grouping by ``y_i`` and averaging both sides over the
+        *same* rows gives paired prototypes computed from the same underlying
+        samples in each agent's own space.  With ``protos_per_class > 1`` each
+        class is further split via k-means on its node_i rows
+        (:func:`~src.mutualinfo._common.kmeans_cluster`), recomputed fresh every
+        step — cheap since it only runs on the (typically small) class subset.
+        """
+        protos_per_class = int(self.hparams.protos_per_class)
+        Zi_rows, yi_rows, Zj_rows, yj_rows = [], [], [], []
+        for c in torch.unique(y_i, sorted=True).tolist():
+            mask = y_i == c
+            Zi_c, Zj_c = Z_i[mask], Z_j[mask]
+            n_c = Zi_c.shape[0]
+            if protos_per_class <= 1 or n_c <= protos_per_class:
+                Zi_rows.append(Zi_c.mean(dim=0, keepdim=True))
+                Zj_rows.append(Zj_c.mean(dim=0, keepdim=True))
+                yi_rows.append(y_i.new_full((1,), c))
+                yj_rows.append(y_j.new_full((1,), c))
+                continue
+            cluster_labels = kmeans_cluster(
+                Zi_c.detach().float().cpu().numpy(), n_clusters=protos_per_class
+            )
+            cluster_ids = torch.as_tensor(
+                cluster_labels, device=Z_i.device, dtype=torch.long
+            )
+            for cl in torch.unique(cluster_ids).tolist():
+                cmask = cluster_ids == cl
+                Zi_rows.append(Zi_c[cmask].mean(dim=0, keepdim=True))
+                Zj_rows.append(Zj_c[cmask].mean(dim=0, keepdim=True))
+                yi_rows.append(y_i.new_full((1,), c))
+                yj_rows.append(y_j.new_full((1,), c))
+        if not Zi_rows:
+            return Z_i[:0], y_i[:0], Z_j[:0], y_j[:0]
+        return (
+            torch.cat(Zi_rows, dim=0),
+            torch.cat(yi_rows, dim=0),
+            torch.cat(Zj_rows, dim=0),
+            torch.cat(yj_rows, dim=0),
         )
-        return self._match_pilots_with_labels(
-            A_i_f, k_i_f, l_i_f, A_j_f, k_j_f, l_j_f
+
+    def _kmeans_proto_edge_anchors(
+        self,
+        node_i: int,
+        node_j: int,
+        Z_i: torch.Tensor,
+        y_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        y_j: torch.Tensor,
+        keys: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Induce node_j prototypes from node_i's cached, one-shot k-means clusters.
+
+        Looks up the ``(node_i, node_j) -> {sample_id: cluster_id}`` assignment
+        fit once, ever, by :meth:`_rebuild_edge_anchor_caches`; rows whose key
+        was not part of the fitted pool are dropped.  Each surviving cluster is averaged
+        independently on both sides (inducing node_j's prototype from whichever
+        of *its own* matched rows fall in that node_i-defined cluster), with the
+        majority label kept for the after-comm task loss.  Falls back to
+        returning the unreduced rows when no assignment has been fit yet (e.g.
+        still in warmup / not enough pooled pilots) — same graceful-fallback
+        idiom as ``CESheafFRL._frozen_alignment_losses`` before the first
+        frozen snapshot exists.
+        """
+        assign_map = self._edge_kmeans_assign.get((node_i, node_j))
+        if not assign_map:
+            return Z_i, y_i, Z_j, y_j
+        cluster_ids = torch.tensor(
+            [assign_map.get(int(k), -1) for k in keys.tolist()],
+            device=Z_i.device,
+            dtype=torch.long,
         )
+        valid = cluster_ids >= 0
+        if not bool(valid.any()):
+            return Z_i, y_i, Z_j, y_j
+        Z_i, y_i, Z_j, y_j = Z_i[valid], y_i[valid], Z_j[valid], y_j[valid]
+        cluster_ids = cluster_ids[valid]
+        Zi_rows, yi_rows, Zj_rows, yj_rows = [], [], [], []
+        for cl in torch.unique(cluster_ids).tolist():
+            mask = cluster_ids == cl
+            Zi_rows.append(Z_i[mask].mean(dim=0, keepdim=True))
+            Zj_rows.append(Z_j[mask].mean(dim=0, keepdim=True))
+            vals, counts = torch.unique(y_i[mask], return_counts=True)
+            majority = vals[counts.argmax()].reshape(1)
+            yi_rows.append(majority)
+            yj_rows.append(majority)
+        return (
+            torch.cat(Zi_rows, dim=0),
+            torch.cat(yi_rows, dim=0),
+            torch.cat(Zj_rows, dim=0),
+            torch.cat(yj_rows, dim=0),
+        )
+
+    def _edge_live_anchors(
+        self, node_i: int, node_j: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Re-encode edge ``(node_i, node_j)``'s fixed anchor cache fresh, then reduce.
+
+        The one place both the per-step penalty (:meth:`_both_live_alignment_losses`)
+        and the epoch-end map refit (:meth:`_rebuild_edge_anchor_caches`) get
+        their anchors from: the underlying pilot *identities* are fixed for the
+        whole refresh window (see :meth:`_rebuild_edge_anchor_caches`), but
+        every call re-encodes them through the agents' *current* (still
+        training) parameters — gradients/values are always fresh even though
+        which samples they come from never changes mid-window.  Returns
+        ``None`` before any cache exists for this edge (e.g. Lightning's
+        sanity-check pass, which runs before ``on_train_start``).
+        """
+        cache = self._edge_anchor_cache.get((node_i, node_j))
+        if cache is None:
+            return None
+        Z_i, y_i = self._edge_live_one_side(node_i, cache, 'i')
+        Z_j, y_j = self._edge_live_one_side(node_j, cache, 'j')
+        keys = cache['sample_ids'].to(self.device)
+        return self._select_edge_anchors(node_i, node_j, Z_i, y_i, Z_j, y_j, keys)
+
+    def _edge_live_one_side(
+        self, node_idx: int, cache: dict[str, torch.Tensor], side: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Re-encode + whiten just one side (``'i'`` or ``'j'``) of an edge's anchor cache.
+
+        Split out of :meth:`_edge_live_anchors` so :class:`CESheafFRL` can
+        re-encode only the *live* node during Phase A, pairing it against the
+        other side's frozen snapshot (``self._frozen_edge_anchors``) instead
+        of a second live encoding.
+        """
+        agent = self.agents[str(node_idx)]
+        x = cache[f'x_{side}'].to(self.device)
+        Z = self._whiten_node_pilots(node_idx, agent.encode(x))
+        y = cache[f'y_{side}'].to(self.device)
+        return Z, y
+
+    def _record_edge_exchange(
+        self,
+        edge_key: str,
+        Z_i: torch.Tensor,
+        Z_j: torch.Tensor,
+        prefix: str = 'train',
+    ) -> None:
+        """Record the communication payload for one edge's freshly (re)selected anchors.
+
+        Called once per edge per refresh from :meth:`_rebuild_edge_anchor_caches`
+        — *not* once per step: under the fixed-anchor-cache design the same
+        ``num_anchors`` rows drive every step's penalty until the next
+        refresh, so the real "wire" cost is paid exactly once per window.
+        ``edge_key`` is unused here but available to overrides (e.g.
+        :class:`SheafCFRL`, which sends the shared compressed dimension
+        ``c_ij`` on both sides instead of ``Z_i``/``Z_j``'s own raw dims).
+        """
+        n_rows = int(Z_i.shape[0])
+        if n_rows <= 0:
+            return
+        if bool(self.hparams.sparse_communication):
+            payload_i = communication_anchor_payload(
+                anchor_matrix=Z_i.detach(), labels=None, config=self._sparse_payload_config
+            )
+            payload_j = communication_anchor_payload(
+                anchor_matrix=Z_j.detach(), labels=None, config=self._sparse_payload_config
+            )
+            self._record_communication(payload_i, prefix=prefix)
+            self._record_communication(payload_j, prefix=prefix)
+        else:
+            self._record_communication(n_rows * Z_i.shape[1], prefix=prefix)
+            self._record_communication(n_rows * Z_j.shape[1], prefix=prefix)
+
+    @torch.no_grad()
+    def _rebuild_edge_anchor_caches(self) -> dict[str, float]:
+        """(Re)select each edge's fixed anchor set and refit its alignment map from it.
+
+        Called once per refresh window, from ``on_train_epoch_end``, gated by
+        ``_should_update_maps_at_epoch_end`` — the same event that used to
+        trigger the old epoch-pooled Stiefel refit.  For each edge: build a
+        fresh, class-filtered, sample-id-matched candidate pool from the
+        *last* train step's raw pilots (``self._latest_train_pilots``); reduce
+        it to the fixed anchor identities that get reused every step until the
+        next refresh (``random``: subsample once to ``num_anchors``;
+        ``proto_kmeans``: fit its one-shot clustering the first time, then
+        restrict to assigned rows; ``all``/``proto_class``: keep the full
+        matched pool — their reduction is per-step averaging over a fixed
+        membership, not identity selection, so it stays in
+        :meth:`_edge_live_anchors`); cache it; immediately re-encode it once
+        (the "just selected" pass) to record the communication cost, snapshot
+        the frozen pair for :class:`CESheafFRL`'s Phase A, and fit the
+        alignment map.
+        """
+        edge_metrics: dict[str, float] = {}
+        update_maps = not (
+            self.hparams.use_general_maps and self.hparams.soft_maps
+        )
+        recorded_round = False
+        strategy = self.hparams.anchor_selection
+
+        for edge_key, node_i, node_j in self._edge_pairs():
+            if (
+                node_i not in self._latest_train_pilots
+                or node_j not in self._latest_train_pilots
+            ):
+                continue
+            x_i, y_i, sid_i = (
+                t.to(self.device) for t in self._latest_train_pilots[node_i]
+            )
+            x_j, y_j, sid_j = (
+                t.to(self.device) for t in self._latest_train_pilots[node_j]
+            )
+
+            x_i_f, sid_i_f, y_i_f, x_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
+                node_i, node_j, x_i, sid_i, y_i, x_j, sid_j, y_j
+            )
+            matched = self._match_pilots_with_labels(
+                x_i_f, sid_i_f, y_i_f, x_j_f, sid_j_f, y_j_f
+            )
+            if matched is None:
+                continue
+            x_i_m, y_i_m, x_j_m, y_j_m, sids_m = matched
+
+            if strategy == 'random':
+                budget = int(self.hparams.num_anchors)
+                if x_i_m.shape[0] > budget:
+                    idx = torch.randperm(x_i_m.shape[0], device=x_i_m.device)[:budget]
+                    x_i_m, y_i_m, x_j_m, y_j_m, sids_m = (
+                        x_i_m[idx], y_i_m[idx], x_j_m[idx], y_j_m[idx], sids_m[idx]
+                    )
+            elif strategy == 'proto_kmeans':
+                pair = (node_i, node_j)
+                K = int(self.hparams.num_anchors)
+                if pair not in self._edge_kmeans_assign and x_i_m.shape[0] >= K:
+                    z_ref = self.agents[str(node_i)].encode(x_i_m)
+                    labels = kmeans_cluster(z_ref.float().cpu().numpy(), n_clusters=K)
+                    self._edge_kmeans_assign[pair] = dict(
+                        zip(sids_m.tolist(), labels.tolist())
+                    )
+                assign_map = self._edge_kmeans_assign.get(pair)
+                if assign_map:
+                    keep = torch.tensor(
+                        [s in assign_map for s in sids_m.tolist()],
+                        device=x_i_m.device,
+                        dtype=torch.bool,
+                    )
+                    if bool(keep.any()):
+                        x_i_m, y_i_m, x_j_m, y_j_m, sids_m = (
+                            x_i_m[keep], y_i_m[keep], x_j_m[keep], y_j_m[keep], sids_m[keep]
+                        )
+
+            self._edge_anchor_cache[(node_i, node_j)] = {
+                'x_i': x_i_m.cpu(), 'y_i': y_i_m.cpu(),
+                'x_j': x_j_m.cpu(), 'y_j': y_j_m.cpu(),
+                'sample_ids': sids_m.cpu(),
+            }
+
+            live = self._edge_live_anchors(node_i, node_j)
+            if live is None:
+                continue
+            Z_i, y_i_l, Z_j, y_j_l = live
+            if not recorded_round:
+                self._record_communication_round(n_rounds=1, prefix='train')
+                recorded_round = True
+            self._record_edge_exchange(edge_key, Z_i, Z_j, prefix='train')
+            self._frozen_edge_anchors[(node_i, node_j)] = (
+                Z_i.detach(), y_i_l.detach(), Z_j.detach(), y_j_l.detach()
+            )
+            edge_metrics.update(
+                self._fit_edge_map(edge_key, node_i, node_j, Z_i, Z_j, update_maps)
+            )
+
+        return edge_metrics
 
     def on_train_start(self) -> None:
         super().on_train_start()
         self._latest_pilots.clear()
         self._whitening_ops.clear()
-        self._pilot_latent_buffer: dict[
-            int, list[tuple[torch.Tensor, torch.Tensor]]
-        ] = {}
         self._task_latent_buffer: dict[int, list[torch.Tensor]] = {}
         self._agent_target_classes: dict[int, set[int]] | None = (
             self._build_agent_target_classes()
         )
+        # Fresh fit() call -> forget any proto_kmeans assignment and any fixed
+        # anchor caches fit/selected previously.
+        self._edge_kmeans_assign = {}
+        self._latest_train_pilots = {}
+        self._edge_anchor_cache = {}
+        self._frozen_edge_anchors = {}
 
     def on_train_epoch_start(self) -> None:
         self._latest_pilots.clear()
-        self._pilot_latent_buffer = {}
         self._task_latent_buffer = {}
 
     @torch.no_grad()
@@ -745,67 +986,20 @@ class SheafFRL(BaseOrchestrator):
                 add_dataloader_idx=False,
             )
 
-        # Whether to refresh the whitening ops + Stiefel maps at this epoch end.
-        # Hook: SheafFRL refreshes every `update_v_every_n_epochs` after warmup;
-        # CESheafFRL refreshes only on Phase-C epochs.
-        do_update = self._should_update_maps_at_epoch_end()
-
-        if not do_update:
-            self._on_maps_refreshed(False)
-            self._latest_pilots.clear()
-            self._pilot_latent_buffer = {}
-            self._task_latent_buffer = {}
-            self._finalize_train_epoch_communication()
-            self._log_train_comm_task_perf()
-            return
-
-        epoch_latents: dict[int, torch.Tensor] = {}
-        epoch_keys: dict[int, torch.Tensor] = {}
-
-        for idx, buf in self._pilot_latent_buffer.items():
-            if not buf:
-                continue
-
-            raw_all = torch.cat([z for z, _ in buf], dim=0).to(self.device)
-            label_all = torch.cat([y for _, y in buf], dim=0).to(self.device)
-
-            # Prototype aggregation over the full epoch's pilots gives better
-            # class estimates than a single last-batch.
-            # Normalization (parseval/L2/whitening) is handled inside
-            # _update_stiefel_matrices — do NOT apply it again here.
-            if self.anchor_config.use_prototypes:
-                final_A, final_keys = self._compute_class_prototypes(
-                    raw_all, label_all
-                )
-            else:
-                final_A = raw_all
-                final_keys = self._pilot_match_keys(label_all, None)
-
-            epoch_latents[idx] = final_A
-            epoch_keys[idx] = final_keys
-
-        if epoch_latents:
-            train_whitening_ops: dict[int, WhiteningOp] = {}
-            # With learnable SWBN whitening, phi_i lives in the persistent layers
-            # (updated online during the epoch); the buffer-and-fit ops are unused.
+        # Whether to refresh the fixed anchor caches + alignment maps this
+        # epoch.  Hook: SheafFRL refreshes every `update_v_every_n_epochs`
+        # after warmup; CESheafFRL refreshes only on Phase-C epochs.
+        if self._should_update_maps_at_epoch_end():
+            # With learnable SWBN whitening, phi_i lives in the persistent
+            # layers (updated online every step); this closed-form ZCA fit is
+            # only needed for learn_whitening=False.
             if not self._use_learnable_whitening():
                 for idx, chunks in self._task_latent_buffer.items():
                     if chunks:
-                        train_whitening_ops[idx] = fit_whitening(
+                        self._whitening_ops[idx] = fit_whitening(
                             torch.cat(chunks, dim=0).float()
                         )
-            update_maps = not (
-                self.hparams.use_general_maps and self.hparams.soft_maps
-            )
-            edge_metrics, new_ops = self._update_stiefel_matrices(
-                epoch_latents,
-                epoch_keys,
-                whitening_ops=train_whitening_ops if train_whitening_ops else None,
-                update_maps=update_maps,
-            )
-            # For soft maps the whitening ops come from training latents directly;
-            # _update_stiefel_matrices returns them unchanged via fitted_ops.
-            self._whitening_ops.update(new_ops)
+            edge_metrics = self._rebuild_edge_anchor_caches()
             if edge_metrics:
                 self.log_dict(
                     {f'train/{k}': v for k, v in edge_metrics.items()},
@@ -815,13 +1009,7 @@ class SheafFRL(BaseOrchestrator):
                     add_dataloader_idx=False,
                 )
 
-        # Hook (no-op in SheafFRL): CESheafFRL snapshots frozen neighbour pilots
-        # here, after the maps + whitening ops have been refreshed and while
-        # _latest_pilots is still available.
-        self._on_maps_refreshed(True)
-
         self._latest_pilots.clear()
-        self._pilot_latent_buffer = {}
         self._task_latent_buffer = {}
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
@@ -835,68 +1023,11 @@ class SheafFRL(BaseOrchestrator):
             and self.current_epoch % self.hparams.update_v_every_n_epochs == 0
         )
 
-    def _on_maps_refreshed(self, did_update: bool) -> None:
-        """Called at every epoch end (no-op here; CESheafFRL snapshots pilots)."""
-
-    def _exchanges_pilots(self, prefix: str) -> bool:
-        """Whether pilots are exchanged (and the round recorded) this step.
-
-        Always ``True`` for SheafFRL; CESheafFRL returns ``False`` during Phase A,
-        where each node reuses frozen neighbour snapshots instead of communicating.
-        """
-        return True
-
-    def _record_pilot_exchange(
-        self,
-        payloads_per_agent: dict[int, Any],
-        latents_per_agent: dict[int, torch.Tensor],
-        prefix: str,
-    ) -> None:
-        """Record one pilot exchange: 1 round + per-agent payload to all neighbours.
-
-        Each agent broadcasts its full d_i-dimensional pilot payload to every
-        neighbour.  SheafCFRL overrides this to record the compressed c_ij-dim
-        payload instead.
-        """
-        self._record_communication_round(n_rounds=1, prefix=prefix)
-        for idx, payload in payloads_per_agent.items():
-            n_neighbors = len(
-                self.hparams.neighbors.get(
-                    idx,
-                    self.hparams.neighbors.get(str(idx), set()),
-                )
-            )
-            if n_neighbors > 0:
-                self._record_communication(
-                    payload,
-                    n_transmissions=n_neighbors,
-                    prefix=prefix,
-                )
-
-    def _on_pilots_whitened(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-        prefix: str,
-    ) -> None:
-        """Called each step after the per-node whitening (no-op in SheafFRL).
-
-        CESheafFRL uses it to cache the neighbours' whitened pilots received
-        during the last Phase-C epoch, keyed by sample-id, so the whole pilot
-        pool is available as a fixed target throughout the next Phase-A block.
-        """
-
     def on_validation_epoch_end(self) -> None:
         super().on_validation_epoch_end()
 
     def _compute_alignment_losses(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-        comm_weight: float,
-        skip: bool,
+        self, comm_weight: float, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-step entry point for the alignment losses (both-live).
 
@@ -906,23 +1037,18 @@ class SheafFRL(BaseOrchestrator):
         ``_frozen_alignment_losses`` so subclasses can swap it (e.g. SheafCFRL's
         compressed coboundary) without re-implementing the schedule.
         """
-        return self._both_live_alignment_losses(
-            whitened_per_agent, keys_per_agent, labels_per_agent, comm_weight, skip
-        )
+        return self._both_live_alignment_losses(comm_weight, skip)
 
     def _both_live_alignment_losses(
-        self,
-        whitened_per_agent: dict[int, torch.Tensor],
-        keys_per_agent: dict[int, torch.Tensor],
-        labels_per_agent: dict[int, torch.Tensor],
-        comm_weight: float,
-        skip: bool,
+        self, comm_weight: float, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Both-live sheaf penalty + after-comm over all edges (embedding maps).
 
         One Stiefel map per edge, embedding coboundary ``z_i V − z_j``; both
-        endpoints live.  :class:`SheafCFRL` overrides this with the compressed
-        two-map coboundary.  ``comm_weight > 0`` enables the after-comm term.
+        endpoints re-encoded fresh from their fixed anchor cache
+        (:meth:`_edge_live_anchors`).  :class:`SheafCFRL` overrides this with
+        the compressed two-map coboundary.  ``comm_weight > 0`` enables the
+        after-comm term.
         """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm_task_loss = torch.tensor(0.0, device=self.device)
@@ -931,23 +1057,11 @@ class SheafFRL(BaseOrchestrator):
 
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
-            if (
-                node_i not in whitened_per_agent
-                or node_j not in whitened_per_agent
-            ):
-                continue
-
-            src_i = (
-                whitened_per_agent[node_i], keys_per_agent[node_i], labels_per_agent[node_i]
-            )
-            src_j = (
-                whitened_per_agent[node_j], keys_per_agent[node_j], labels_per_agent[node_j]
-            )
-            matched = self._match_edge(node_i, node_j, src_i, src_j)
+            matched = self._edge_live_anchors(node_i, node_j)
             if matched is None:
                 continue
 
-            # Rows are already whitened (whitening was applied per node upstream).
+            # Rows are already whitened (inside _edge_live_anchors).
             Z_i, y_i_shared, Z_j, y_j_shared = matched
             diff = torch.matmul(Z_i, V) - Z_j
             sheaf_penalty += self._edge_penalty_term(edge_key, diff)
@@ -1000,12 +1114,6 @@ class SheafFRL(BaseOrchestrator):
         outputs = {}
         agent_losses = {}
         agent_performances = {}
-        latents_per_agent: dict[int, torch.Tensor] = {}
-        payloads_per_agent: dict[int, Any] = {}
-        keys_per_agent: dict[int, torch.Tensor] = {}
-        # Class labels (y_pilot) aligned with latents_per_agent — always class
-        # labels regardless of whether keys_per_agent carries sample IDs.
-        labels_per_agent: dict[int, torch.Tensor] = {}
 
         pilots_available = True
 
@@ -1036,11 +1144,20 @@ class SheafFRL(BaseOrchestrator):
                 else:
                     self._latest_pilots[idx] = (x_pilot, y_pilot, sample_ids)
                     pilot_latents = agent.encode(x_pilot)
+                    # Whiten every node's pilots ONCE per step for SWBN's online
+                    # W / running-stat update and diagnostics; the alignment
+                    # penalty no longer consumes this pass — it re-encodes each
+                    # edge's fixed anchor cache separately (_edge_live_anchors).
+                    self._whiten_node_pilots(idx, pilot_latents)
 
                     if prefix == 'train':
-                        # Accumulate for epoch-level Stiefel update / whitening-op fitting.
-                        self._pilot_latent_buffer.setdefault(idx, []).append(
-                            (pilot_latents.detach().cpu(), y_pilot.cpu())
+                        # Raw pilots (not yet encoded) from the most recent train
+                        # step; used at the next map refresh to rebuild the fixed
+                        # per-edge anchor caches (_rebuild_edge_anchor_caches).
+                        self._latest_train_pilots[idx] = (
+                            x_pilot.detach().cpu(),
+                            y_pilot.detach().cpu(),
+                            sample_ids.detach().cpu(),
                         )
                         if getattr(self.hparams, 'log_latent_diagnostics', False):
                             self.log(
@@ -1052,60 +1169,13 @@ class SheafFRL(BaseOrchestrator):
                                 add_dataloader_idx=False,
                             )
 
-                    # Raw latents — whitening is applied below using ops from
-                    # the previous epoch (self._whitening_ops).
-                    latents_per_agent[idx] = pilot_latents
-                    keys_per_agent[idx] = self._pilot_match_keys(y_pilot, sample_ids)
-                    # Per-sample class labels aligned with the latent rows.
-                    # Prototype mode replaces rows/keys/labels with per-class
-                    # prototypes after whitening (_apply_prototype_collapse);
-                    # keys must NOT be used here — with global pilots they are
-                    # sample IDs, and grouping/filtering by them is meaningless.
-                    labels_per_agent[idx] = y_pilot
-                    payloads_per_agent[idx] = communication_anchor_payload(
-                        anchor_matrix=latents_per_agent[idx],
-                        labels=y_pilot,
-                        config=self.anchor_config,
-                    )
-
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
 
-        if (
-            pilots_available
-            and prefix in self._COMMUNICATION_SPLITS
-            and prefix != 'test_monitor'
-            and self._exchanges_pilots(prefix)
-        ):
-            self._record_pilot_exchange(payloads_per_agent, latents_per_agent, prefix)
-
         comm_weight = float(getattr(self.hparams, 'comm_task_coeff', 0.0))
-
-        # Whiten every node's pilots ONCE, before the per-edge loop, so a node's
-        # SWBN layer (and its W / running-stat online update) runs a single time
-        # per step regardless of its degree.  Row-wise whitening commutes with
-        # the per-edge row matching, so the matched rows are pre-whitened.
-        whitened_per_agent: dict[int, torch.Tensor] = {
-            idx: self._whiten_node_pilots(idx, A)
-            for idx, A in latents_per_agent.items()
-        }
-        # Prototype mode: collapse to per-class prototypes AFTER whitening, so
-        # the SWBN online update keeps seeing per-sample rows.  Placed before
-        # _on_pilots_whitened so CESheafFRL's Phase-A snapshots cache prototypes
-        # keyed by class, matching what the live side produces in Phase A.
-        if self.anchor_config.use_prototypes:
-            self._apply_prototype_collapse(
-                whitened_per_agent, keys_per_agent, labels_per_agent
-            )
-        self._on_pilots_whitened(
-            whitened_per_agent, keys_per_agent, labels_per_agent, prefix
-        )
 
         in_warmup = self.current_epoch < self.hparams.warmup_epochs
         self._step_edge_residuals = {}
         sheaf_penalty, after_comm_task_loss = self._compute_alignment_losses(
-            whitened_per_agent,
-            keys_per_agent,
-            labels_per_agent,
             comm_weight=comm_weight,
             skip=in_warmup,
         )

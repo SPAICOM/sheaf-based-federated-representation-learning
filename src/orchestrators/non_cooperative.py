@@ -15,10 +15,31 @@ from src.communication.alignment_mixin import (
     PostTrainingAlignmentMixin,
 )
 from src.orchestrators.base_orchestrator import BaseOrchestrator
+from src.utils.anchors import VALID_PAIRED_ANCHOR_SELECTIONS
 
 
 class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
-    """Independent local-training baseline with shared evaluation logging."""
+    """Independent local-training baseline with shared evaluation logging.
+
+    Post-hoc alignment for the communication-accuracy evaluation supports
+    the mixin's three methods: 'general' (least-squares), 'procrustes'
+    (semi-orthogonal), and 'relative' — zero-shot anchor frames, where the
+    sender's anchors act as the analysis operator and the pseudo-inverse of
+    the receiver's anchors as the synthesis operator (relative
+    representations; no map is fitted).  All three fit on the same edge
+    *anchors*, reduced from the matched pilot pool exactly as SheafFRL does
+    at train time, so one override set sweeps the anchor budget/strategy
+    across a SheafFRL run and this baseline alike: ``anchor_selection``
+    ('all' | 'random' | 'proto_class' | 'proto_kmeans', one-shot here — see
+    :func:`~src.utils.anchors.select_paired_anchors`), ``num_anchors``,
+    ``protos_per_class``.  ``anchor_parseval_normalize`` left at its default
+    (``None``) auto-picks True for 'relative' (the analysis/synthesis
+    pairing is what Parseval frames are for, Fiorellino et al. 2025) and
+    False for 'general'/'procrustes' (there the anchors only ever feed a
+    least-squares/SVD fit — prewhitening an already-whitened, possibly
+    small anchor subset is redundant at best); an explicit True/False
+    overrides this for every method.
+    """
 
     def __init__(
         self,
@@ -26,6 +47,10 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         neighbors: dict[int, set[int]],
         optimizer: Any,
         alignment_method: str = 'general',
+        anchor_selection: str = 'all',
+        num_anchors: int = 128,
+        protos_per_class: int = 1,
+        anchor_parseval_normalize: bool | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -40,6 +65,15 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
                 f"Unknown alignment_method '{alignment_method}'. "
                 f'Valid options: {VALID_ALIGNMENT_METHODS}'
             )
+        if str(anchor_selection) not in VALID_PAIRED_ANCHOR_SELECTIONS:
+            raise ValueError(
+                f"Unknown anchor_selection '{anchor_selection}'. "
+                f'Valid options: {list(VALID_PAIRED_ANCHOR_SELECTIONS)}'
+            )
+        if int(num_anchors) < 1:
+            raise ValueError('num_anchors must be at least 1')
+        if int(protos_per_class) < 1:
+            raise ValueError('protos_per_class must be at least 1')
         self.save_hyperparameters(ignore=['agents'])
 
     def on_train_epoch_end(self) -> None:

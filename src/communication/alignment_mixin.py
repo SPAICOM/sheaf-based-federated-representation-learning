@@ -13,21 +13,36 @@ from src.communication.whitening import (
     common_pilot_indices,
     fit_alignment,
     fit_procrustes,
+    fit_relative_alignment,
     fit_whitening,
     whiten,
 )
+from src.utils.anchors import select_paired_anchors
 
-VALID_ALIGNMENT_METHODS = ('general', 'procrustes')
+VALID_ALIGNMENT_METHODS = ('general', 'procrustes', 'relative')
 
 
 class PostTrainingAlignmentMixin:
     """Mixin that adds post-hoc whitening + alignment to any BaseOrchestrator.
 
     Concrete classes must still implement on_train_epoch_end and _shared_eval.
-    The alignment_method hparam (saved by the subclass) controls whether maps
-    are general (least-squares) or procrustes (semi-orthogonal).  When
-    alignment_method is None the send_message falls back to identity, so this
-    mixin is safe to inherit in orchestrators with optional alignment.
+    The alignment_method hparam (saved by the subclass) controls how each
+    edge's map is obtained: 'general' (least-squares), 'procrustes'
+    (semi-orthogonal), or 'relative' (zero-shot anchor frames — no fit at
+    all; the whitened pilot anchors act as the analysis operator on the
+    sender and their pseudo-inverse as the synthesis operator on the
+    receiver, relative-representation style).  When alignment_method is None
+    the send_message falls back to identity, so this mixin is safe to
+    inherit in orchestrators with optional alignment.
+
+    All three methods fit on the same edge *anchors*, not necessarily the
+    full matched-pilot pool: ``anchor_selection`` reduces the matched rows
+    exactly as SheafFRL does at train time ('all' | 'random' | 'proto_class'
+    | 'proto_kmeans', with ``num_anchors`` / ``protos_per_class``), so a
+    Procrustes/general baseline can be swept over the same anchor budget and
+    strategy as a SheafFRL run for a like-for-like comparison. See
+    ``BaseOrchestrator._alignment_anchor_kwargs`` for the knobs, including
+    the per-method ``anchor_parseval_normalize`` default.
     """
 
     @torch.no_grad()
@@ -37,10 +52,21 @@ class PostTrainingAlignmentMixin:
         Steps:
           1. Encode each agent's full training set, fit a whitening operator.
           2. Encode each agent's pilot set, whiten with training operator.
-          3. For every *undirected* edge, find common pilot samples and fit
-             exactly one map M_{receiver←sender} using the configured method:
+          3. For every *undirected* edge, find common pilot samples, reduce
+             them to this edge's anchors via ``select_paired_anchors``
+             (``_alignment_anchor_kwargs`` — same ``anchor_selection`` /
+             ``num_anchors`` / ``protos_per_class`` SheafFRL uses at train
+             time, plus a per-method ``anchor_parseval_normalize`` default),
+             and fit exactly one map M_{receiver←sender} on those anchors
+             using the configured method:
              - 'general'    : unconstrained least-squares (fit_alignment).
              - 'procrustes' : semi-orthogonal map (fit_procrustes).
+             - 'relative'   : zero-shot anchor frames (fit_relative_alignment)
+               — no fit at all; the anchors themselves become the operators:
+               the sender's anchors analyse (relative representation) and
+               the pseudo-inverse of the receiver's anchors synthesises.
+               The reverse-direction map is the same construction with the
+               two roles swapped, precomputed into ``_relative_reverse_maps``.
              The (sender, receiver) orientation is fixed by latent dimension
              — sender = the endpoint with the larger latent dim, ties broken
              by the larger agent index — the same canonical convention
@@ -72,6 +98,17 @@ class PostTrainingAlignmentMixin:
                     x = _pil_to_tensor(x)
                 xs.append(x)
             return torch.stack(xs)
+
+        def _collate_xy(batch):
+            xs, ys = [], []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImg.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+                y = item[1]
+                ys.append(y if isinstance(y, torch.Tensor) else torch.tensor(y))
+            return torch.stack(xs), torch.stack(ys)
 
         # Step 1 — fit whitening on training latents.
         self._train_whitening_ops: dict[int, WhiteningOp] = {}
@@ -107,8 +144,11 @@ class PostTrainingAlignmentMixin:
         if not self._train_whitening_ops:
             return False
 
-        # Step 2 — encode pilot latents, whiten with training operators.
+        # Step 2 — encode pilot latents (+ labels, for the 'relative'
+        # method's proto_class anchor selection), whiten with training
+        # operators.
         pilot_Z: dict[int, torch.Tensor] = {}
+        pilot_y: dict[int, torch.Tensor] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -120,6 +160,7 @@ class PostTrainingAlignmentMixin:
             if pilot_ds is None or len(pilot_ds) == 0:
                 d = self._train_whitening_ops[idx].W.shape[0]
                 pilot_Z[idx] = torch.empty(0, d)
+                pilot_y[idx] = torch.empty(0, dtype=torch.long)
                 continue
 
             loader = torch.utils.data.DataLoader(
@@ -127,23 +168,26 @@ class PostTrainingAlignmentMixin:
                 batch_size=256,
                 shuffle=False,
                 num_workers=0,
-                collate_fn=_collate_x,
+                collate_fn=_collate_xy,
             )
             was_training = agent.training
             agent.eval()
-            Zs = []
-            for x_batch in loader:
+            Zs, ys = [], []
+            for x_batch, y_batch in loader:
                 Zs.append(
                     agent.encode(x_batch.to(self.device)).detach().cpu().float()
                 )
+                ys.append(y_batch.cpu())
             agent.train(was_training)
 
             if Zs:
                 Z_pilot = torch.cat(Zs, dim=0)
                 pilot_Z[idx] = whiten(Z_pilot, self._train_whitening_ops[idx])
+                pilot_y[idx] = torch.cat(ys, dim=0)
             else:
                 d = self._train_whitening_ops[idx].W.shape[0]
                 pilot_Z[idx] = torch.empty(0, d)
+                pilot_y[idx] = torch.empty(0, dtype=torch.long)
 
         # Step 3 — fit one alignment map per undirected edge.
         method = str(getattr(self.hparams, 'alignment_method', 'general'))
@@ -157,6 +201,11 @@ class PostTrainingAlignmentMixin:
         self._alignment_maps: dict[int, dict[int, torch.Tensor]] = {
             idx: {} for idx in pilot_Z
         }
+        # 'relative' only: maps for each edge's non-canonical direction,
+        # keyed by the canonical (sender, receiver) pair.  Kept out of
+        # _alignment_maps so misalignment-loss scoring still sees exactly one
+        # direction per edge (see _directed_alignment_map).
+        self._relative_reverse_maps: dict[tuple[int, int], torch.Tensor] = {}
 
         any_fitted = False
         seen_edges: set[frozenset[int]] = set()
@@ -192,13 +241,24 @@ class PostTrainingAlignmentMixin:
 
                 X_i = pilot_Z[sender_idx][idx_i]
                 X_j = pilot_Z[receiver_idx][idx_j]
+                A_s, A_r = select_paired_anchors(
+                    X_i,
+                    X_j,
+                    labels=pilot_y[sender_idx][idx_i],
+                    **self._alignment_anchor_kwargs(method),
+                )
 
-                if method == 'procrustes':
-                    M = fit_procrustes(X_i, X_j)
+                if method == 'relative':
+                    M = fit_relative_alignment(A_s, A_r)
+                    self._relative_reverse_maps[(sender_idx, receiver_idx)] = (
+                        fit_relative_alignment(A_r, A_s)
+                    )
+                elif method == 'procrustes':
+                    M = fit_procrustes(A_s, A_r)
                 else:
-                    # fit_alignment returns A s.t. X_i @ A.T ≈ X_j;
+                    # fit_alignment returns A s.t. A_s @ A.T ≈ A_r;
                     # store as right-multiply M = A.T.
-                    M = fit_alignment(X_i, X_j).T
+                    M = fit_alignment(A_s, A_r).T
 
                 self._alignment_maps[sender_idx][receiver_idx] = M
                 any_fitted = True
@@ -219,9 +279,12 @@ class PostTrainingAlignmentMixin:
         edge (see ``_fit_alignment_maps``); when queried in the opposite
         orientation, that single map is inverted instead — ``M.T`` for
         ``alignment_method == 'procrustes'`` (semi-orthogonal, so the
-        transpose is exact) or ``pinv(M)`` otherwise — exactly mirroring
-        ``SheafFRL.send_message``'s ``V.T``/``pinv(V)`` fallback for the
-        edge's non-canonical direction. When alignment_method is None or no
+        transpose is exact) or ``pinv(M)`` for ``'general'`` — exactly
+        mirroring ``SheafFRL.send_message``'s ``V.T``/``pinv(V)`` fallback
+        for the edge's non-canonical direction.  ``'relative'`` needs no
+        inversion at all: its reverse map is the same anchor construction
+        with the analysis/synthesis roles swapped, precomputed at fit time
+        into ``_relative_reverse_maps``. When alignment_method is None or no
         maps have been fitted, the method degrades to identity (returns
         Z_sender).
 
@@ -245,14 +308,21 @@ class PostTrainingAlignmentMixin:
 
         M = alignment_maps.get(sender_idx, {}).get(receiver_idx)
         if M is None:
-            M_rev = alignment_maps.get(receiver_idx, {}).get(sender_idx)
-            if M_rev is not None:
-                method = str(getattr(self.hparams, 'alignment_method', 'general'))
-                M = (
-                    M_rev.T
-                    if method == 'procrustes'
-                    else torch.linalg.pinv(M_rev)
+            method = str(getattr(self.hparams, 'alignment_method', 'general'))
+            if method == 'relative':
+                # Reverse map precomputed at fit time, keyed by the edge's
+                # canonical (sender, receiver) orientation.
+                M = getattr(self, '_relative_reverse_maps', {}).get(
+                    (receiver_idx, sender_idx)
                 )
+            else:
+                M_rev = alignment_maps.get(receiver_idx, {}).get(sender_idx)
+                if M_rev is not None:
+                    M = (
+                        M_rev.T
+                        if method == 'procrustes'
+                        else torch.linalg.pinv(M_rev)
+                    )
 
         dev = Z_sender.device
 
@@ -271,6 +341,7 @@ class PostTrainingAlignmentMixin:
     def _cleanup_alignment(self) -> None:
         self._train_whitening_ops = {}
         self._alignment_maps = {}
+        self._relative_reverse_maps = {}
 
     def _whiten_own_latents(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
         """Whiten with this agent's own post-hoc-fitted training-set operator."""

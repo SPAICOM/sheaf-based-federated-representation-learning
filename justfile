@@ -126,8 +126,21 @@ plot-hetero-bottleneck *args="":
 
 # Plot the multi_hetero_agents_true project (comm-vs-shift, training curves, tables)
 plot-hetero *args="":
-    uv run scripts/plot_multiagent_metrics.py --project shift_distr_lr0.05 {{args}}
+    uv run scripts/plot_multiagent_metrics.py --project shift_distr {{args}}
+
+# Plot the per-agent degree distribution behind just plot-hetero's weighted-mean estimator
+plot-degree *args="":
+    uv run scripts/plot_degree_distribution.py {{args}}
+
+# Plot the netowrk_analysis_sfrl sweep (comm/private accuracy vs graph density)
+plot-network *args="":
+    uv run scripts/plot_network_density_metrics.py --project netowrk_analysis_sfrl {{args}}
 
 # Plot the multi_homo_agents_true project (own out_dir so hetero plots aren't overwritten)
 plot-homo *args="":
     uv run scripts/plot_multiagent_metrics.py --project multi_homo --out_dir results/multi_agent/plots_homo {{args}}
+
+# Network complete ablation study
+network-ablation exp_args="" plot_args="":
+    uv run scripts/multi_agent_experiment.py --config-name=multiagent_mnist_network_analyisis {{exp_args}}
+    just plot-network {{plot_args}}

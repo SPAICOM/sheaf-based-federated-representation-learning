@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -109,11 +110,28 @@ def _bottleneck_dim(raw_config: dict[str, Any]) -> float | None:
     return None
 
 
+def _shift_strength(raw_config: dict[str, Any]) -> float | None:
+    """Return ``dataset.shift_strength`` from a run's stored config."""
+    dataset = _unwrap(raw_config, 'dataset')
+    if not isinstance(dataset, dict):
+        return None
+    shift = dataset.get('shift_strength')
+    return float(shift) if isinstance(shift, (int, float)) else None
+
+
 def discover_runs(
     wandb_dir: Path,
     project: str | None,
+    shift_strength: float | None = None,
 ) -> dict[tuple[str, float], dict[str, Any]]:
-    """Return {(orch, bottleneck_dim): meta} keeping the latest completed run."""
+    """Return {(orch, bottleneck_dim): meta} keeping the latest completed run.
+
+    When ``shift_strength`` is given, runs whose ``dataset.shift_strength``
+    doesn't match (within a small tolerance, for float round-tripping) are
+    skipped — the sweep has been run at more than one shift strength, and
+    mixing those into the same ``(orch, dim)`` cell would silently blend
+    incomparable runs.
+    """
     best: dict[tuple[str, float], dict[str, Any]] = {}
     for run_dir in sorted(wandb_dir.glob('run-*')):
         if project is not None and read_run_project(run_dir) != project:
@@ -130,6 +148,12 @@ def discover_runs(
         dim = _bottleneck_dim(raw)
         if orch_name is None or dim is None:
             continue
+        if shift_strength is not None:
+            shift = _shift_strength(raw)
+            if shift is None or not math.isclose(
+                shift, shift_strength, abs_tol=1e-6
+            ):
+                continue
 
         summ_path = run_dir / 'files' / 'wandb-summary.json'
         if not summ_path.exists():
@@ -155,6 +179,7 @@ def discover_runs_remote(
     api: Any,
     entity: str,
     project: str,
+    shift_strength: float | None = None,
 ) -> dict[tuple[str, float], dict[str, Any]]:
     """Same contract as :func:`discover_runs`, scanning a wandb cloud project.
 
@@ -181,6 +206,12 @@ def discover_runs_remote(
         dim = _bottleneck_dim(raw)
         if orch_name is None or dim is None:
             return None
+        if shift_strength is not None:
+            shift = _shift_strength(raw)
+            if shift is None or not math.isclose(
+                shift, shift_strength, abs_tol=1e-6
+            ):
+                return None
         summary = dict(run.summary)
         if 'test/avg_comm_task_perf' not in summary:
             return None
@@ -242,6 +273,15 @@ def main() -> None:
         'one figure (shared legend on top, 3 columns) instead of two '
         'separate figures.',
     )
+    parser.add_argument(
+        '--shift_strength',
+        type=float,
+        default=0.7,
+        help='Only keep runs whose dataset.shift_strength matches this value '
+        '(the sweep has been run at more than one shift strength; mixing '
+        'them into the same orchestrator/bottleneck-dim cell would blend '
+        'incomparable runs).',
+    )
     args = parser.parse_args()
 
     project = None if args.project.lower() == 'none' else args.project
@@ -261,12 +301,22 @@ def main() -> None:
                 'No wandb entity available for the remote fetch (pass '
                 '--entity, or run `wandb login`).'
             )
-        print(f'Scanning wandb cloud project {entity}/{project!r} …')
-        return discover_runs_remote(api, entity, project)
+        print(
+            f'Scanning wandb cloud project {entity}/{project!r} '
+            f'(shift_strength={args.shift_strength:g}) …'
+        )
+        return discover_runs_remote(
+            api, entity, project, shift_strength=args.shift_strength
+        )
 
     if args.local:
-        print(f'Scanning {args.wandb_dir} (project={project!r}) …')
-        runs = discover_runs(args.wandb_dir, project)
+        print(
+            f'Scanning {args.wandb_dir} (project={project!r}, '
+            f'shift_strength={args.shift_strength:g}) …'
+        )
+        runs = discover_runs(
+            args.wandb_dir, project, shift_strength=args.shift_strength
+        )
         if not runs and project is not None:
             print(
                 f'No completed local runs found in {args.wandb_dir} — '
@@ -278,15 +328,16 @@ def main() -> None:
 
     if not runs:
         raise SystemExit(
-            f'No completed runs found for project {project!r} '
+            f'No completed runs found for project {project!r} at '
+            f'shift_strength={args.shift_strength:g} '
             f'({"local" if args.local else "remote"}).'
         )
 
-    runs = {(o, dim): meta for (o, dim), meta in runs.items() if dim != 4}
+    runs = {(o, dim): meta for (o, dim), meta in runs.items() if dim >= 16}
     if not runs:
         raise SystemExit(
             f'No completed runs left for project {project!r} after '
-            f'excluding bottleneck dim 4.'
+            f'excluding bottleneck dims below 16.'
         )
 
     runs = drop_excluded_orchs(runs)
@@ -311,6 +362,8 @@ def main() -> None:
         'xscale': 'log',
         'xticklabel_fmt': lambda x: str(int(x)),
         'xticklabel_rotation': 45,
+        'adjusted': False,
+        'show_error': False,
     }
     comm_df = _agent_metric_long_df(
         runs, _AGENT_COMM_RE, 'comm_task_perf', x_col='bottleneck_dim'
@@ -332,6 +385,10 @@ def main() -> None:
             markers,
             args.out_dir,
             'comm_and_priv_task_perf_vs_bottleneck_dim.png',
+            legend_loc='inside',
+            legend_anchor='lower right',
+            comm_estimator='mean',
+            priv_estimator='mean',
             **x_kwargs,
         )
     else:
@@ -345,6 +402,7 @@ def main() -> None:
             'comm_task_perf_vs_bottleneck_dim.png',
             'comm_task_perf',
             'Avg. communication accuracy',
+            estimator='mean',
             **x_kwargs,
         )
         print('\nPlot 2: private task performance vs bottleneck dim …')
@@ -357,6 +415,7 @@ def main() -> None:
             'private_task_perf_vs_bottleneck_dim.png',
             'private_task_perf',
             'Avg. private accuracy',
+            estimator='mean',
             **x_kwargs,
         )
 

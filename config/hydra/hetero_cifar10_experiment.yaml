@@ -103,7 +103,6 @@ orchestrator:
   parseval_normalization: true
   l2_normalization: false
   #filter_unseen_classes: false  
-  use_prototypes: false
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch

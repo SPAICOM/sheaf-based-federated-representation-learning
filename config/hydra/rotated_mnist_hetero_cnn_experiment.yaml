@@ -133,7 +133,6 @@ orchestrator:
   l2_normalization: false
   #local_steps: 1
   update_v_every_n_epochs: 1
-  use_prototypes: false
   sparse_communication: False
   sparse_epsilon: 1e-6
 

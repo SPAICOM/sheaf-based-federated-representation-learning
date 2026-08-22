@@ -39,7 +39,6 @@ orchestrator:
   local_steps: 1
   parseval_normalization: true
   l2_normalization: false
-  use_prototypes: false
 
 dataset:
   split_strategy: non_iid_with_margin

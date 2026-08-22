@@ -24,11 +24,12 @@ CSV="$LOGDIR/trace_${STAMP}.csv"
 SUMMARY="$LOGDIR/summary_${STAMP}.txt"
 echo "timestamp,gamma,proc_rss_mb,gpu_used_mb,sys_available_mb" > "$CSV"
 
-# Gammas to try, ascending from the confirmed-safe ceiling (~3e-3 on this
-# 15-agent/84-edge graph). Override by passing your own list as args.
+# Gammas to try, log-spaced from clearly-safe up past the expected ceiling,
+# so the resulting curve has enough rising points before it crashes to be
+# worth plotting. Override by passing your own list as args.
 GAMMAS=("$@")
 if [ ${#GAMMAS[@]} -eq 0 ]; then
-  GAMMAS=(0.003 0.004 0.005 0.007 0.01 0.015 0.02 0.03)
+  GAMMAS=(0.0001 0.0003 0.001 0.002 0.003 0.005 0.007 0.01 0.015 0.02 0.03 0.05)
 fi
 
 MIN_AVAILABLE_MB=3000  # self-kill if system available RAM drops below this
@@ -39,11 +40,16 @@ for GAMMA in "${GAMMAS[@]}"; do
   echo "=== gamma=$GAMMA ===" | tee -a "$SUMMARY"
   RUNLOG="$LOGDIR/run_gamma_${GAMMA}_${STAMP}.log"
 
+  # num_workers=0 and max_epochs=1: the P_ij matrices are all allocated at
+  # construction time (before any epoch runs), so this is the fastest way to
+  # reach peak memory; num_workers=0 also keeps the RSS reading clean (no
+  # DataLoader worker subprocesses inflating memory outside what we measure).
   WANDB_MODE=offline uv run python scripts/multi_agent_experiment.py \
     --config-name multiagent_mnist_shift_distr \
     orchestrator=sheaf_fmtl \
     "orchestrator.gamma=$GAMMA" \
-    trainer.max_epochs=2 \
+    trainer.max_epochs=1 \
+    dataset.num_workers=0 \
     lmb_study.enabled=false \
     hydra.mode=RUN \
     > "$RUNLOG" 2>&1 &
