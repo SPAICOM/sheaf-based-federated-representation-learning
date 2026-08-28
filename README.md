@@ -1,4 +1,4 @@
-# REPO TITLE
+# Sheaf-Based Federated Representation Learning
 
 
 <h5 align="center">
@@ -12,7 +12,9 @@
 </h5>
 
 > [!TIP]
-> 
+> Heterogeneous federated systems require agents to learn and exchange informative representations despite differences in data distributions, sensing modalities, model architectures, latent dimensionalities, and local learning objectives. To address this challenge, we propose Sheaf-based Federated Representation Learning (SFRL), a general framework that jointly optimizes local objectives with a manifold-constrained geometric alignment regularizer based on learnable sheaf restriction maps. Unlike most existing approaches, SFRL does not assume a shared global latent space. Instead, global consistency emerges from the alignment of neighboring latent representations through orthogonal transformations and isometric embeddings. This alignment is enforced by a quadratic gluing regularizer induced by the sheaf Laplacian, whose learnable restriction maps adapt the geometry to the observed data.
+The penalty is evaluated on a small set of shared pilot samples, ensuring scalability and communication efficiency. We develop a decentralized algorithm for solving SFRL, termed Sheaf-FRL, which alternates between gradient updates of the local models and closed-form Procrustes updates of the edge-wise restriction maps. We further establish convergence of Sheaf-FRL to first-order stationary points in both deterministic and stochastic settings. As an application, we consider a cooperative classification task in the context of semantic communication, under model and data heterogeneity.
+Our results show that Sheaf-FRL outperforms baseline approaches in terms of local and post-communication classification accuracy across different levels of local distribution shift and exhibits greater robustness to latent-space dimensionality compression.
 
 ## Dependencies
 
@@ -41,22 +43,6 @@ The `setup` recipe will:
 - Install all project dependencies using `uv`
 
 After the command completes, the development environment will be ready to use. 🚀
-
-## Current Implementation Notes
-
-The most recent federated-learning changes are:
-
-- `SheafFRL` now exposes `anchor_strategy` with two supported modes:
-  - `pilots`: uses the shared pilot loaders already aligned by pilot sample ids; `use_prototypes=true` compresses each pilot batch to one prototype per observed class before alignment.
-  - `batch_anchors`: reuses each agent's current task-batch latents, compresses them immediately to per-class prototypes, logs communication on those prototype payloads, and aligns neighboring agents by class labels across independent local batches.
-- During training, `SheafFRL` computes the sheaf penalty with the current frozen Stiefel matrices `V`; the matrices themselves are updated only in `on_train_epoch_end()` from the cached training anchors accumulated during the epoch.
-- `ClassificationDataModule` now supports `split_strategy=non_iid_with_margin`, which assigns every agent exactly `K` classes while ensuring every global class is assigned to at least one agent. For each assigned class, the partitioner reserves a safety margin of samples before applying the skewed allocation, and it uses the same partitioner for train, validation, and test. `starve_clients=true` still subsamples only the training split afterward.
-
-For more detailed module-level documentation, see:
-
-- [`src/orchestrators/README.md`](src/orchestrators/README.md)
-- [`src/datamodules/README.md`](src/datamodules/README.md)
-- [`src/utils/README.md`](src/utils/README.md)
 
 ## Citation
 
