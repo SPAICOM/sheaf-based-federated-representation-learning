@@ -16,13 +16,21 @@ learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for close
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
-# ── Per-edge anchor selection: what gets aligned each communication step ──────
-#   all          — every matched, class-filtered pilot row (default)
-#   random       — a fresh random subset of size num_anchors, resampled every step
-#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype per
-#                  class present on the edge, à la FedProto
-#   proto_kmeans — unsupervised: k-means (K=num_anchors) fit once on the edge's
-#                  canonical higher-dim node, assignment reused for the rest of training
+# ── Per-edge anchor selection ─────────────────────────────────────────────────
+# At every map refresh the candidate pool is the FULL pilot split
+# (class-filtered per edge, matched by sample id); the map is fit on the
+# selected anchors.  Per training step:
+#   all          — map fit on every matched pilot; the step penalty consumes the
+#                  rotating pilot batch (an epoch cycles the whole pool; each
+#                  step's exchanged batch latents are counted as communication)
+#   random       — num_anchors rows subsampled from the pool once per refresh;
+#                  the step penalty re-encodes exactly those rows (budgeted
+#                  once-per-window communication)
+#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype
+#                  per class, à la FedProto; step penalty uses batch prototypes
+#   proto_kmeans — k-means (K=num_anchors) refit on the whitened matched pool
+#                  at every refresh; step penalty averages the batch under the
+#                  window's assignment
 anchor_selection: all
 num_anchors: 32          # edge anchor budget: subset size (random) / K (proto_kmeans)
 protos_per_class: 1      # only used by proto_class
@@ -51,13 +59,14 @@ compression_admm_rel_tol: 1e-2  # ε_rel: relative tolerance (only used when com
 compression_admm_max_iter: 500  # k_max: iteration cap when running to convergence
                                 # (nonconvex SOC: the dual residual can plateau; the cap guards that)
 
-# ── Decoupled three-phase schedule (communication-efficient; inherited from CESheafFRL) ─
-# Each outer iteration: T_C Phase-C epochs (compressed coboundary every step, maps
-# refreshed via SOC-ADMM at each Phase-C epoch end), then T_A Phase-A
-# epochs (NO pilot exchange: frozen neighbour pilots cached over the last Phase-C
-# epoch, maps held fixed). Cycle = T_C + T_A.
-phase_c_epochs: 1   # T_C: per-step (classical compressed) epochs per outer iteration
-phase_a_epochs: 1   # T_A: communication-free (frozen-pilot) epochs per outer iteration
+# ── Decoupled local/collaborative schedule (communication-efficient; inherited from CESheafFRL) ─
+# Each cycle: collab_epochs collaborative epochs (compressed coboundary every step,
+# maps refreshed via SOC-ADMM at each collaborative epoch end), then local_epochs
+# local epochs (NO pilot exchange: frozen neighbour pilots cached over the last
+# collaborative epoch, maps held fixed). Cycle = collab_epochs + local_epochs.
+collab_epochs: 1    # collaborative (communication) epochs per cycle  (was phase_c_epochs)
+local_epochs: 1     # communication-free local epochs per cycle       (was phase_a_epochs)
+local_reg: false    # during local epochs: false = pure local task, true = pull toward frozen neighbours
 
 # Information-theoretic PID logging (Liang et al. 2023).
 pid_logging: True

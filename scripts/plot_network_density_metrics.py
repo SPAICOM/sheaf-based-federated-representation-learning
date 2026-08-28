@@ -31,14 +31,16 @@ per orchestrator:
     2. ``test/avg_private_task_perf`` (private task performance)
 
 Both reuse the plotting machinery of ``plot_multiagent_metrics.py``
-(:func:`plot_metric_vs_x` / :func:`plot_two_metrics_vs_x`), so colors, markers,
-legend and error bands are identical to the shift-strength and bottleneck
+(:func:`plot_metric_vs_x` / :func:`plot_two_metrics_vs_x`), so colors,
+markers and legend are identical to the shift-strength and bottleneck
 figures: the comm curve is the per-agent **degree-weighted mean**
 (``--comm-estimator``, weighting each agent by its share of total graph
 degree — which itself changes as the graph densifies) and the private curve
-the plain **mean** (``--priv-estimator``), each wrapped in a translucent
-percentile-interval band across agents (``--errorbar-pi``, default the full
-min-max range). Pass ``--together`` to draw both panels in one figure.
+the plain **mean** (``--priv-estimator``). The per-agent spread is hidden by
+default (``--errorbar-pi 0``); pass e.g. ``--errorbar-pi 100`` for a
+translucent band spanning the full min-max range, or ``--errorbar-pi 50``
+for the interquartile range. Pass ``--together`` to draw both panels in one
+figure.
 
 Alongside the figures it writes, per metric, the mean/std summary CSV, plus
 ``graph_density.csv`` — the ``max_edge_frac`` → realized ``density`` mapping
@@ -423,10 +425,10 @@ def main() -> None:
     parser.add_argument(
         '--errorbar-pi',
         type=float,
-        default=100.0,
-        help='Percentile-interval width (0-100) drawn around each line, e.g. '
-        '100 (default) spans the full min-max range across agents, 50 the '
-        'interquartile range. Pass 0 to hide the interval entirely.',
+        default=0.0,
+        help='Percentile-interval width (0-100) drawn around each line. 0 '
+        '(default) hides the interval entirely; e.g. 100 spans the full '
+        'min-max range across agents, 50 the interquartile range.',
     )
     args = parser.parse_args()
     errorbar = ('pi', args.errorbar_pi) if args.errorbar_pi > 0 else None
@@ -549,7 +551,7 @@ def main() -> None:
             markers,
             args.out_dir,
             f'comm_and_priv_task_perf_vs_{args.x_source}.png',
-            legend_loc='inside',
+            legend_loc='right',
             legend_anchor='lower left',
             comm_estimator=args.comm_estimator,
             priv_estimator=args.priv_estimator,

@@ -16,13 +16,21 @@ learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for close
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
-# ── Per-edge anchor selection: what gets aligned each communication step ──────
-#   all          — every matched, class-filtered pilot row (default)
-#   random       — a fresh random subset of size num_anchors, resampled every step
-#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype per
-#                  class present on the edge, à la FedProto
-#   proto_kmeans — unsupervised: k-means (K=num_anchors) fit once on the edge's
-#                  canonical higher-dim node, assignment reused for the rest of training
+# ── Per-edge anchor selection ─────────────────────────────────────────────────
+# At every map refresh the candidate pool is the FULL pilot split
+# (class-filtered per edge, matched by sample id); the map is fit on the
+# selected anchors.  Per training step:
+#   all          — map fit on every matched pilot; the step penalty consumes the
+#                  rotating pilot batch (an epoch cycles the whole pool; each
+#                  step's exchanged batch latents are counted as communication)
+#   random       — num_anchors rows subsampled from the pool once per refresh;
+#                  the step penalty re-encodes exactly those rows (budgeted
+#                  once-per-window communication)
+#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype
+#                  per class, à la FedProto; step penalty uses batch prototypes
+#   proto_kmeans — k-means (K=num_anchors) refit on the whitened matched pool
+#                  at every refresh; step penalty averages the batch under the
+#                  window's assignment
 anchor_selection: all
 num_anchors: 32          # edge anchor budget: subset size (random) / K (proto_kmeans)
 protos_per_class: 1      # only used by proto_class
@@ -35,9 +43,16 @@ filter_unseen_classes: False
 comm_task_coeff: 1.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
 
-# ── Decoupled three-phase schedule (communication-efficient) ──────────────────
-phase_c_epochs: 1   # T_C: classical SheafFRL epochs per outer iteration
-phase_a_epochs: 2   # T_A: communication-free (frozen-pilot) epochs per outer iteration
+# ── Decoupled local/collaborative schedule (communication-efficient) ──────────
+# Each cycle runs `collab_epochs` collaborative (classical SheafFRL, communicating)
+# epochs then `local_epochs` communication-free local epochs; the collaborative
+# fraction sets how often agents communicate (swept by the comm_frac ablation).
+collab_epochs: 1    # collaborative (communication) epochs per cycle  (was phase_c_epochs)
+local_epochs: 2     # communication-free local epochs per cycle       (was phase_a_epochs)
+# During local epochs the sheaf regularization disappears by default (pure local
+# task training); local_reg: true instead pulls each node toward the rotated,
+# whitened representations its neighbours sent during the last collaborative epoch.
+local_reg: false
 
 # Information-theoretic PID logging (Liang et al. 2023).
 pid_logging: True

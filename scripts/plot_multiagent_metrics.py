@@ -12,13 +12,14 @@ built — edit that set directly to bring one back. Either way it produces:
 
   1. ``test/avg_comm_task_perf`` vs ``shift_strength``, one curve per
      orchestrator, and a companion figure of ``test/avg_private_task_perf``
-     vs ``shift_strength`` the same way. ComFed is left out of this plot by
-     default — it sits far below the others and squashes the y-axis; its
-     numbers instead go in the dedicated ComFed table (part 4 below). Pass
-     ``--include-comfed`` to draw it here anyway. Pass ``--together`` to
-     draw the two metrics side by side in one figure (same per-panel
-     proportions as the standalone plots) with a single shared legend drawn
-     inside the left panel, instead of two separate figures.
+     vs ``shift_strength`` the same way. ComFed is included in this plot by
+     default; pass ``--exclude-comfed`` to drop it — it sits far below the
+     others and can squash the y-axis — its numbers are always available
+     separately in the dedicated ComFed table (part 4 below) either way.
+     Pass ``--together`` to draw the two metrics side by side in one figure
+     (same per-panel proportions as the standalone plots) with a single
+     shared legend drawn inside the left panel, instead of two separate
+     figures.
      By default the comm-task-perf line is each orchestrator's per-agent
      **degree-weighted mean** (``--comm-estimator weighted_mean``, the
      default — each agent weighted by its share of total communication-graph
@@ -26,10 +27,10 @@ built — edit that set directly to bring one back. Either way it produces:
      stored graph config) and the private-task-perf line is the plain
      **mean** (``--priv-estimator mean``, the default, unweighted); pass
      ``mean``/``median``/``weighted_mean`` to either flag to change it. The
-     spread across agents is a **percentile interval spanning the full
-     min-max range** (``--errorbar-pi 100``, the default; pass e.g.
-     ``--errorbar-pi 50`` for the interquartile range, or ``--errorbar-pi 0``
-     to hide the interval), drawn as a light translucent ``fill_between``
+     spread across agents is a **percentile interval** (``--errorbar-pi``,
+     default ``0`` — hidden; pass e.g. ``--errorbar-pi 100`` for a band
+     spanning the full min-max range, or ``--errorbar-pi 50`` for the
+     interquartile range), drawn as a light translucent ``fill_between``
      band around the line so overlapping bands stay legible. Points sit
      exactly on the shared shift value (no dodge) by default; pass
      ``adjusted=True`` to instead dodge each orchestrator's points slightly
@@ -57,8 +58,8 @@ built — edit that set directly to bring one back. Either way it produces:
 
   4. A dedicated ComFed table (printed + CSV + markdown), one row per
      ``shift_strength``, with its avg. comm + private task perf (± std
-     across agents) — since ComFed is excluded from the plots above, this is
-     the only place its accuracy across shifts is visible.
+     across agents) — this gives its accuracy across shifts in one place
+     even when it's also drawn in the plots above.
 
 Parameter counting
 ------------------
@@ -1158,11 +1159,22 @@ def plot_metric_vs_x(
     show_error: bool = True,
     estimator: str = 'mean',
     errorbar: tuple[str, float] | None = ('pi', 100),
+    legend_loc: str = 'inside',
+    legend_ncol: int | None = None,
+    legend_anchor: str | None = None,
 ) -> None:
     """Plot ``value_col`` (``estimator`` across agents) vs ``x_col``, one curve per orch.
 
     See :func:`_plot_metric_on_ax` for what ``estimator``/``errorbar``/
-    ``show_error`` control.
+    ``show_error`` control. ``legend_loc`` picks where the legend goes:
+    ``'inside'`` (default) draws it inside the axis — at matplotlib's
+    auto-placed ``'best'`` location, or at ``legend_anchor`` (e.g.
+    ``'center right'``) if given — while ``'outside'`` draws it above the
+    axis instead, wrapped into ``legend_ncol`` columns (default: one row,
+    i.e. ``ncol=len(labels)``) — e.g. ``legend_ncol=2`` with 6 orchestrators
+    lays the legend out as 3 rows of 2 columns (matplotlib fills columns
+    top-to-bottom first); ``legend_anchor`` is ignored there. ``legend_ncol``
+    is ignored when ``legend_loc`` is ``'inside'``.
     """
     with plt.style.context(str(_MPLSTYLE)):
         fig, ax = plt.subplots()
@@ -1185,12 +1197,23 @@ def plot_metric_vs_x(
             errorbar=errorbar,
         )
         handles, labels = ax.get_legend_handles_labels()
-        ax.legend(
-            _strip_errorbar_caps(handles),
-            labels,
-            title='Method',
-            frameon=True,
-        )
+        handles = _strip_errorbar_caps(handles)
+        if legend_loc == 'outside':
+            fig.legend(
+                handles,
+                labels,
+                title='Method',
+                loc='lower center',
+                bbox_to_anchor=(0.5, ax.get_position().y1 + 0.03),
+                ncol=legend_ncol or len(labels),
+                frameon=True,
+                borderaxespad=0.0,
+            )
+        else:
+            legend_kwargs = {'title': 'Method', 'frameon': True}
+            if legend_anchor is not None:
+                legend_kwargs['loc'] = legend_anchor
+            ax.legend(handles, labels, **legend_kwargs)
         sns.despine()
         out = out_dir / fname
         _savefig(fig, out)
@@ -1616,13 +1639,12 @@ def main() -> None:
         'separate figures.',
     )
     parser.add_argument(
-        '--include-comfed',
+        '--exclude-comfed',
         action='store_true',
-        help='Also draw ComFed in Plot 1 (comm/private task perf vs shift) '
-        'alongside the other orchestrators. By default it is left out of '
-        'that plot because its accuracy sits far below the rest and '
-        'squashes the y-axis — it still appears in Plot 2 and the Part 3/4 '
-        'tables either way.',
+        help='Drop ComFed from Plot 1 (comm/private task perf vs shift). It '
+        'is included there by default; pass this flag if its accuracy sits '
+        'too far below the rest and squashes the y-axis — it still appears '
+        'in Plot 2 and the Part 3/4 tables either way.',
     )
     parser.add_argument(
         '--comm-estimator',
@@ -1643,11 +1665,20 @@ def main() -> None:
     parser.add_argument(
         '--errorbar-pi',
         type=float,
-        default=100.0,
+        default=0.0,
         help='Percentile-interval width (0-100) drawn around the Plot 1 '
-        'line, e.g. 100 (default) spans the full min-max range across '
-        'agents, 50 spans the interquartile range. Pass 0 to hide the '
-        'interval entirely.',
+        'line. 0 (default) hides the interval entirely; e.g. 100 spans the '
+        'full min-max range across agents, 50 the interquartile range.',
+    )
+    parser.add_argument(
+        '--comm-legend-middle-left',
+        action='store_true',
+        help="Pin the standalone comm-task-perf figure's legend "
+        "('comm_task_perf_vs_shift.png') inside the axis at the "
+        "middle-left (matplotlib loc='center left') instead of letting "
+        "it auto-place with 'best'. Only takes effect without --together "
+        "(--together draws its own combined figure with its own legend "
+        'handling).',
     )
     args = parser.parse_args()
     errorbar = ('pi', args.errorbar_pi) if args.errorbar_pi > 0 else None
@@ -1726,11 +1757,11 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     sns.set_theme(style='whitegrid', context='paper', font_scale=1.4)
 
-    # ComFed is dropped from the shift plots by default (it sits far below
-    # the other methods and squashes the y-axis) — its own accuracy across
-    # shifts goes in the dedicated table (part 4) instead. Pass
-    # --include-comfed to draw it here too.
-    plot_orchs = orchs if args.include_comfed else [o for o in orchs if o != 'ComFed']
+    # ComFed is included in the shift plots by default; pass
+    # --exclude-comfed to drop it if its accuracy sits far below the other
+    # methods and squashes the y-axis — its own accuracy across shifts is
+    # always in the dedicated table (part 4) too.
+    plot_orchs = orchs if not args.exclude_comfed else [o for o in orchs if o != 'ComFed']
 
     # ── Plot 1: comm + private task performance vs shift ──────────────────────
     print('\nPlot 1: communication + private task performance vs shift …')
@@ -1765,6 +1796,7 @@ def main() -> None:
             adjusted=False,
             estimator=args.comm_estimator,
             errorbar=errorbar,
+            legend_anchor='center left' if args.comm_legend_middle_left else None,
         )
         plot_metric_vs_x(
             priv_df,

@@ -54,45 +54,57 @@ class SheafFRL(BaseOrchestrator):
       exactly 0 once inside it, so warmup and schedules emerge automatically
       and hard (e.g. cross-group) edges receive more weight than easy ones.
 
-    Communication is a *per-edge fixed anchor set*, re-selected every time the
-    alignment map refreshes (:meth:`_rebuild_edge_anchor_caches`, on the same
+    Anchors are re-selected every time the alignment map refreshes
+    (:meth:`_rebuild_edge_anchor_caches`, on the same
     ``update_v_every_n_epochs`` / ``warmup_epochs`` cadence as
-    ``_should_update_maps_at_epoch_end``) — **not** every step.  At each
-    refresh, for every edge, matched pilot rows (already restricted to the
-    union — or, with ``align_on_intersection=True``, the intersection — of the
-    two endpoints' target classes via :meth:`_apply_edge_class_filter`) are
-    reduced by one of four mutually exclusive ``anchor_selection`` strategies
-    into a *fixed set of pilot identities* cached in ``self._edge_anchor_cache``:
+    ``_should_update_maps_at_epoch_end``).  The candidate pool at every
+    refresh is the **full pilot split** (``dm.pilot_datasets``, encoded once
+    per node and whitened with the frozen operators) — per edge it is
+    restricted to the union — or, with ``align_on_intersection=True``, the
+    intersection — of the two endpoints' target classes
+    (:meth:`_apply_edge_class_filter`), matched row-by-row by sample id, and
+    reduced by one of four mutually exclusive ``anchor_selection`` strategies.
+    The selected anchors are recorded as that window's communication and fed
+    straight to the alignment-map fit (:meth:`_fit_edge_map`):
 
-    * **all** (default) — the full matched pool, unchanged;
-    * **random** — exactly ``num_anchors`` rows, subsampled once at the
-      refresh and reused verbatim (same physical samples) for every step
-      until the next refresh;
+    * **all** (default) — every class-filtered matched pilot: the map is fit
+      on the whole pool, and the per-step penalty consumes the *rotating*
+      pilot batch of the current training step (class-filtered and matched
+      per edge), so an epoch iterates the entire feasible pilot set;
+    * **random** — exactly ``num_anchors`` rows, subsampled from the full
+      pool once per refresh and reused verbatim (same physical samples,
+      re-encoded fresh through the current parameters) for every step's
+      penalty until the next refresh — ``num_anchors`` is the total volume
+      communicated per edge per window;
     * **proto_class** — one (or ``protos_per_class``, via within-class
-      k-means) prototype per class present on the edge, à la FedProto — the
-      *membership* of each class group is fixed at the refresh, but its mean
-      is recomputed every step from the members' current encodings;
-    * **proto_kmeans** — unsupervised: k-means (``K=num_anchors``) is fit
-      *once ever* (not every refresh) on the canonical higher-dimensional
-      endpoint's pilots; the resulting sample-id → cluster assignment is
-      cached and reused for the rest of training to induce matching
-      prototypes on the other endpoint by averaging its rows under the same
-      assignment — a one-shot, broadcast-once protocol.
+      k-means) prototype per class, à la FedProto — the map is fit on
+      full-pool prototypes at the refresh, while the per-step penalty builds
+      prototypes from the current rotating pilot batch;
+    * **proto_kmeans** — unsupervised: k-means (``K=num_anchors``) is refit
+      at *every refresh* on the whitened matched pool of the canonical
+      higher-dimensional endpoint; the sample-id → cluster assignment is
+      cached for the window — the map is fit on full-pool cluster
+      prototypes, and the per-step penalty averages the current pilot
+      batch's rows under the window's assignment.
 
-    Between refreshes, every step re-encodes the *same* underlying pilot
-    samples through each agent's current (still-training) parameters
-    (:meth:`_edge_live_anchors`) — values change every step, identities don't
-    — and this fresh re-encoding drives both the per-step sheaf penalty and,
-    at the next refresh, the alignment-map refit itself
-    (:meth:`_fit_edge_map`): the same anchors that were communicated build
-    both.  ``num_anchors`` is therefore the *total* volume communicated per
-    edge per refresh window, not a per-step recurring cost.
+    The per-step SWBN whitening statistics are updated exactly once per node
+    per step, on the rotating pilot batch (:meth:`_shared_eval`); every other
+    whitening application this step (anchor re-encoding, refresh, test) uses
+    the frozen statistics (:meth:`_apply_frozen_whitening`).  With
+    ``anchor_selection='all'`` each training step additionally records the
+    batch latents exchanged per edge, since the penalty consumes fresh rows
+    every step; the budgeted strategies keep the once-per-window accounting.
 
     With ``anchor_parseval_normalize=True`` the selected anchors are further
     prewhitened per side via :func:`~src.utils.anchors.parseval_normalize`
     before the penalty/after-comm terms are computed — most useful for the
     small anchor counts the ``random``/``proto_*`` strategies produce.
     """
+
+    # Anchor caches at or below this many rows store raw input copies;
+    # larger ones store dataset positions and fetch rows on demand
+    # (_fetch_pilot_rows), keeping 'all' caches from copying the pilot split.
+    _CACHE_RAW_X_MAX_ROWS = 1024
 
     def __init__(
         self,
@@ -196,27 +208,32 @@ class SheafFRL(BaseOrchestrator):
             sparse_communication=bool(sparse_communication),
             sparse_epsilon=float(sparse_epsilon),
         )
-        self._latest_pilots: dict[
-            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
-        ] = {}
         self._whitening_ops: dict[int, WhiteningOp] = {}
         # anchor_selection='proto_kmeans' state: per-edge sample-id -> cluster-id
-        # assignment, fit once (lazily, at the first refresh with enough pooled
-        # pilots) and reused for the rest of a fit() call.
+        # assignment, refit at every map refresh (whenever the matched pool
+        # has at least K rows) and reused for the steps of that window.
         self._edge_kmeans_assign: dict[tuple[int, int], dict[int, int]] = {}
-        # Fixed per-edge anchor mechanism (selection cadence == map-refresh
-        # cadence, see class docstring).  All three must exist from
-        # construction, not just on_train_start: Lightning's sanity-check
-        # validation pass runs _shared_eval (and therefore _edge_live_anchors)
-        # *before* on_train_start fires.
-        self._latest_train_pilots: dict[
+        # Current step's whitened pilot-batch latents per node (grad intact):
+        # (Z_whitened, y, sample_ids), consumed by the step-batch penalty path
+        # (_edge_step_anchors) and cleared after every loss computation.
+        self._step_pilot_latents: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
+        # Fixed per-edge anchor mechanism (selection cadence == map-refresh
+        # cadence, see class docstring).  Both must exist from construction,
+        # not just on_train_start: Lightning's sanity-check validation pass
+        # runs _shared_eval (and therefore the anchor paths) *before*
+        # on_train_start fires.
         self._edge_anchor_cache: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         self._frozen_edge_anchors: dict[
             tuple[int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
+        # Rotating-window offsets for _rotating_rows: bounds how many cached
+        # anchor rows _edge_live_anchors re-encodes live in one step, so a
+        # large num_anchors (communication/map-fit budget) can't blow up
+        # per-step, per-edge compute (see _rotating_rows).
+        self._edge_step_offsets: dict[tuple[int, int], int] = {}
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
         self._build_restriction_maps(neighbors, latent_dims_int)
 
@@ -317,7 +334,7 @@ class SheafFRL(BaseOrchestrator):
         applied once by ``_shared_eval``.
 
         Dual mode: returns ``λ_e · P̂_e`` and records ``P̂_e`` for the
-        post-step dual update.  Phase-A frozen penalties contribute two
+        post-step dual update.  Local-epoch frozen penalties contribute two
         terms per edge (one per live endpoint); both estimate the same edge
         residual, so their recordings are averaged.
         """
@@ -384,17 +401,31 @@ class SheafFRL(BaseOrchestrator):
             layer.train(was_training)
 
     def _whiten_node_pilots(self, idx: int, A: torch.Tensor) -> torch.Tensor:
-        """Whiten node ``idx``'s pilot latents **once** (independent of degree).
+        """Whiten node ``idx``'s pilot latents **once per step**, updating SWBN.
 
-        Whitening is row-wise, so it commutes with the per-edge row matching:
-        whitening up-front (one call per node) gives the same result as the old
-        per-edge whitening while updating the SWBN layer's ``W`` / running stats
-        only once per step regardless of how many neighbours node ``idx`` has.
+        This is the single place per training step where the SWBN layer's
+        ``W`` / running statistics are advanced (on the rotating pilot batch,
+        BatchNorm-style).  Every other whitening application in the same step
+        must go through :meth:`_apply_frozen_whitening` instead, so the
+        statistics are never re-estimated from the (small, fixed) anchor sets.
         """
         if self._use_learnable_whitening():
             return self.whitening_layers[str(idx)](A)
         op = self._whitening_ops.get(idx)
         return whiten(A, op) if op is not None else A
+
+    def _apply_frozen_whitening(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Apply agent ``idx``'s current whitening without re-estimating it.
+
+        Gradient-carrying counterpart of :meth:`_whiten_own_latents`: SWBN
+        layers run in eval mode (frozen running stats / ``W``; ``gamma`` /
+        ``beta`` still differentiable), closed-form operators are applied
+        as-is, and a missing operator degrades to identity.
+        """
+        if self._use_learnable_whitening():
+            return self._whiten_pilots_frozen(idx, Z)
+        op = self._whitening_ops.get(idx)
+        return whiten(Z, op) if op is not None else Z
 
     def _recolour_node(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
         """Re-colour ``Z`` into node ``idx``'s native space (inverse of whitening)."""
@@ -587,7 +618,37 @@ class SheafFRL(BaseOrchestrator):
         labels (needed for the after-communication task loss) and the matched
         keys themselves (needed by the ``proto_kmeans`` anchor-selection
         strategy to look up its cached sample-id -> cluster-id assignment).
+
+        Fast path: when both key arrays are duplicate-free (the standard
+        sample-id case), the intersection is computed vectorised — the
+        per-key Python loop below is O(n²) and full-pool refreshes would
+        spend minutes per epoch in it.  Both paths emit rows in ascending
+        key order.
         """
+        if keys_i.numel() == 0 or keys_j.numel() == 0:
+            return None
+        uniq_i = torch.unique(keys_i)
+        uniq_j = torch.unique(keys_j)
+        if (
+            uniq_i.numel() == keys_i.numel()
+            and uniq_j.numel() == keys_j.numel()
+        ):
+            order_i = torch.argsort(keys_i)
+            order_j = torch.argsort(keys_j)
+            in_j = torch.isin(keys_i[order_i], keys_j)
+            in_i = torch.isin(keys_j[order_j], keys_i)
+            rows_i = order_i[in_j]
+            rows_j = order_j[in_i]
+            if rows_i.numel() == 0:
+                return None
+            return (
+                A_i[rows_i],
+                labels_i[rows_i],
+                A_j[rows_j],
+                labels_j[rows_j],
+                keys_i[rows_i],
+            )
+
         target_keys = set(keys_i.tolist()) & set(keys_j.tolist())
         if not target_keys:
             return None
@@ -738,11 +799,11 @@ class SheafFRL(BaseOrchestrator):
         y_j: torch.Tensor,
         keys: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Induce node_j prototypes from node_i's cached, one-shot k-means clusters.
+        """Induce node_j prototypes from node_i's cached k-means clusters.
 
         Looks up the ``(node_i, node_j) -> {sample_id: cluster_id}`` assignment
-        fit once, ever, by :meth:`_rebuild_edge_anchor_caches`; rows whose key
-        was not part of the fitted pool are dropped.  Each surviving cluster is averaged
+        refit at every refresh by :meth:`_rebuild_edge_anchor_caches`; rows
+        whose key was not part of the fitted pool are dropped.  Each surviving cluster is averaged
         independently on both sides (inducing node_j's prototype from whichever
         of *its own* matched rows fall in that node_i-defined cluster), with the
         majority label kept for the after-comm task loss.  Falls back to
@@ -781,43 +842,94 @@ class SheafFRL(BaseOrchestrator):
         )
 
     def _edge_live_anchors(
-        self, node_i: int, node_j: int
+        self,
+        node_i: int,
+        node_j: int,
+        rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Re-encode edge ``(node_i, node_j)``'s fixed anchor cache fresh, then reduce.
+        """Re-encode edge ``(node_i, node_j)``'s cached anchor identities, then reduce.
 
-        The one place both the per-step penalty (:meth:`_both_live_alignment_losses`)
-        and the epoch-end map refit (:meth:`_rebuild_edge_anchor_caches`) get
-        their anchors from: the underlying pilot *identities* are fixed for the
-        whole refresh window (see :meth:`_rebuild_edge_anchor_caches`), but
-        every call re-encodes them through the agents' *current* (still
-        training) parameters — gradients/values are always fresh even though
-        which samples they come from never changes mid-window.  Returns
-        ``None`` before any cache exists for this edge (e.g. Lightning's
-        sanity-check pass, which runs before ``on_train_start``).
+        The cache holds the fixed sample identities selected at the last
+        refresh (:meth:`_rebuild_edge_anchor_caches`); every call re-encodes
+        them through the agents' *current* (still training) parameters and
+        applies the frozen whitening statistics — values are always fresh
+        even though the identities never change mid-window.  ``rows``
+        optionally restricts the call to a subset of cache rows
+        (:class:`CESheafFRL`'s local-epoch minibatching).  Returns ``None``
+        before any cache exists for this edge (e.g. Lightning's sanity-check
+        pass, which runs before ``on_train_start``).
         """
         cache = self._edge_anchor_cache.get((node_i, node_j))
         if cache is None:
             return None
-        Z_i, y_i = self._edge_live_one_side(node_i, cache, 'i')
-        Z_j, y_j = self._edge_live_one_side(node_j, cache, 'j')
-        keys = cache['sample_ids'].to(self.device)
+        Z_i, y_i = self._edge_live_one_side(node_i, cache, 'i', rows)
+        Z_j, y_j = self._edge_live_one_side(node_j, cache, 'j', rows)
+        keys = cache['sample_ids']
+        if rows is not None:
+            keys = keys[rows]
+        keys = keys.to(self.device)
         return self._select_edge_anchors(node_i, node_j, Z_i, y_i, Z_j, y_j, keys)
 
     def _edge_live_one_side(
-        self, node_idx: int, cache: dict[str, torch.Tensor], side: str
+        self,
+        node_idx: int,
+        cache: dict[str, torch.Tensor],
+        side: str,
+        rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Re-encode + whiten just one side (``'i'`` or ``'j'``) of an edge's anchor cache.
+        """Re-encode + whiten one side (``'i'`` or ``'j'``) of an edge's anchor cache.
 
         Split out of :meth:`_edge_live_anchors` so :class:`CESheafFRL` can
-        re-encode only the *live* node during Phase A, pairing it against the
-        other side's frozen snapshot (``self._frozen_edge_anchors``) instead
-        of a second live encoding.
+        re-encode only the *live* node during local epochs, pairing it against
+        the other side's frozen snapshot (``self._frozen_edge_anchors``) instead
+        of a second live encoding.  Raw inputs come from the cached copies
+        when present (small anchor sets) and are otherwise fetched on demand
+        from the pilot dataset via the cached positions.  Whitening is the
+        frozen application — the online SWBN update already happened this
+        step, on the rotating pilot batch.
         """
         agent = self.agents[str(node_idx)]
-        x = cache[f'x_{side}'].to(self.device)
-        Z = self._whiten_node_pilots(node_idx, agent.encode(x))
-        y = cache[f'y_{side}'].to(self.device)
-        return Z, y
+        x = cache.get(f'x_{side}')
+        if x is not None:
+            if rows is not None:
+                x = x[rows]
+        else:
+            pos = cache[f'pos_{side}']
+            if rows is not None:
+                pos = pos[rows]
+            x = self._fetch_pilot_rows(node_idx, pos)
+        Z = self._apply_frozen_whitening(
+            node_idx, agent.encode(x.to(self.device))
+        )
+        y = cache[f'y_{side}']
+        if rows is not None:
+            y = y[rows]
+        return Z, y.to(self.device)
+
+    def _fetch_pilot_rows(
+        self, node_idx: int, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Materialise raw pilot inputs at ``positions`` of a node's pilot dataset.
+
+        Used by :meth:`_edge_live_one_side` when the anchor cache is too
+        large to hold raw input copies (``anchor_selection='all'`` with a big
+        pilot split): the cache then stores dataset positions and rows are
+        fetched on demand.
+        """
+        from PIL import Image as _PILImage
+        from torchvision.transforms.functional import (
+            to_tensor as _pil_to_tensor,
+        )
+
+        dm = getattr(self.trainer, 'datamodule', None)
+        ds = dm.pilot_datasets[node_idx]
+        xs = []
+        for p in positions.tolist():
+            x = ds[p][0]
+            if isinstance(x, _PILImage.Image):
+                x = _pil_to_tensor(x)
+            xs.append(x)
+        return torch.stack(xs)
 
     def _record_edge_exchange(
         self,
@@ -854,108 +966,203 @@ class SheafFRL(BaseOrchestrator):
 
     @torch.no_grad()
     def _rebuild_edge_anchor_caches(self) -> dict[str, float]:
-        """(Re)select each edge's fixed anchor set and refit its alignment map from it.
+        """(Re)select each edge's anchors from the full pilot pool and refit its map.
 
         Called once per refresh window, from ``on_train_epoch_end``, gated by
-        ``_should_update_maps_at_epoch_end`` — the same event that used to
-        trigger the old epoch-pooled Stiefel refit.  For each edge: build a
-        fresh, class-filtered, sample-id-matched candidate pool from the
-        *last* train step's raw pilots (``self._latest_train_pilots``); reduce
-        it to the fixed anchor identities that get reused every step until the
-        next refresh (``random``: subsample once to ``num_anchors``;
-        ``proto_kmeans``: fit its one-shot clustering the first time, then
-        restrict to assigned rows; ``all``/``proto_class``: keep the full
-        matched pool — their reduction is per-step averaging over a fixed
-        membership, not identity selection, so it stays in
-        :meth:`_edge_live_anchors`); cache it; immediately re-encode it once
-        (the "just selected" pass) to record the communication cost, snapshot
-        the frozen pair for :class:`CESheafFRL`'s Phase A, and fit the
-        alignment map.
+        ``_should_update_maps_at_epoch_end``.  The candidate pool is the
+        **whole pilot split** (``dm.pilot_datasets``, encoded once per node
+        via :meth:`_encode_pilot_set` and whitened with the frozen
+        operators), not any loader batch.  Per edge: class-filter, match by
+        sample id, then
+
+        1. apply ``anchor_selection`` to the full matched pool (``random``:
+           subsample ``num_anchors``; ``proto_kmeans``: refit its clustering
+           on the whitened matched pool at every refresh;
+           ``all``/``proto_class``: keep everything / class prototypes),
+           record the selected anchors as this window's communication, and
+           fit the alignment map on exactly those rows — for ``'all'`` the
+           Procrustes/LS fit therefore uses every class-filtered matched
+           pilot;
+        2. cache the anchor *identities* for the per-step paths (dataset
+           positions, plus raw input copies when the set is small):
+           ``random`` keeps its selected rows; the proto strategies cap the
+           cached membership at ``pilot_batch_size`` rows so per-step
+           prototype recomputation stays bounded; ``'all'`` caches the full
+           identity list (rows are fetched lazily);
+        3. snapshot the frozen pair for :class:`CESheafFRL`'s local epochs
+           from the *cached* membership (not the full pool), so the local-epoch
+           live recomputation stays row-aligned with the snapshot.
         """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return {}
+        encoded = self._encode_pilot_set(dm)
+        if not encoded:
+            return {}
+
+        # The pool stays on CPU throughout: with flattened-conv latent dims in
+        # the thousands and dozens of edges, holding full-pool latents (or
+        # per-edge matched copies) on the GPU next to the d_i×d_j Stiefel
+        # parameters OOMs.  The GPU is touched only transiently — whitening in
+        # chunks here, and the per-edge map fit below.
+        pool: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        whiten_chunk = 1024
+        for idx, (Z, y, sids) in encoded.items():
+            if sids is None:
+                continue
+            Z_w_chunks = []
+            for start in range(0, Z.shape[0], whiten_chunk):
+                zc = Z[start : start + whiten_chunk].to(self.device).float()
+                Z_w_chunks.append(
+                    self._apply_frozen_whitening(idx, zc).cpu()
+                )
+            pool[idx] = (torch.cat(Z_w_chunks, dim=0), y.cpu(), sids.cpu())
+        if not pool:
+            return {}
+
+        pilot_datasets = getattr(dm, 'pilot_datasets', {})
+        pos_maps: dict[int, dict[int, int]] = {}
+
+        def _positions(node: int, sids: torch.Tensor) -> torch.Tensor:
+            if node not in pos_maps:
+                ds_ids = getattr(
+                    pilot_datasets.get(node), 'sample_ids', None
+                )
+                pos_maps[node] = {
+                    int(s): p for p, s in enumerate(ds_ids or [])
+                }
+            m = pos_maps[node]
+            return torch.tensor(
+                [m.get(int(s), -1) for s in sids.tolist()],
+                dtype=torch.long,
+            )
+
         edge_metrics: dict[str, float] = {}
         update_maps = not (
             self.hparams.use_general_maps and self.hparams.soft_maps
         )
         recorded_round = False
         strategy = self.hparams.anchor_selection
+        membership_cap = int(getattr(dm, 'pilot_batch_size', 0) or 512)
 
         for edge_key, node_i, node_j in self._edge_pairs():
-            if (
-                node_i not in self._latest_train_pilots
-                or node_j not in self._latest_train_pilots
-            ):
+            if node_i not in pool or node_j not in pool:
                 continue
-            x_i, y_i, sid_i = (
-                t.to(self.device) for t in self._latest_train_pilots[node_i]
-            )
-            x_j, y_j, sid_j = (
-                t.to(self.device) for t in self._latest_train_pilots[node_j]
-            )
+            Z_i, y_i, sid_i = pool[node_i]
+            Z_j, y_j, sid_j = pool[node_j]
 
-            x_i_f, sid_i_f, y_i_f, x_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
-                node_i, node_j, x_i, sid_i, y_i, x_j, sid_j, y_j
+            Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
+                node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
             )
             matched = self._match_pilots_with_labels(
-                x_i_f, sid_i_f, y_i_f, x_j_f, sid_j_f, y_j_f
+                Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f
             )
             if matched is None:
                 continue
-            x_i_m, y_i_m, x_j_m, y_j_m, sids_m = matched
+            Z_i_m, y_i_m, Z_j_m, y_j_m, sids_m = matched
 
             if strategy == 'random':
                 budget = int(self.hparams.num_anchors)
-                if x_i_m.shape[0] > budget:
-                    idx = torch.randperm(x_i_m.shape[0], device=x_i_m.device)[:budget]
-                    x_i_m, y_i_m, x_j_m, y_j_m, sids_m = (
-                        x_i_m[idx], y_i_m[idx], x_j_m[idx], y_j_m[idx], sids_m[idx]
+                if Z_i_m.shape[0] > budget:
+                    idx = torch.randperm(Z_i_m.shape[0], device=Z_i_m.device)[:budget]
+                    Z_i_m, y_i_m, Z_j_m, y_j_m, sids_m = (
+                        Z_i_m[idx], y_i_m[idx], Z_j_m[idx], y_j_m[idx], sids_m[idx]
                     )
             elif strategy == 'proto_kmeans':
                 pair = (node_i, node_j)
                 K = int(self.hparams.num_anchors)
-                if pair not in self._edge_kmeans_assign and x_i_m.shape[0] >= K:
-                    z_ref = self.agents[str(node_i)].encode(x_i_m)
-                    labels = kmeans_cluster(z_ref.float().cpu().numpy(), n_clusters=K)
+                if Z_i_m.shape[0] >= K:
+                    # Refit at every refresh: the clustering tracks the
+                    # drifting whitened pilot geometry, alongside the map
+                    # refit.  Re-broadcasting the sample-id -> cluster
+                    # assignment costs a few KB per window.
+                    labels = kmeans_cluster(
+                        Z_i_m.detach().float().cpu().numpy(), n_clusters=K
+                    )
                     self._edge_kmeans_assign[pair] = dict(
                         zip(sids_m.tolist(), labels.tolist())
                     )
-                assign_map = self._edge_kmeans_assign.get(pair)
-                if assign_map:
-                    keep = torch.tensor(
-                        [s in assign_map for s in sids_m.tolist()],
-                        device=x_i_m.device,
-                        dtype=torch.bool,
-                    )
-                    if bool(keep.any()):
-                        x_i_m, y_i_m, x_j_m, y_j_m, sids_m = (
-                            x_i_m[keep], y_i_m[keep], x_j_m[keep], y_j_m[keep], sids_m[keep]
-                        )
 
-            self._edge_anchor_cache[(node_i, node_j)] = {
-                'x_i': x_i_m.cpu(), 'y_i': y_i_m.cpu(),
-                'x_j': x_j_m.cpu(), 'y_j': y_j_m.cpu(),
-                'sample_ids': sids_m.cpu(),
-            }
-
-            live = self._edge_live_anchors(node_i, node_j)
-            if live is None:
+            # 1 — anchors actually exchanged + fed to the map fit.  The
+            # selected rows move to the GPU only for the fit itself and are
+            # freed before the next edge.
+            Z_i_sel, y_i_sel, Z_j_sel, y_j_sel = self._select_edge_anchors(
+                node_i, node_j, Z_i_m, y_i_m, Z_j_m, y_j_m, sids_m
+            )
+            if Z_i_sel.shape[0] == 0:
                 continue
-            Z_i, y_i_l, Z_j, y_j_l = live
             if not recorded_round:
                 self._record_communication_round(n_rounds=1, prefix='train')
                 recorded_round = True
-            self._record_edge_exchange(edge_key, Z_i, Z_j, prefix='train')
-            self._frozen_edge_anchors[(node_i, node_j)] = (
-                Z_i.detach(), y_i_l.detach(), Z_j.detach(), y_j_l.detach()
-            )
+            self._record_edge_exchange(edge_key, Z_i_sel, Z_j_sel, prefix='train')
             edge_metrics.update(
-                self._fit_edge_map(edge_key, node_i, node_j, Z_i, Z_j, update_maps)
+                self._fit_edge_map(
+                    edge_key,
+                    node_i,
+                    node_j,
+                    Z_i_sel.to(self.device),
+                    Z_j_sel.to(self.device),
+                    update_maps,
+                )
+            )
+
+            # 2 — per-step cache identities.
+            n_rows = Z_i_m.shape[0]
+            if (
+                strategy in ('proto_class', 'proto_kmeans')
+                and n_rows > membership_cap
+            ):
+                cache_rows = torch.randperm(n_rows, device=Z_i_m.device)[
+                    :membership_cap
+                ].sort().values
+            else:
+                cache_rows = torch.arange(n_rows, device=Z_i_m.device)
+
+            cache_sids = sids_m[cache_rows]
+            pos_i = _positions(node_i, cache_sids)
+            pos_j = _positions(node_j, cache_sids)
+            valid = (pos_i >= 0) & (pos_j >= 0)
+            if not bool(valid.all()):
+                cache_rows = cache_rows[valid.to(cache_rows.device)]
+                cache_sids = cache_sids[valid.to(cache_sids.device)]
+                pos_i, pos_j = pos_i[valid], pos_j[valid]
+            if cache_rows.shape[0] == 0:
+                continue
+
+            cache: dict[str, torch.Tensor] = {
+                'sample_ids': cache_sids.cpu(),
+                'y_i': y_i_m[cache_rows].cpu(),
+                'y_j': y_j_m[cache_rows].cpu(),
+                'pos_i': pos_i,
+                'pos_j': pos_j,
+            }
+            if int(cache_rows.shape[0]) <= self._CACHE_RAW_X_MAX_ROWS:
+                cache['x_i'] = self._fetch_pilot_rows(node_i, pos_i)
+                cache['x_j'] = self._fetch_pilot_rows(node_j, pos_j)
+            self._edge_anchor_cache[(node_i, node_j)] = cache
+
+            # 3 — frozen snapshot for local epochs, over the cached membership.
+            # Kept on CPU; local epochs move (sliced) rows to the device per step.
+            froz = self._select_edge_anchors(
+                node_i,
+                node_j,
+                Z_i_m[cache_rows],
+                y_i_m[cache_rows],
+                Z_j_m[cache_rows],
+                y_j_m[cache_rows],
+                cache_sids,
+            )
+            self._frozen_edge_anchors[(node_i, node_j)] = tuple(
+                t.detach().cpu() for t in froz
             )
 
         return edge_metrics
 
     def on_train_start(self) -> None:
         super().on_train_start()
-        self._latest_pilots.clear()
+        self._step_pilot_latents.clear()
         self._whitening_ops.clear()
         self._task_latent_buffer: dict[int, list[torch.Tensor]] = {}
         self._agent_target_classes: dict[int, set[int]] | None = (
@@ -964,12 +1171,40 @@ class SheafFRL(BaseOrchestrator):
         # Fresh fit() call -> forget any proto_kmeans assignment and any fixed
         # anchor caches fit/selected previously.
         self._edge_kmeans_assign = {}
-        self._latest_train_pilots = {}
         self._edge_anchor_cache = {}
         self._frozen_edge_anchors = {}
+        self._warn_if_pool_coverage_partial()
+
+    def _warn_if_pool_coverage_partial(self) -> None:
+        """One-time note when an epoch's pilot batches can't cover the pool.
+
+        The step-batch penalty path ('all'/proto strategies) iterates the
+        pilot split via the rotating loader batches; full per-epoch coverage
+        needs ``steps_per_epoch × pilot_batch_size ≥ pool size``.
+        """
+        if self.hparams.anchor_selection == 'random':
+            return
+        dm = getattr(self.trainer, 'datamodule', None)
+        pds = getattr(dm, 'pilot_datasets', None) if dm is not None else None
+        pbs = int(getattr(dm, 'pilot_batch_size', 0) or 0)
+        try:
+            steps = int(self.trainer.num_training_batches)
+        except (TypeError, ValueError, OverflowError):
+            steps = 0
+        pool_n = max((len(d) for d in pds.values()), default=0) if pds else 0
+        if steps and pbs and pool_n and steps * pbs < pool_n:
+            warnings.warn(
+                f'Pilot loader covers only {steps * pbs}/{pool_n} pilot '
+                'samples per epoch; the step-batch sheaf penalty will never '
+                'see the tail of the pilot split. Raise pilot_batch_size or '
+                'accept partial per-epoch coverage (the epoch-end map refit '
+                'still uses the full pool).',
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def on_train_epoch_start(self) -> None:
-        self._latest_pilots.clear()
+        self._step_pilot_latents.clear()
         self._task_latent_buffer = {}
 
     @torch.no_grad()
@@ -988,7 +1223,7 @@ class SheafFRL(BaseOrchestrator):
 
         # Whether to refresh the fixed anchor caches + alignment maps this
         # epoch.  Hook: SheafFRL refreshes every `update_v_every_n_epochs`
-        # after warmup; CESheafFRL refreshes only on Phase-C epochs.
+        # after warmup; CESheafFRL refreshes only on collaborative epochs.
         if self._should_update_maps_at_epoch_end():
             # With learnable SWBN whitening, phi_i lives in the persistent
             # layers (updated online every step); this closed-form ZCA fit is
@@ -1009,7 +1244,7 @@ class SheafFRL(BaseOrchestrator):
                     add_dataloader_idx=False,
                 )
 
-        self._latest_pilots.clear()
+        self._step_pilot_latents.clear()
         self._task_latent_buffer = {}
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
@@ -1032,37 +1267,135 @@ class SheafFRL(BaseOrchestrator):
         """Per-step entry point for the alignment losses (both-live).
 
         SheafFRL evaluates the both-live penalty every step; :class:`CESheafFRL`
-        overrides this to phase-dispatch (Phase A → frozen coboundary, else
-        both-live).  The geometry lives in ``_both_live_alignment_losses`` /
+        overrides this to dispatch on the schedule (local epoch → frozen
+        coboundary or nothing, collaborative epoch → both-live).  The geometry
+        lives in ``_both_live_alignment_losses`` /
         ``_frozen_alignment_losses`` so subclasses can swap it (e.g. SheafCFRL's
         compressed coboundary) without re-implementing the schedule.
         """
         return self._both_live_alignment_losses(comm_weight, skip)
+
+    def _row_budget(self) -> int:
+        """Per-step row budget for live re-encoding (``dm.pilot_batch_size``).
+
+        Shared by :meth:`_rotating_rows` (plain SheafFRL) and
+        :class:`CESheafFRL`/:class:`SheafCFRL`'s local-epoch minibatching — one
+        definition of "how many rows is it safe to re-encode live in a
+        single step."
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        try:
+            return int(getattr(dm, 'pilot_batch_size', 0)) or 512
+        except (TypeError, ValueError):
+            return 512
+
+    def _rotating_rows(self, node_i: int, node_j: int) -> torch.Tensor | None:
+        """Bound a live per-step re-encode to a rotating ``pilot_batch_size`` window.
+
+        ``_edge_live_anchors`` re-encodes whatever it's given through a live
+        CNN forward pass, with gradients, every step, once per side. Its
+        cache can hold far more rows than that's safe for: ``num_anchors``
+        for ``'random'`` is a *communication/map-fit* budget, not a per-step
+        compute budget, and can be set arbitrarily large (e.g. to find where
+        Procrustes saturates); an uncapped ``'all'`` cache hit via the
+        ``_edge_step_anchors`` fallback would be worse still. Returns
+        ``None`` (no windowing — the caller re-encodes everything, as
+        before) when the cache is already within budget, so normal
+        (small-``num_anchors``) configurations are unaffected; only above
+        that does this kick in, cycling through the full cache across
+        steps — mirrors :class:`CESheafFRL`'s local-epoch minibatching
+        (``_frozen_alignment_losses``), generalised to the always-live path.
+        """
+        cache = self._edge_anchor_cache.get((node_i, node_j))
+        if cache is None:
+            return None
+        n = int(cache['sample_ids'].shape[0])
+        budget = self._row_budget()
+        if n <= budget:
+            return None
+        off = self._edge_step_offsets.get((node_i, node_j), 0)
+        rows = (torch.arange(budget) + off) % n
+        self._edge_step_offsets[(node_i, node_j)] = (off + budget) % n
+        return rows
+
+    def _edge_step_anchors(
+        self, node_i: int, node_j: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Per-step anchors for one edge, per the active ``anchor_selection``.
+
+        ``'random'`` keeps the fixed-cache path (:meth:`_edge_live_anchors`),
+        bounded per step by :meth:`_rotating_rows`: the penalty is restricted
+        to the ``num_anchors`` rows communicated at the last refresh, but any
+        single step only re-encodes up to ``pilot_batch_size`` of them (all
+        of them, when ``num_anchors <= pilot_batch_size`` — the normal case).
+        The other strategies consume the *current
+        step's rotating pilot batch*: the two endpoints' whitened step
+        latents (stored by :meth:`_shared_eval`) are class-filtered, matched
+        by sample id, then reduced (``'all'``: kept whole; ``'proto_class'``:
+        batch prototypes; ``'proto_kmeans'``: prototypes under the cached
+        one-shot assignment).  Falls back to the cache path when step latents
+        are unavailable (e.g. a datamodule without pilot sample ids).
+        """
+        if self.hparams.anchor_selection == 'random':
+            return self._edge_live_anchors(
+                node_i, node_j, rows=self._rotating_rows(node_i, node_j)
+            )
+        sp_i = self._step_pilot_latents.get(node_i)
+        sp_j = self._step_pilot_latents.get(node_j)
+        if sp_i is None or sp_j is None:
+            return self._edge_live_anchors(
+                node_i, node_j, rows=self._rotating_rows(node_i, node_j)
+            )
+        Z_i, y_i, sid_i = sp_i
+        Z_j, y_j, sid_j = sp_j
+        Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
+            node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
+        )
+        matched = self._match_pilots_with_labels(
+            Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f
+        )
+        if matched is None:
+            return None
+        Z_i_m, y_i_m, Z_j_m, y_j_m, keys = matched
+        return self._select_edge_anchors(
+            node_i, node_j, Z_i_m, y_i_m, Z_j_m, y_j_m, keys
+        )
 
     def _both_live_alignment_losses(
         self, comm_weight: float, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Both-live sheaf penalty + after-comm over all edges (embedding maps).
 
-        One Stiefel map per edge, embedding coboundary ``z_i V − z_j``; both
-        endpoints re-encoded fresh from their fixed anchor cache
-        (:meth:`_edge_live_anchors`).  :class:`SheafCFRL` overrides this with
-        the compressed two-map coboundary.  ``comm_weight > 0`` enables the
-        after-comm term.
+        One Stiefel map per edge, embedding coboundary ``z_i V − z_j``; the
+        rows come from :meth:`_edge_step_anchors` — the current step's
+        rotating pilot batch for ``'all'``/proto strategies, the fixed anchor
+        cache for ``'random'``.  :class:`SheafCFRL` overrides this with the
+        compressed two-map coboundary.  ``comm_weight > 0`` enables the
+        after-comm term.  With ``anchor_selection='all'`` each *training*
+        step also records the exchanged batch latents per edge — fresh rows
+        every step imply a fresh exchange, unlike the once-per-window
+        accounting of the budgeted strategies.
         """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm_task_loss = torch.tensor(0.0, device=self.device)
         if skip:
             return sheaf_penalty, after_comm_task_loss
 
+        record_step_exchange = (
+            self.training and self.hparams.anchor_selection == 'all'
+        )
         for edge_key, V in self.stiefel_matrices.items():
             node_i, node_j = map(int, edge_key.split('_'))
-            matched = self._edge_live_anchors(node_i, node_j)
+            matched = self._edge_step_anchors(node_i, node_j)
             if matched is None:
                 continue
 
-            # Rows are already whitened (inside _edge_live_anchors).
+            # Rows are already whitened (upstream of _edge_step_anchors).
             Z_i, y_i_shared, Z_j, y_j_shared = matched
+            if record_step_exchange:
+                self._record_edge_exchange(
+                    edge_key, Z_i.detach(), Z_j.detach(), prefix='train'
+                )
             diff = torch.matmul(Z_i, V) - Z_j
             sheaf_penalty += self._edge_penalty_term(edge_key, diff)
 
@@ -1142,23 +1475,20 @@ class SheafFRL(BaseOrchestrator):
                 except ValueError:
                     pilots_available = False
                 else:
-                    self._latest_pilots[idx] = (x_pilot, y_pilot, sample_ids)
                     pilot_latents = agent.encode(x_pilot)
-                    # Whiten every node's pilots ONCE per step for SWBN's online
-                    # W / running-stat update and diagnostics; the alignment
-                    # penalty no longer consumes this pass — it re-encodes each
-                    # edge's fixed anchor cache separately (_edge_live_anchors).
-                    self._whiten_node_pilots(idx, pilot_latents)
+                    # Whiten every node's pilots ONCE per step — this is the
+                    # single place SWBN's online W / running-stat update
+                    # happens (on the rotating pilot batch); every other
+                    # whitening call this step applies the frozen stats.  The
+                    # whitened latents feed the step-batch penalty path
+                    # (_edge_step_anchors) for the non-'random' strategies.
+                    Z_pilot_w = self._whiten_node_pilots(idx, pilot_latents)
+                    if sample_ids is not None:
+                        self._step_pilot_latents[idx] = (
+                            Z_pilot_w, y_pilot, sample_ids
+                        )
 
                     if prefix == 'train':
-                        # Raw pilots (not yet encoded) from the most recent train
-                        # step; used at the next map refresh to rebuild the fixed
-                        # per-edge anchor caches (_rebuild_edge_anchor_caches).
-                        self._latest_train_pilots[idx] = (
-                            x_pilot.detach().cpu(),
-                            y_pilot.detach().cpu(),
-                            sample_ids.detach().cpu(),
-                        )
                         if getattr(self.hparams, 'log_latent_diagnostics', False):
                             self.log(
                                 f'train/global_pilot_effective_rank_agent_{idx}',
@@ -1179,6 +1509,9 @@ class SheafFRL(BaseOrchestrator):
             comm_weight=comm_weight,
             skip=in_warmup,
         )
+        # Step-scoped state: drop our references so the autograd graph the
+        # penalty holds internally is the only thing keeping them alive.
+        self._step_pilot_latents.clear()
 
         # λ handling — fixed/scheduled: one global coefficient applied here;
         # dual (learn_lmb): every edge term already carries its own λ_e, and

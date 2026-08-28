@@ -16,13 +16,21 @@ learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for close
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
-# ── Per-edge anchor selection: what gets aligned each communication step ──────
-#   all          — every matched, class-filtered pilot row (default)
-#   random       — a fresh random subset of size num_anchors, resampled every step
-#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype per
-#                  class present on the edge, à la FedProto
-#   proto_kmeans — unsupervised: k-means (K=num_anchors) fit once on the edge's
-#                  canonical higher-dim node, assignment reused for the rest of training
+# ── Per-edge anchor selection ─────────────────────────────────────────────────
+# At every map refresh the candidate pool is the FULL pilot split
+# (class-filtered per edge, matched by sample id); the map is fit on the
+# selected anchors.  Per training step:
+#   all          — map fit on every matched pilot; the step penalty consumes the
+#                  rotating pilot batch (an epoch cycles the whole pool; each
+#                  step's exchanged batch latents are counted as communication)
+#   random       — num_anchors rows subsampled from the pool once per refresh;
+#                  the step penalty re-encodes exactly those rows (budgeted
+#                  once-per-window communication)
+#   proto_class  — 1 (or protos_per_class, via within-class k-means) prototype
+#                  per class, à la FedProto; step penalty uses batch prototypes
+#   proto_kmeans — k-means (K=num_anchors) refit on the whitened matched pool
+#                  at every refresh; step penalty averages the batch under the
+#                  window's assignment
 anchor_selection: all
 num_anchors: 32          # edge anchor budget: subset size (random) / K (proto_kmeans)
 protos_per_class: 1      # only used by proto_class

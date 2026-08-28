@@ -1,0 +1,98 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - net_size: a15          # provides dataset.n_agents + dataset.groups; swept below
+  - _self_
+
+seed: 42
+study_name: "Agent scaling MNIST (fixed 40% density)"
+
+# Companion to the network-density study: here the graph density is held FIXED
+# at 40% of the possible edges (graph.max_edge_frac: 0.4 — class_overlap keeps
+# exactly floor(0.4 * n(n-1)/2) edges) while the ONLY swept knob is the number
+# of agents. Because grouped_non_iid needs `groups` to enumerate exactly
+# 0..n_agents-1, the per-size (n_agents, groups) pair lives in the `net_size`
+# config group and is swept via `net_size=a5,a10,...` at the bottom.
+# Homogeneous models: all agents use the default `model: cnn_classifier`.
+
+lmb_study:
+  enabled: true
+  efficient: true
+  n_trials: 15
+  n_tune_epochs: 5
+  lmb_low: 1e-4
+  lmb_high: 1e-1
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.4          # fixed 40% density at every network size
+  similarity: intersection
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: agent_scaling_sfrl
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+optimizer:
+  lr: 1e-2
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  # n_agents and groups come from the `net_size` config group (swept below).
+  split_strategy: grouped_non_iid
+  classes_per_agent: 10
+  shift_strength: 0.9
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  learn_whitening: true
+  gamma: 1e-3
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+  max_lmb: 1e-2
+  learn_lmb: false
+  dual_rho: null
+  comm_task_coeff: 0
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      net_size: a5, a10, a15, a20, a25

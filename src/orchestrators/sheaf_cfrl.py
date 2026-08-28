@@ -25,10 +25,10 @@ is an int, or to convergence (Boyd's primal/dual residual criterion, capped at
 ``compression_admm_max_iter``) when it is ``None`` — each a closed-form pass of
 two generalised Sylvester solves (updating ``V_ji`` then ``V_ij``), two polar
 projections onto the Stiefel manifold (the auxiliaries ``Y_i``, ``Y_j``) and a
-scaled dual ascent (``U_i``, ``U_j``).  The decoupled three-phase schedule, whitening, and frozen-pilot
-caching are inherited from :class:`CESheafFRL`; only the map structure, the
-(both-live and Phase-A frozen) coboundary penalties, the Phase-B update and
-``send_message`` differ.
+scaled dual ascent (``U_i``, ``U_j``).  The decoupled local/collaborative
+schedule, whitening, and frozen-pilot caching are inherited from
+:class:`CESheafFRL`; only the map structure, the (both-live and local frozen)
+coboundary penalties, the Phase-B map refit and ``send_message`` differ.
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ class SheafCFRL(CESheafFRL):
     """Compressed, communication-efficient Sheaf-FRL (Section 9 + decoupling).
 
     Compressed edge stalks (two fat semi-orthogonal maps per edge, refit by
-    SOC-ADMM in Phase B) layered on the :class:`CESheafFRL` three-phase
-    schedule.  It overrides only the *geometry* hooks — the both-live and
-    Phase-A frozen coboundaries, the map update, and ``send_message`` — and
-    inherits the phase schedule + frozen-pilot caching unchanged.
+    SOC-ADMM in Phase B) layered on the :class:`CESheafFRL` local/collaborative
+    schedule.  It overrides only the *geometry* hooks — the both-live and local
+    frozen coboundaries, the map update, and ``send_message`` — and inherits the
+    schedule + frozen-pilot caching unchanged.
     """
 
     def __init__(
@@ -319,14 +319,20 @@ class SheafCFRL(CESheafFRL):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Phase-C / per-step compressed coboundary ‖Z_a V_aᵀ − Z_b V_bᵀ‖² + after-comm.
 
-        Both stalks re-encoded fresh from their fixed anchor cache
-        (:meth:`~src.orchestrators.sheaf_frl.SheafFRL._edge_live_anchors`).
+        Rows come from
+        :meth:`~src.orchestrators.sheaf_frl.SheafFRL._edge_step_anchors` —
+        the current step's rotating pilot batch for ``'all'``/proto
+        strategies, the fixed anchor cache for ``'random'`` — mirroring the
+        embedding-map base class.
         """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm_task_loss = torch.tensor(0.0, device=self.device)
         if skip:
             return sheaf_penalty, after_comm_task_loss
 
+        record_step_exchange = (
+            self.training and self.hparams.anchor_selection == 'all'
+        )
         for edge_key, a, b, _c in self._compression_edges:
             V_a = self.compression_maps[
                 self._proj_key(edge_key, a)
@@ -334,12 +340,16 @@ class SheafCFRL(CESheafFRL):
             V_b = self.compression_maps[
                 self._proj_key(edge_key, b)
             ]  # (c, d_b)
-            matched = self._edge_live_anchors(a, b)
+            matched = self._edge_step_anchors(a, b)
             if matched is None:
                 continue
 
-            # Rows are already whitened (inside _edge_live_anchors).
+            # Rows are already whitened (upstream of _edge_step_anchors).
             Z_a, y_a_shared, Z_b, y_b_shared = matched
+            if record_step_exchange:
+                self._record_edge_exchange(
+                    edge_key, Z_a.detach(), Z_b.detach(), prefix='train'
+                )
 
             # Compressed coboundary: project both stalks into the c-dim edge space.
             P_a = torch.matmul(Z_a, V_a.t())  # (n, c)
@@ -387,12 +397,13 @@ class SheafCFRL(CESheafFRL):
     def _frozen_alignment_losses(
         self, skip: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Phase-A compressed coboundary against FROZEN neighbours.
+        """Local-epoch compressed coboundary against FROZEN neighbours.
 
-        Mirrors :meth:`CESheafFRL._frozen_alignment_losses`: each term pairs
-        one side's fresh re-encoding of the fixed anchor cache
+        Mirrors :meth:`CESheafFRL._frozen_alignment_losses` (the ``local_reg``
+        regularizer): each term pairs one side's fresh re-encoding of the fixed
+        anchor cache
         (:meth:`~src.orchestrators.sheaf_frl.SheafFRL._edge_live_anchors`)
-        against the *other* side's snapshot as of the last Phase-C refresh
+        against the *other* side's snapshot as of the last collaborative refresh
         (``self._frozen_edge_anchors``), then projects both into the shared
         ``c``-dim edge stalk before differencing — gradient reaches only the
         live node, and no pilot is communicated this step.
@@ -405,11 +416,23 @@ class SheafCFRL(CESheafFRL):
         if not self._frozen_edge_anchors:
             return self._both_live_alignment_losses(0.0, skip)
 
+        minibatch = self.hparams.anchor_selection == 'all'
+        budget = self._row_budget() if minibatch else None
+
         for edge_key, a, b, _c in self._compression_edges:
             frozen = self._frozen_edge_anchors.get((a, b))
             if frozen is None:
                 continue
-            live = self._edge_live_anchors(a, b)
+            Z_a_frozen, _y_a_frozen, Z_b_frozen, _y_b_frozen = frozen
+
+            rows = None
+            n_frozen = int(Z_a_frozen.shape[0])
+            if minibatch and budget and n_frozen > budget:
+                off = self._local_offsets.get((a, b), 0)
+                rows = (torch.arange(budget) + off) % n_frozen
+                self._local_offsets[(a, b)] = (off + budget) % n_frozen
+
+            live = self._edge_live_anchors(a, b, rows=rows)
             if live is None:
                 continue
             V_a = self.compression_maps[
@@ -419,7 +442,13 @@ class SheafCFRL(CESheafFRL):
                 self._proj_key(edge_key, b)
             ]  # (c, d_b)
             Z_a_live, _y_a_live, Z_b_live, _y_b_live = live
-            Z_a_frozen, _y_a_frozen, Z_b_frozen, _y_b_frozen = frozen
+            if rows is not None:
+                frozen_rows = rows.to(Z_a_frozen.device)
+                Z_a_frozen = Z_a_frozen[frozen_rows]
+                Z_b_frozen = Z_b_frozen[frozen_rows]
+            # Snapshots are stored on CPU; move only the consumed rows.
+            Z_a_frozen = Z_a_frozen.to(self.device)
+            Z_b_frozen = Z_b_frozen.to(self.device)
 
             # node a live, pulled toward b's last-known (frozen) state.
             d_a = torch.matmul(Z_a_live, V_a.t()) - torch.matmul(

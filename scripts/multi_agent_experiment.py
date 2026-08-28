@@ -34,6 +34,7 @@ Sweep over shift_strength:
 from __future__ import annotations
 
 import copy
+import gc
 import inspect
 import sys
 from collections.abc import Iterator
@@ -46,6 +47,7 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 import hydra
 import pandas as pd
+import torch
 from hydra.utils import get_class, instantiate
 from lightning import Trainer, seed_everything
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -717,6 +719,19 @@ def main(cfg: DictConfig) -> float:
     remove_non_empty_dir('~/.cache/wandb/')
     remove_non_empty_dir(cfg.logger.project)
     _finish_active_wandb_run()
+
+    # Hydra's default BasicLauncher runs MULTIRUN jobs sequentially in this
+    # same process, so a heavy job's CUDA allocations must be released before
+    # the next one starts — otherwise a later, individually cheap job can
+    # crash with a CUDA OOM despite having a small footprint of its own.
+    # Python's refcounting frees `trainer`/`orchestrator`/`datamodule` once
+    # they go out of scope, but PyTorch's caching allocator keeps the freed
+    # GPU memory reserved for reuse rather than returning it to the driver;
+    # `empty_cache()` forces that release.
+    del trainer, orchestrator, datamodule, logger, callbacks
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return objective
 

@@ -1,0 +1,146 @@
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 15 agents (homo models)"
+
+# Homogeneous-model twin of multiagent_mnist_network_analyisis.yaml: identical
+# network-density study (sweep graph.max_edge_frac x {non_cooperative, sheaf_frl})
+# but every agent shares the SAME architecture. The homogeneous CNN is exactly
+# the default `model: cnn_classifier` ([32, 64] encoder / [120] decoder,
+# dropout 0.1, batchnorm), so no per-agent `model.agents` overrides are needed.
+
+lmb_study:
+  enabled: true
+  efficient: true
+  n_trials: 15
+  n_tune_epochs: 5
+  lmb_low: 1e-4
+  lmb_high: 1e-1
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.4
+  similarity: intersection
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: netowrk_analysis_homo
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+optimizer:
+  lr: 1e-2
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 15
+  classes_per_agent: 10
+  shift_strength: 0.9
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4]
+    2:
+      agents: [2]
+      target_classes: [0, 1, 2, 3, 4, 5]
+    3:
+      agents: [3]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    4:
+      agents: [4]
+      target_classes: [0, 1, 2, 7, 8, 9]
+    5:
+      agents: [5]
+      target_classes: [2, 3, 4, 5, 6]
+    6:
+      agents: [6]
+      target_classes: [1, 2, 3, 4, 5, 6]
+    7:
+      agents: [7]
+      target_classes: [3, 4, 5, 6, 7]
+    8:
+      agents: [8]
+      target_classes: [0, 2, 4, 6, 8]
+    9:
+      agents: [9]
+      target_classes: [5, 6, 7, 8, 9]
+    10:
+      agents: [10]
+      target_classes: [1, 2, 3, 4, 5]
+    11:
+      agents: [11]
+      target_classes: [0, 1, 2, 8, 9]
+    12:
+      agents: [12]
+      target_classes: [3, 4, 5, 6, 7, 8]
+    13:
+      agents: [13]
+      target_classes: [1, 4, 6, 8, 9]
+    14:
+      agents: [14]
+      target_classes: [0, 1, 2, 3, 7]
+
+# Homogeneous models: all 15 agents use the default `model: cnn_classifier`
+# architecture. Intentionally no `model.agents` block (that is what makes this
+# the "homo" twin of the heterogeneous network-analysis config).
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  learn_whitening: true
+  gamma: 1e-3
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+  max_lmb: 1e-2
+  learn_lmb: false
+  dual_rho: null
+  comm_task_coeff: 0
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      graph.max_edge_frac: 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9
+      orchestrator: non_cooperative, sheaf_frl

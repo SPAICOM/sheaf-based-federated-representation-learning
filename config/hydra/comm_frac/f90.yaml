@@ -1,0 +1,5 @@
+# @package orchestrator
+# Communication-fraction ablation — 90% of every 10-epoch cycle is collaborative.
+# Over 100 epochs (10 cycles) this gives 90 collaborative (communication) epochs.
+collab_epochs: 9
+local_epochs: 1

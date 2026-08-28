@@ -1,31 +1,45 @@
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
-  - orchestrator: sheaf_frl
+  - orchestrator: ce_sheaf_frl
   - optimizer: sgd
+  - comm_frac: f50            # collab/local epoch split (# @package orchestrator); swept below
   - _self_
 
 seed: 42
-study_name: "HeteroRate MNIST 15 agents"
+study_name: "CommFrac ablation CESheafFRL MNIST 15 agents"
+
+# ── Communication-fraction ablation ───────────────────────────────────────────
+# Replicates the multiagent_mnist_shift_distr setup (same 15-agent heterogeneous
+# MNIST, same class_overlap graph, same models) but runs CESheafFRL for 100
+# epochs and sweeps *how often agents communicate*: the collaborative/local split
+# is a 10-epoch cycle, so `comm_frac=f10..f90` gives 10..90 collaborative
+# (communication) epochs out of 100. Crossed with orchestrator.local_reg =
+# {false, true} to see whether regularizing toward frozen neighbours during the
+# communication-free local epochs helps. shift_strength is held FIXED at 0.7.
+#
+# lmb_study is DISABLED on purpose: max_lmb is held fixed across every run so the
+# only thing varying is the communication fraction (and local_reg) — an Optuna
+# search per trial would retune lambda for each cell and confound the ablation.
 
 lmb_study:
   enabled: false
-  # efficient: true
-  # n_trials: 15
-  # n_tune_epochs: 5
-  # lmb_low: 1e-4
-  # lmb_high: 1e-1
+  efficient: true
+  n_trials: 15
+  n_tune_epochs: 5
+  lmb_low: 1e-4
+  lmb_high: 1e-1
 
 graph:
   neighbors_mode: "class_overlap"
-  max_edge_frac: 0.4
-  similarity: intersection
+  max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
+  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: anchor_selection_sfrl
+  project: comm_ablation
   group: ${study_name}
-  name: anchor_${orchestrator.anchor_selection}_na${orchestrator.num_anchors}_trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.comm_frac}_trial_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -57,10 +71,6 @@ dataset:
   num_workers: 0
   mode: min_size
   pilot_split: 0.1
-  # Per-step pilot batch for the rotating step-batch penalty path and SWBN
-  # statistics.  Anchor selection (random/proto_kmeans budgets) now draws
-  # from the FULL pilot split at every map refresh, so this no longer needs
-  # to exceed num_anchors.
   pilot_batch_size: 64
   comm_data: shared_global_pilots
   groups:
@@ -120,7 +130,7 @@ model:
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128, 224]
+      encoder_hidden_dims: [32, 64, 128, 224]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
@@ -132,7 +142,7 @@ model:
       use_batchnorm: true
     3:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128, 128]
+      encoder_hidden_dims: [64, 128, 128]  # +3rd block: pools 7x7 -> 3x3
       decoder_hidden_dims: [256, 128]
       dropout: 0.25
       use_batchnorm: true
@@ -206,20 +216,22 @@ model:
 orchestrator:
   pid_logging: false
   log_latent_diagnostics: true
-  # Sheaf FRL specific
+  # Sheaf FRL specific (fixed across the ablation)
   warmup_epochs: 0
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
   learn_whitening: true
-  gamma: 1e-3
-  eta: 0.01
-  # Post-training alignment
-  alignment_method: procrustes
-  max_lmb: 1e-2
+  anchor_selection: all
+  num_anchors: 32
+  max_lmb: 1e-2           # held fixed (lmb_study disabled) so only comm-fraction varies
   learn_lmb: false
   dual_rho: null
   comm_task_coeff: 0
+  # collab_epochs / local_epochs come from the comm_frac group (swept below).
+  # local_reg default lives in orchestrator/ce_sheaf_frl.yaml (false); swept below.
+  # Post-training alignment baseline
+  alignment_method: procrustes
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch
@@ -229,14 +241,6 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      orchestrator: sheaf_frl
-      orchestrator.alignment_method: procrustes
-      # Keep the budgets at or below a few multiples of the latent dim —
-      # Procrustes on a whitened pool saturates well before ~512 anchors, so
-      # larger values all produce (near-)identical maps and aren't needed to
-      # answer this sweep's question. The live per-step re-encode is now
-      # bounded to pilot_batch_size regardless of num_anchors (SheafFRL
-      # _rotating_rows), so a one-off run at 512/1024 to confirm saturation
-      # at the top end is safe if you want it — just not the sweep default.
-      orchestrator.num_anchors: 1024
-      orchestrator.anchor_selection: random, proto_kmeans
+      orchestrator: non_cooperative
+      # comm_frac: f10, f20, f30, f40, f50, f60, f70, f80, f90
+      # orchestrator.local_reg: false, true

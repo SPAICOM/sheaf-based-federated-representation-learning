@@ -9,10 +9,17 @@ under each ``orchestrator.anchor_selection`` strategy (``all`` / ``random`` /
 chosen and *how big* it is, with everything else held constant.
 
 The curves are grouped by **(orchestrator, alignment method, anchor-selection)
-method** — e.g. "Sheaf-FRL + Procrustes + Random subset" — since the project
-mixes more than one orchestrator, more than one ``orchestrator.alignment_method``
-(``general`` / ``procrustes`` / ``relative``), and more than one anchor strategy.
-It produces one figure, one curve per method, of
+method**, since the project mixes more than one orchestrator, more than one
+``orchestrator.alignment_method`` (``general`` / ``procrustes`` / ``relative``),
+and more than one anchor strategy. By default only ``alignment_method ==
+'procrustes'`` runs are kept; pass ``--all-alignment-strategies`` to include
+``general``/``relative`` too. The legend label reflects this: by default
+(procrustes-only) it drops the now-constant alignment segment and reads just
+``<Orchestrator> + <anchor strategy>`` (e.g. "Sheaf-FRL + Random subset");
+with ``--all-alignment-strategies`` it reads ``<Orchestrator> + <alignment> +
+<anchor strategy>`` (e.g. "Sheaf-FRL + Procrustes + Random subset") so
+methods that only differ by alignment stay distinguishable. It produces one
+figure, one curve per method, of
 
     ``test/avg_comm_task_perf``  (avg. communication accuracy)  vs num anchors
 
@@ -43,6 +50,9 @@ Usage:
 
     # Read from logs/wandb instead (falls back to remote if empty).
     python scripts/plot_anchor_selection_metrics.py --local
+
+    # Include general/relative alignment runs too (default: procrustes only).
+    python scripts/plot_anchor_selection_metrics.py --all-alignment-strategies
 """
 
 from __future__ import annotations
@@ -103,14 +113,20 @@ _MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', '<']
 Combo = tuple[str, str, str]
 
 
-def _combo_label(combo: Combo) -> str:
-    """Legend label: ``<Orchestrator> + <alignment> + <anchor strategy>``."""
+def _combo_label(combo: Combo, show_alignment: bool = True) -> str:
+    """Legend label: ``<Orchestrator> + <alignment> + <anchor strategy>``.
+
+    ``show_alignment=False`` drops the middle ``<alignment>`` segment,
+    leaving just ``<Orchestrator> + <anchor strategy>`` — safe whenever every
+    combo shares the same alignment method (e.g. the default procrustes-only
+    run set), since then it adds no disambiguating information.
+    """
     orch, align, sel = combo
-    return (
-        f'{ORCH_LABELS.get(orch, orch)} + '
-        f'{ALIGN_LABELS.get(align, align)} + '
-        f'{ANCHOR_LABELS.get(sel, sel)}'
-    )
+    parts = [ORCH_LABELS.get(orch, orch)]
+    if show_alignment:
+        parts.append(ALIGN_LABELS.get(align, align))
+    parts.append(ANCHOR_LABELS.get(sel, sel))
+    return ' + '.join(parts)
 
 
 def _combo_sort_key(combo: Combo) -> tuple[int, str, int, str, int, str]:
@@ -313,19 +329,22 @@ def _plot_metric_on_ax(
     ylabel: str,
     xvals: list[float],
     baseline: set[str],
+    show_alignment: bool = True,
 ) -> None:
     """Draw one metric-vs-num_anchors panel, one curve per method.
 
     A method whose anchor strategy is in ``baseline`` (e.g. ``all``, which
     ignores ``num_anchors``) is drawn as a horizontal reference line spanning
-    the x-range instead of a per-``num_anchors`` curve.
+    the x-range instead of a per-``num_anchors`` curve. ``show_alignment``
+    controls whether the alignment method appears in each curve's label —
+    see :func:`_combo_label`.
     """
     for combo in combos:
         xs, ys = _series_xy(runs, combo, value_key)
         if len(xs) == 0:
             continue
         _orch, _align, sel = combo
-        label = _combo_label(combo)
+        label = _combo_label(combo, show_alignment=show_alignment)
         if sel in baseline:
             ax.axhline(
                 float(np.mean(ys)),
@@ -360,6 +379,7 @@ def plot_anchor_metrics(
     out_dir: Path,
     fname: str,
     baseline: set[str],
+    show_alignment: bool = True,
 ) -> None:
     """Avg. communication accuracy vs num anchors, one curve per method."""
     # The x-axis is defined by the *swept* (non-baseline) methods; a baseline
@@ -380,6 +400,7 @@ def plot_anchor_metrics(
             'Avg. communication accuracy',
             xvals,
             baseline,
+            show_alignment=show_alignment,
         )
         # One legend. With the longer combined labels it's drawn above the
         # panel, spanning its width; two columns unless there are very few
@@ -431,6 +452,13 @@ def main() -> None:
         'found.',
     )
     parser.add_argument(
+        '--all-alignment-strategies',
+        action='store_true',
+        help="Keep every orchestrator.alignment_method ('general' / "
+        "'procrustes' / 'relative') instead of restricting to 'procrustes' "
+        '(the default).',
+    )
+    parser.add_argument(
         '--baseline',
         nargs='*',
         default=['all'],
@@ -479,6 +507,16 @@ def main() -> None:
             f'({"local" if args.local else "remote"}).'
         )
 
+    if not args.all_alignment_strategies:
+        runs = {k: meta for k, meta in runs.items() if k[1] == 'procrustes'}
+        if not runs:
+            raise SystemExit(
+                f'No completed runs left for project {project!r} after '
+                "restricting to alignment_method='procrustes' (pass "
+                '--all-alignment-strategies to include general/relative '
+                'too).'
+            )
+
     combos = _ordered_combos({(o, a, s) for (o, a, s, _na) in runs})
     colors, markers = _style_maps(combos)
     nas = sorted({na for (*_, na) in runs})
@@ -499,6 +537,7 @@ def main() -> None:
         args.out_dir,
         'comm_perf_vs_num_anchors.png',
         baseline,
+        show_alignment=args.all_alignment_strategies,
     )
 
     table = summary_df(runs, combos)

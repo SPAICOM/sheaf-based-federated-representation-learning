@@ -27,15 +27,14 @@ x-axis, one curve per orchestrator:
     2. ``test/avg_private_task_perf`` (private task performance)
 
 These reuse the exact plotting machinery from ``plot_multiagent_metrics.py``
-(:func:`plot_metric_vs_x` / :func:`plot_two_metrics_vs_x`), so the styling is
-identical: by default (``adjusted=True``) each orchestrator's points are
-dodged slightly off the shared bottleneck-dim value and the per-agent spread
-(± std of ``test/comm_task_perf_agent_{i}`` / ``test/private_task_perf_agent_{i}``)
-is drawn as small error-bar caps (bar-plot style) rather than a translucent
-band. Pass ``--together`` to draw both metrics side by side in one figure
-(same per-panel proportions as the standalone plots) with a single shared
-legend, in three columns, sitting just above both panels, instead of two
-separate figures. Either way, the mean/std summary is also written to CSV.
+(:func:`plot_metric_vs_x` / :func:`plot_two_metrics_vs_x`), so the styling
+matches every other figure here: points sit exactly on the shared
+bottleneck-dim value (no dodge) and the per-agent spread is hidden entirely
+(``show_error=False``) rather than drawn as a band or error-bar caps. Pass
+``--together`` to draw both metrics side by side in one figure (same
+per-panel proportions as the standalone plots) with a single shared legend,
+in three columns, sitting just above both panels, instead of two separate
+figures. Either way, the mean/std summary is also written to CSV.
 
 Runs are scoped by their wandb *project* (a run property, not a config
 value), so runs from other projects that reuse the same study name are never
@@ -47,6 +46,7 @@ Usage:
         --entity my-team \\
         --project sfrl_hetero_bottleneck --out_dir results/hetero_bottleneck/plots
     python scripts/plot_hetero_bottleneck_metrics.py --together
+    python scripts/plot_hetero_bottleneck_metrics.py --comm-legend-outside
 
     # Read from logs/wandb instead (falls back to remote if empty).
     python scripts/plot_hetero_bottleneck_metrics.py --local
@@ -274,6 +274,15 @@ def main() -> None:
         'separate figures.',
     )
     parser.add_argument(
+        '--comm-legend-outside',
+        action='store_true',
+        help='Draw the standalone comm-task-perf figure ('
+        "'comm_task_perf_vs_bottleneck_dim.png', only produced without "
+        '--together) with its legend above the axis instead of inside it, '
+        'wrapped into 3 columns (2 rows for 6 orchestrators) rather than '
+        'one row.',
+    )
+    parser.add_argument(
         '--shift_strength',
         type=float,
         default=0.7,
@@ -403,6 +412,8 @@ def main() -> None:
             'comm_task_perf',
             'Avg. communication accuracy',
             estimator='mean',
+            legend_loc='outside' if args.comm_legend_outside else 'inside',
+            legend_ncol=3 if args.comm_legend_outside else None,
             **x_kwargs,
         )
         print('\nPlot 2: private task performance vs bottleneck dim …')
