@@ -5,6 +5,7 @@ alignment is performed during training, so cumulative communication remains
 zero throughout the run.
 """
 
+import inspect
 from typing import Any
 
 import torch
@@ -79,8 +80,13 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
     def on_train_epoch_end(self) -> None:
         """No communication or aggregation is performed."""
         self._finalize_train_epoch_communication()
-        self._log_train_comm_task_perf()
+        if getattr(self, '_trainer', None) is not None:
+            self._log_train_comm_task_perf()
         return None
+
+    @staticmethod
+    def _supports_eval_mask(method) -> bool:
+        return 'eval_mask' in inspect.signature(method).parameters
 
     def _shared_eval(
         self,
@@ -94,9 +100,25 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         agent_performances = {}
 
         for idx, agent in self.agents.items():
-            y_hat, y = outputs[idx]
-            agent_losses[int(idx)] = agent.compute_loss(y_hat, y)
-            agent_performances[int(idx)] = agent.task_performance(y_hat, y)
+            y_hat, y, *rest = outputs[idx]
+            eval_mask = rest[0] if rest else None
+            if self._supports_eval_mask(agent.compute_loss):
+                agent_losses[int(idx)] = agent.compute_loss(
+                    y_hat,
+                    y,
+                    eval_mask=eval_mask,
+                )
+            else:
+                agent_losses[int(idx)] = agent.compute_loss(y_hat, y)
+
+            if self._supports_eval_mask(agent.task_performance):
+                agent_performances[int(idx)] = agent.task_performance(
+                    y_hat,
+                    y,
+                    eval_mask=eval_mask,
+                )
+            else:
+                agent_performances[int(idx)] = agent.task_performance(y_hat, y)
 
         total_loss, _avg_performance = self._log_shared_metrics(
             prefix=prefix,

@@ -5,6 +5,8 @@ evaluate_communication_accuracy override that wraps the base class's generic
 loop with conditional map fitting and cleanup.
 """
 
+import math
+
 import torch
 
 from src.communication.whitening import (
@@ -100,7 +102,7 @@ class PostTrainingAlignmentMixin:
             return torch.stack(xs)
 
         def _collate_xy(batch):
-            xs, ys = [], []
+            xs, ys, masks = [], [], []
             for item in batch:
                 x = item[0]
                 if isinstance(x, _PILImg.Image):
@@ -445,7 +447,7 @@ class PostTrainingAlignmentMixin:
             return {}
 
         def _collate_xy(batch):
-            xs, ys = [], []
+            xs, ys, mask_items = [], [], []
             for item in batch:
                 x = item[0]
                 if isinstance(x, _PILImg.Image):
@@ -455,10 +457,19 @@ class PostTrainingAlignmentMixin:
                 ys.append(
                     y if isinstance(y, torch.Tensor) else torch.tensor(y)
                 )
-            return torch.stack(xs), torch.stack(ys)
+                if len(item) > 2:
+                    mask_items.append(item[2])
+            if mask_items:
+                return (
+                    torch.stack(xs),
+                    torch.stack(ys),
+                    torch.stack(mask_items),
+                )
+            return torch.stack(xs), torch.stack(ys), None
 
         test_Z: dict[int, torch.Tensor] = {}
         test_y: dict[int, torch.Tensor] = {}
+        test_masks: dict[int, torch.Tensor] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -476,17 +487,21 @@ class PostTrainingAlignmentMixin:
             )
             was_training = agent.training
             agent.eval()
-            Zs, ys = [], []
-            for x_batch, y_batch in loader:
+            Zs, ys, masks = [], [], []
+            for x_batch, y_batch, mask_batch in loader:
                 Zs.append(
                     agent.encode(x_batch.to(self.device)).detach().cpu().float()
                 )
                 ys.append(y_batch.cpu())
+                if mask_batch is not None:
+                    masks.append(mask_batch.cpu())
             agent.train(was_training)
 
             if Zs:
                 test_Z[idx] = torch.cat(Zs, dim=0)
                 test_y[idx] = torch.cat(ys, dim=0)
+                if masks:
+                    test_masks[idx] = torch.cat(masks, dim=0)
 
         if not test_Z:
             return {}
@@ -496,14 +511,82 @@ class PostTrainingAlignmentMixin:
             for k, v in self.hparams.neighbors.items()
         }
 
-        # Communication accuracy is a classification-only metric: the
-        # receiver's decoder is expected to return logits, so AE agents
-        # (decoder returns an image) are skipped both as receivers and as
-        # self-accuracy targets. They can still act as senders.
         def _is_classifier(agent) -> bool:
             return (
                 getattr(agent, 'task_type', 'classification')
                 == 'classification'
+            )
+
+        def _is_reconstruction(agent) -> bool:
+            return (
+                getattr(agent, 'task_type', 'classification')
+                == 'reconstruction'
+            )
+
+        def _expand_mask(
+            eval_mask: torch.Tensor | None,
+            reference: torch.Tensor,
+        ) -> torch.Tensor | None:
+            if eval_mask is None:
+                return None
+            mask = eval_mask.to(device=reference.device, dtype=reference.dtype)
+            while mask.ndim < reference.ndim:
+                mask = mask.unsqueeze(1)
+            if mask.shape[1] == 1 and reference.shape[1] != 1:
+                mask = mask.expand_as(reference)
+            return mask
+
+        def _reconstruction_mse(
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            eval_mask: torch.Tensor | None = None,
+        ) -> float:
+            target = y.to(y_hat.device).detach()
+            if target.shape != y_hat.shape:
+                target = target.reshape_as(y_hat)
+            mask = _expand_mask(eval_mask, y_hat)
+            if mask is None:
+                mse_t = torch.nn.functional.mse_loss(
+                    y_hat.detach(),
+                    target,
+                )
+            else:
+                diff_sq = (y_hat.detach() - target).pow(2)
+                mse_t = (diff_sq * mask).sum() / mask.sum().clamp_min(1.0)
+            return float(mse_t.detach().cpu().clamp_min(1e-10).item())
+
+        def _task_perf(
+            agent,
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            eval_mask: torch.Tensor | None = None,
+        ) -> float:
+            if _is_classifier(agent):
+                preds = y_hat.argmax(dim=1).cpu()
+                return float((preds == y).float().mean().item())
+            if _is_reconstruction(agent):
+                mse = _reconstruction_mse(y_hat, y, eval_mask=eval_mask)
+                return 10.0 * math.log10(1.0 / mse)
+            return float('nan')
+
+        def _missing_mse(
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            visible_mask: torch.Tensor,
+        ) -> float:
+            mask = _expand_mask(visible_mask, y_hat)
+            if mask is None:
+                return float('nan')
+            target = y.to(y_hat.device).detach()
+            if target.shape != y_hat.shape:
+                target = target.reshape_as(y_hat)
+            missing = 1.0 - mask
+            diff_sq = (y_hat.detach() - target).pow(2)
+            return float(
+                ((diff_sq * missing).sum() / missing.sum().clamp_min(1.0))
+                .detach()
+                .cpu()
+                .item()
             )
 
         self_accs: dict[int, float] = {}
@@ -512,17 +595,36 @@ class PostTrainingAlignmentMixin:
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
                 continue
-            if not _is_classifier(agent):
+            if not (_is_classifier(agent) or _is_reconstruction(agent)):
                 continue
             was_training = agent.training
             agent.eval()
-            logits = agent.decoder(test_Z[idx].to(self.device))
+            y_hat = agent.decoder(test_Z[idx].to(self.device))
             agent.train(was_training)
-            preds = logits.argmax(dim=1).cpu()
-            self_accs[idx] = float(
-                (preds == test_y[idx]).float().mean().item()
+            self_accs[idx] = _task_perf(
+                agent,
+                y_hat,
+                test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
+            if _is_reconstruction(agent):
+                logs[f'{prefix}/private_mse_full_agent_{idx}'] = (
+                    _reconstruction_mse(
+                        y_hat,
+                        test_y[idx],
+                    )
+                )
+            if _is_reconstruction(agent) and idx in test_masks:
+                logs[f'{prefix}/private_mse_visible_agent_{idx}'] = (
+                    _reconstruction_mse(
+                        y_hat,
+                        test_y[idx],
+                        eval_mask=test_masks[idx],
+                    )
+                )
+                logs[f'{prefix}/private_mse_missing_agent_{idx}'] = (
+                    _missing_mse(y_hat, test_y[idx], test_masks[idx])
+                )
 
         if self_accs:
             logs[f'{prefix}/avg_private_task_perf'] = (
@@ -536,12 +638,16 @@ class PostTrainingAlignmentMixin:
             receiver_idx = int(idx_str)
             if not hasattr(agent_receiver, 'decoder'):
                 continue
-            if not _is_classifier(agent_receiver):
+            if not (
+                _is_classifier(agent_receiver)
+                or _is_reconstruction(agent_receiver)
+            ):
                 continue
             if receiver_idx not in test_Z:
                 continue
 
             neighbor_accs: list[float] = []
+            neighbor_visible_mses: list[float] = []
             for sender_idx in neighbors_map.get(receiver_idx, set()):
                 if sender_idx not in test_Z:
                     continue
@@ -563,19 +669,40 @@ class PostTrainingAlignmentMixin:
 
                 was_training = agent_receiver.training
                 agent_receiver.eval()
-                logits = agent_receiver.decoder(Z_colored.to(self.device))
+                y_hat = agent_receiver.decoder(Z_colored.to(self.device))
                 agent_receiver.train(was_training)
 
-                preds = logits.argmax(dim=1).cpu()
-                acc = float(
-                    (preds == test_y[sender_idx]).float().mean().item()
+                acc = _task_perf(
+                    agent_receiver,
+                    y_hat,
+                    test_y[sender_idx],
                 )
                 neighbor_accs.append(acc)
+                if _is_reconstruction(agent_receiver):
+                    neighbor_visible_mses.append(
+                        _reconstruction_mse(
+                            y_hat,
+                            test_y[sender_idx],
+                        )
+                    )
 
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
                 logs[f'{prefix}/comm_task_perf_agent_{receiver_idx}'] = avg_acc
+                if neighbor_visible_mses:
+                    avg_mse = sum(neighbor_visible_mses) / len(
+                        neighbor_visible_mses
+                    )
+                    logs[f'{prefix}/comm_mse_full_agent_{receiver_idx}'] = (
+                        avg_mse
+                    )
+                    logs[
+                        f'{prefix}/comm_mse_tx_missing_rx_visible_agent_{receiver_idx}'
+                    ] = avg_mse
+                    logs[f'{prefix}/comm_mse_visible_agent_{receiver_idx}'] = (
+                        avg_mse
+                    )
 
                 self_acc = self_accs.get(receiver_idx, 0.0)
                 fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
@@ -590,5 +717,44 @@ class PostTrainingAlignmentMixin:
             logs[f'{prefix}/avg_task_fidelity'] = (
                 sum(task_fidelities.values()) / len(task_fidelities)
             )
+        comm_visible = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/comm_mse_visible_agent_')
+        ]
+        if comm_visible:
+            logs[f'{prefix}/avg_comm_mse_visible'] = sum(comm_visible) / len(
+                comm_visible
+            )
+            logs[f'{prefix}/avg_comm_mse_tx_missing_rx_visible'] = logs[
+                f'{prefix}/avg_comm_mse_visible'
+            ]
+        private_visible = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_visible_agent_')
+        ]
+        if private_visible:
+            logs[f'{prefix}/avg_private_mse_visible'] = sum(
+                private_visible
+            ) / len(private_visible)
+        private_full = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_full_agent_')
+        ]
+        if private_full:
+            logs[f'{prefix}/avg_private_mse_full'] = sum(private_full) / len(
+                private_full
+            )
+        private_missing = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_missing_agent_')
+        ]
+        if private_missing:
+            logs[f'{prefix}/avg_private_mse_missing'] = sum(
+                private_missing
+            ) / len(private_missing)
 
         return logs

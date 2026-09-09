@@ -62,8 +62,10 @@ class PairwiseDataset(Dataset):
         item_j = self.dataset_j[idx]
         x_i, label = item_i[0], item_i[1]
         x_j = item_j[0]
-        if len(item_i) == 3:
-            return x_i, x_j, label, item_i[2]
+        if len(item_i) >= 3:
+            candidate = item_i[-1]
+            if isinstance(candidate, torch.Tensor) and candidate.ndim == 0:
+                return x_i, x_j, label, candidate
         return x_i, x_j, label
 
 

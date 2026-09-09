@@ -12,6 +12,8 @@ Features:
 - Create train/val/test partitions
 """
 
+from typing import Callable
+
 import lightning as l
 import torch
 from datasets import concatenate_datasets, load_dataset
@@ -93,6 +95,7 @@ class ClassificationDataset(Dataset):
         label_key: str = 'label',
         rotation_angle: float = 0,
         sample_ids: list[int] | None = None,
+        transform: Callable | None = None,
     ) -> None:
         self.dataset = hf_dataset
         self.data_key = data_key
@@ -100,6 +103,7 @@ class ClassificationDataset(Dataset):
         # Normalize rotation angle to [0, 360) range
         self.rotation_angle = rotation_angle % 360
         self.sample_ids = sample_ids
+        self.transform = transform
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -129,6 +133,8 @@ class ClassificationDataset(Dataset):
         data = item[self.data_key]
         if isinstance(data, list):
             data = torch.tensor(data, dtype=torch.float32)
+        elif self.transform is not None:
+            data = self.transform(data)
 
         # Extract label from specified column
         # Convert integer labels to long tensors for classification
@@ -301,6 +307,18 @@ class ClassificationDataModule(l.LightningDataModule):
         self.comm_data = comm_data
         self.starve_clients = starve_clients
         self.seed = seed
+        # Augment only CIFAR-10 training images. Validation, test, and pilot
+        # datasets intentionally retain the unmodified inputs.
+        self.train_transform = (
+            transforms.Compose(
+                [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                ]
+            )
+            if self.name.lower() == 'cifar10'
+            else None
+        )
 
     def _starve_training_datasets(self, label_key: str) -> None:
         """Reduce train data by 80% for a deterministic half of clients."""
@@ -338,6 +356,7 @@ class ClassificationDataModule(l.LightningDataModule):
                 train_dataset.label_key,
                 rotation_angle=train_dataset.rotation_angle,
                 sample_ids=sample_ids,
+                transform=train_dataset.transform,
             )
             self.num_classes[client_idx] = len(
                 set(self.train_datasets[client_idx].dataset[label_key])
@@ -408,7 +427,11 @@ class ClassificationDataModule(l.LightningDataModule):
         if self.n_agents == 1:
             rotation = self.agent_rotations.get(0, 0)
             self.train_datasets[0] = ClassificationDataset(
-                train, self.data_key, label_key, rotation_angle=rotation
+                train,
+                self.data_key,
+                label_key,
+                rotation_angle=rotation,
+                transform=self.train_transform,
             )
             self.val_datasets[0] = ClassificationDataset(
                 val, self.data_key, label_key, rotation_angle=rotation
@@ -439,6 +462,7 @@ class ClassificationDataModule(l.LightningDataModule):
                     self.data_key,
                     label_key,
                     rotation_angle=rotation,
+                    transform=self.train_transform,
                 )
                 self.val_datasets[i] = ClassificationDataset(
                     val.select(val_splits[i].tolist()),
@@ -524,6 +548,11 @@ class ClassificationDataModule(l.LightningDataModule):
                     self.data_key,
                     label_key,
                     rotation_angle=rotation,
+                    transform=(
+                        self.train_transform
+                        if target_dict == 'train_datasets'
+                        else None
+                    ),
                 )
 
         for i in range(self.n_agents):
@@ -594,6 +623,11 @@ class ClassificationDataModule(l.LightningDataModule):
                     self.data_key,
                     label_key,
                     rotation_angle=rotation,
+                    transform=(
+                        self.train_transform
+                        if target_dict == 'train_datasets'
+                        else None
+                    ),
                 )
 
         for i in range(self.n_agents):
@@ -654,6 +688,11 @@ class ClassificationDataModule(l.LightningDataModule):
                     self.data_key,
                     label_key,
                     rotation_angle=rotation,
+                    transform=(
+                        self.train_transform
+                        if target_dict == 'train_datasets'
+                        else None
+                    ),
                 )
 
         for i in range(self.n_agents):
@@ -921,10 +960,13 @@ class ClassificationDataModule(l.LightningDataModule):
 
         chunks: list[torch.Tensor] = []
         for i in range(len(ds)):
-            item = ds[i]
-            x = item[0]
+            # Access the wrapped HuggingFace dataset directly so this metric
+            # remains in the raw input space, independent of augmentation.
+            x = ds.dataset[i][ds.data_key]
             if isinstance(x, Image.Image):
                 x = transforms.ToTensor()(x)
+            elif isinstance(x, list):
+                x = torch.tensor(x, dtype=torch.float32)
             chunks.append(x.float().flatten())
 
         X = torch.stack(chunks, dim=0)  # (N, C*H*W)

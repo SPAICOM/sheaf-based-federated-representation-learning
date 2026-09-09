@@ -1,0 +1,155 @@
+defaults:
+  - dataset: hetero_cifar10
+  - model: resnet_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate Cifar10 2 agents"
+
+lmb_study:
+  enabled: true         # set to true to run Optuna search before the full training run
+  efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
+  n_trials: 20          # number of Optuna trials
+  n_tune_epochs: 10     # epochs per trial
+  lmb_low: 1e-4         # lower bound of the log-uniform search interval
+  lmb_high: 1
+
+# Optuna study run before the full SheafFRL training.  The model-level L2
+# penalty is disabled below, so this study controls the only weight decay.
+optimizer_study:
+  enabled: false
+  n_trials: 20
+  n_tune_epochs: 10
+  lr_low: 1e-4
+  lr_high: 1e-1
+  weight_decay_low: 1e-6
+  weight_decay_high: 1e-2
+  objective_metric: validation/avg_task_performance_epoch
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 1.0          # <= 40% of the n(n-1)/2 possible edges
+  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: 2agents_cifar10_trial
+  group: ${study_name}
+
+
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 40
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+  early_stopping:
+      _target_: lightning.pytorch.callbacks.EarlyStopping
+      monitor: validation/avg_task_performance_epoch
+      mode: max
+      patience: 8
+      min_delta: 0.001
+  model_checkpoint:
+      _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${hydra:runtime.output_dir}/checkpoints
+      filename: best-{epoch:02d}
+      monitor: validation/avg_task_performance_epoch
+      mode: max
+      save_top_k: 1
+      save_last: true
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.5
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 12
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+
+# equal architectures 
+model:
+  #weight_decay: 0.0
+  agents:
+    0:
+      _target_: src.agents.ResNetClassifier
+      encoder_hidden_dims: [64, 128, 256, 512]
+      blocks_per_stage: [2, 2, 2, 2] # resnet
+      stage_strides: [1, 2, 2, 2] # resnet
+      decoder_hidden_dims: [256]
+      dropout: 0.1
+      use_batchnorm: true
+
+      stem_kernel_size: 3
+      stem_stride: 1
+      stem_pool: false
+    1:
+      _target_: src.agents.ResNetClassifier
+      encoder_hidden_dims: [64, 128, 256, 512]
+      blocks_per_stage: [2, 2, 2, 2] # resnet
+      stage_strides: [1, 2, 2, 2] # resnet
+      decoder_hidden_dims: [256]
+      dropout: 0.1
+      use_batchnorm: true
+
+      stem_kernel_size: 3
+      stem_stride: 1
+      stem_pool: false
+
+orchestrator:
+  pid_logging: false
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0 # just for sheaf_frl
+  use_general_maps: false
+  soft_maps: false
+  learn_whitening: true
+  # CE Sheaf FRL specific
+  phase_a_epochs: 1
+  phase_c_epochs: 2
+  # Sheaf compressed FRL
+  compression_factor: 0.5
+  # Sheaf FMTL specific
+  gamma: 1e-4
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+  max_lmb: 1e-2
+  learn_lmb: false
+  comm_task_coeff: 0
+  align_on_intersection: false
+  dual_rho: 0.3
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: RUN

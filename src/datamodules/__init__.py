@@ -4,6 +4,7 @@ Data modules for loading and distributing datasets across federated agents.
 This package provides PyTorch Lightning data modules for three dataset types:
 
 - ClassificationDataModule: For image classification (CIFAR, MNIST, etc.)
+- MaskedCIFARDataModule: For masked CIFAR-10 inpainting
 - HeteroClassificationDataModule: Client-first non-IID classification splits
 - SemanticDataModule: For pre-computed embeddings with semantic attributes
 - MHealthDataModule: For MHEALTH wearable-sensor activity recognition
@@ -19,6 +20,7 @@ All support:
 from .classification_datamodule import ClassificationDataModule
 from .deepsense_datamodule import DeepSenseDataModule
 from .hetero_datamodule import HeteroClassificationDataModule
+from .masked_cifar_datamodule import MaskedCIFARDataModule
 from .mfeat_datamodule import MFEAT_MODALITIES, MFeatDataModule
 from .mhealth_datamodule import MHEALTH_SENSOR_MODALITIES, MHealthDataModule
 from .semantic_datamodule import SemanticDataModule
@@ -26,6 +28,7 @@ from .semantic_datamodule import SemanticDataModule
 __all__ = [
     'ClassificationDataModule',
     'HeteroClassificationDataModule',
+    'MaskedCIFARDataModule',
     'MHealthDataModule',
     'MHEALTH_SENSOR_MODALITIES',
     'MFeatDataModule',

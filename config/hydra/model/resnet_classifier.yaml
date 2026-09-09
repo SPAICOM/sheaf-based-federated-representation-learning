@@ -1,0 +1,21 @@
+_target_: src.agents.ResNetClassifier
+
+in_features: null
+num_classes: null
+
+encoder_hidden_dims: [64, 128, 256, 512]
+blocks_per_stage: [2, 2, 2, 2]
+stage_strides: [1, 2, 2, 2]
+
+decoder_hidden_dims: [256]
+
+dropout: 0.0
+use_batchnorm: true
+
+stem_kernel_size: 3
+stem_stride: 1
+stem_pool: false
+
+weight_decay: 5e-4
+l1_reg: 0.0
+sparsity_type: l1
