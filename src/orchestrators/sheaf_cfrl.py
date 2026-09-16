@@ -234,22 +234,29 @@ class SheafCFRL(CESheafFRL):
         Z_i: torch.Tensor,
         Z_j: torch.Tensor,
         prefix: str = 'train',
+        *,
+        mode: str = 'refit',
     ) -> None:
-        """Record one edge's refresh using compressed ``c_ij``-dimensional payloads.
+        """Record one edge's ONE-DIRECTIONAL exchange for the compressed stalk.
 
-        Overrides :meth:`SheafFRL._record_edge_exchange`: each direction
-        carries ``n_rows`` rows of the *shared* compressed edge-stalk
-        dimension ``c_ij`` (looked up via ``self._edge_c_ij``), not ``Z_i``/
-        ``Z_j``'s own raw ``d_a``/``d_b`` dims — both directions send the same
-        ``n_rows*c_ij`` scalars, unlike :class:`SheafFRL`'s heterogeneous
-        ``d_i``/``d_j``.
+        Overrides :meth:`SheafFRL._record_edge_exchange`.  Same convention: the
+        larger model (node_a, ``d_a ≥ d_b``) is the receiver, so the **smaller**
+        node_b transmits.
+
+        * ``mode='refit'``   — the smaller node sends its RAW pilots (``n × d_b``)
+          so the larger node runs the SOC-ADMM fit; charged once per refresh.
+        * ``mode='penalty'`` — the *compressed/aligned* pilots in the shared
+          edge stalk (``n × c_ij``); charged per step under ``anchor_selection='all'``.
+
+        Only the (smaller→larger) payload is counted (one direction).
         """
         n_rows = int(Z_i.shape[0])
         c_ij = self._edge_c_ij.get(edge_key)
         if n_rows <= 0 or c_ij is None:
             return
-        self._record_communication(n_rows * c_ij, prefix=prefix)
-        self._record_communication(n_rows * c_ij, prefix=prefix)
+        # refit → smaller node's raw dim (d_b = Z_j); penalty → compressed c_ij.
+        dim = Z_j.shape[1] if mode == 'refit' else c_ij
+        self._record_communication(n_rows * dim, prefix=prefix)
 
     def on_train_start(self) -> None:
         super().on_train_start()
@@ -348,7 +355,8 @@ class SheafCFRL(CESheafFRL):
             Z_a, y_a_shared, Z_b, y_b_shared = matched
             if record_step_exchange:
                 self._record_edge_exchange(
-                    edge_key, Z_a.detach(), Z_b.detach(), prefix='train'
+                    edge_key, Z_a.detach(), Z_b.detach(),
+                    prefix='train', mode='penalty',
                 )
 
             # Compressed coboundary: project both stalks into the c-dim edge space.
@@ -413,8 +421,12 @@ class SheafCFRL(CESheafFRL):
         if skip:
             return sheaf_penalty, after_comm
 
+        # Before the first collaborative epoch has populated a neighbour
+        # snapshot there is nothing to regularize toward, so train purely
+        # locally (zero penalty, no communication) rather than falling back to
+        # the both-live compressed coboundary.
         if not self._frozen_edge_anchors:
-            return self._both_live_alignment_losses(0.0, skip)
+            return sheaf_penalty, after_comm
 
         minibatch = self.hparams.anchor_selection == 'all'
         budget = self._row_budget() if minibatch else None

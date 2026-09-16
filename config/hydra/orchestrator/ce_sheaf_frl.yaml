@@ -43,12 +43,15 @@ filter_unseen_classes: False
 comm_task_coeff: 1.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
 
-# ── Decoupled local/collaborative schedule (communication-efficient) ──────────
-# Each cycle runs `collab_epochs` collaborative (classical SheafFRL, communicating)
-# epochs then `local_epochs` communication-free local epochs; the collaborative
-# fraction sets how often agents communicate (swept by the comm_frac ablation).
-collab_epochs: 1    # collaborative (communication) epochs per cycle  (was phase_c_epochs)
-local_epochs: 2     # communication-free local epochs per cycle       (was phase_a_epochs)
+# ── Decoupled communication schedule (communication-efficient) ────────────────
+# comm_percentage (in (0, 100]) fixes the EXACT number of collaborative
+# (communicating) epochs, round(comm_percentage/100 * total_epochs), spread as
+# uniformly as possible over the run; the rest are communication-free local
+# epochs. total_epochs: null reads the horizon from trainer.max_epochs.
+# (Replaces the old cyclic collab_epochs/local_epochs split, still accepted as a
+# deprecated alias. 0% is not valid — use the non_cooperative orchestrator.)
+comm_percentage: 50
+total_epochs: null
 # During local epochs the sheaf regularization disappears by default (pure local
 # task training); local_reg: true instead pulls each node toward the rotated,
 # whitened representations its neighbours sent during the last collaborative epoch.

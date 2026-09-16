@@ -80,6 +80,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         pid_batch_size: int = 256,
         pid_hidden_dim: int = 32,
         pid_embed_dim: int = 10,
+        eval_on_class_intersection: bool = False,
         **kwargs: Any,
     ):
         super().__init__()
@@ -92,6 +93,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
             )
         self.save_hyperparameters(ignore=['agents', 'cfg'])
 
+        # When True, the post-hoc alignment maps are FIT on, and the
+        # misalignment / MRR eval is SCORED on, only the pilots whose class
+        # falls in the intersection of the two endpoints' target classes — the
+        # region both agents actually trained on.  Stored as a plain attribute
+        # (not read from hparams) so it survives regardless of how subclasses
+        # capture their signature, and shared by the SheafFRL family and the
+        # post-hoc-alignment baselines alike for a like-for-like comparison.
+        self._eval_on_class_intersection = bool(eval_on_class_intersection)
+
         assert len(agents) > 0, 'The "agents" dictionary must be not empty'
 
         self.agents = nn.ModuleDict(
@@ -101,6 +111,64 @@ class BaseOrchestrator(l.LightningModule, ABC):
         self._latent_buffer: dict[int, list[torch.Tensor]] = {}
         self._global_pilot_buffer: dict[int, list[torch.Tensor]] = {}
         self._reset_communication_state()
+
+    # ── Per-agent target classes (for intersection-scoped fit / eval) ─────────
+
+    def _build_agent_target_classes(self) -> dict[int, set[int]] | None:
+        """Build per-agent target-class sets from the datamodule, or return None.
+
+        Reads ``dm.groups`` / ``dm.group_target_classes`` (the heterogeneous
+        grouped-non-iid setup). Available to every orchestrator so both the
+        post-hoc-alignment baselines and the SheafFRL family can scope their
+        fit/eval to the class overlap of an edge.
+        """
+        dm = getattr(self.trainer, 'datamodule', None)
+        if dm is None:
+            return None
+        groups: dict | None = getattr(dm, 'groups', None)
+        group_tc: dict | None = getattr(dm, 'group_target_classes', None)
+        if not groups or not group_tc:
+            return None
+        agent_tc: dict[int, set[int]] = {}
+        for gid, agent_ids in groups.items():
+            if gid in group_tc:
+                tc_set = set(group_tc[gid])
+                for aid in agent_ids:
+                    agent_tc[int(aid)] = tc_set
+        return agent_tc if agent_tc else None
+
+    def _resolve_agent_target_classes(self) -> dict[int, set[int]] | None:
+        """Cached ``_agent_target_classes`` (set by SheafFRL at train start), else build fresh."""
+        cached = getattr(self, '_agent_target_classes', None)
+        if cached is not None:
+            return cached
+        return self._build_agent_target_classes()
+
+    def _class_intersection_mask(
+        self,
+        agent_target_classes: dict[int, set[int]] | None,
+        i: int,
+        j: int,
+        labels: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Boolean mask over ``labels`` for classes in ``tc_i ∩ tc_j``.
+
+        Returns ``None`` (meaning "no filtering applicable — keep all rows")
+        when target classes are unknown or the intersection is empty, so callers
+        can treat ``None`` as a graceful no-op.
+        """
+        if agent_target_classes is None:
+            return None
+        ci = agent_target_classes.get(int(i))
+        cj = agent_target_classes.get(int(j))
+        if not ci or not cj:
+            return None
+        inter = ci & cj
+        if not inter:
+            return None
+        return torch.isin(
+            labels, torch.tensor(sorted(inter), dtype=labels.dtype)
+        )
 
     def _empty_communication_state(self) -> dict[str, float]:
         """Return a zero-initialized communication state."""
@@ -115,6 +183,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             split: self._empty_communication_state()
             for split in self._COMMUNICATION_SPLITS
         }
+        # Post-training-alignment methods refit maps every train epoch for
+        # monitoring; their pilot-exchange cost is charged exactly once per
+        # fit() run (see PostTrainingAlignmentMixin._fit_alignment_maps).
+        self._posthoc_comm_recorded = False
 
     def on_train_start(self) -> None:
         """Reset communication accounting at the start of training."""
@@ -1118,22 +1190,46 @@ class BaseOrchestrator(l.LightningModule, ABC):
         ``NotImplementedError``), or edges with no map fitted in the queried
         direction, are silently skipped.
 
+        Alongside the misalignment loss it also reports an instance-identity
+        retrieval **MRR** per edge (``pilots/mrr_edge_{i}_{j}``) and its
+        edge-average (``pilots/mean_reciprocal_rank``): on the shared pilot
+        samples, how well the transported sender latent retrieves its own
+        counterpart in the receiver's whitened space (decoder-free, so it
+        tracks the coboundary rather than the decoder-floored comm accuracy).
+        These live under the ``pilots/`` group since they are measured on the
+        pilot set, not the test split.
+
         Returns a dict of metric name → value; the caller logs it.
         """
         pilot_datasets = getattr(dm, 'pilot_datasets', None)
         if not pilot_datasets:
             return {}
 
-        def _collate_x(batch):
-            xs = []
+        # Labels are needed only for the intersection-class scoping below.
+        scope_intersection = getattr(
+            self, '_eval_on_class_intersection', False
+        )
+        agent_tc = (
+            self._resolve_agent_target_classes()
+            if scope_intersection
+            else None
+        )
+
+        def _collate_xy(batch):
+            xs, ys = [], []
             for item in batch:
                 x = item[0]
                 if isinstance(x, _PILImage.Image):
                     x = _pil_to_tensor(x)
                 xs.append(x)
-            return torch.stack(xs)
+                y = item[1]
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
+            return torch.stack(xs), torch.stack(ys)
 
         pilot_Z: dict[int, torch.Tensor] = {}
+        pilot_y: dict[int, torch.Tensor] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -1147,19 +1243,21 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 batch_size=256,
                 shuffle=False,
                 num_workers=0,
-                collate_fn=_collate_x,
+                collate_fn=_collate_xy,
             )
             was_training = agent.training
             agent.eval()
-            Zs = []
-            for x_batch in loader:
+            Zs, ys = [], []
+            for x_batch, y_batch in loader:
                 Zs.append(
                     agent.encode(x_batch.to(self.device)).detach().cpu().float()
                 )
+                ys.append(y_batch.cpu())
             agent.train(was_training)
 
             if Zs:
                 pilot_Z[idx] = torch.cat(Zs, dim=0)
+                pilot_y[idx] = torch.cat(ys, dim=0)
 
         if not pilot_Z:
             return {}
@@ -1170,6 +1268,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         }
 
         per_receiver: dict[int, list[float]] = {}
+        per_edge_mrr: list[float] = []
         logs: dict[str, float] = {}
         for sender_idx, receiver_set in neighbors_map.items():
             if sender_idx not in pilot_Z:
@@ -1193,6 +1292,23 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 if len(idx_i) < 2:
                     continue
 
+                # Scope to the class overlap of the edge (region both agents
+                # trained on) when requested — matched rows share a sample id,
+                # so the sender's labels label both sides.
+                if scope_intersection:
+                    labels_i = pilot_y[sender_idx][
+                        torch.as_tensor(idx_i, dtype=torch.long)
+                    ]
+                    mask = self._class_intersection_mask(
+                        agent_tc, sender_idx, receiver_idx, labels_i
+                    )
+                    if mask is not None:
+                        keep = mask.nonzero(as_tuple=True)[0].tolist()
+                        if len(keep) < 2:
+                            continue
+                        idx_i = [idx_i[k] for k in keep]
+                        idx_j = [idx_j[k] for k in keep]
+
                 Z_i = pilot_Z[sender_idx][idx_i]
                 Z_j = pilot_Z[receiver_idx][idx_j]
                 try:
@@ -1211,7 +1327,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 except NotImplementedError:
                     continue
 
-                diff = Z_i_w @ M.detach().cpu().float() - Z_j_w
+                Mc = M.detach().cpu().float()
+                Z_i_to_j = Z_i_w @ Mc
+                diff = Z_i_to_j - Z_j_w
                 d_e = diff.shape[1]
                 if d_e == 0:
                     continue
@@ -1223,10 +1341,119 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 ] = normed
                 per_receiver.setdefault(receiver_idx, []).append(normed)
 
+                # Instance-identity retrieval MRR on the pilot samples common to
+                # both agents (matched by id): rank every receiver row by cosine
+                # similarity to the transported sender row, and take the
+                # reciprocal rank of the *matching* row (same sample), averaged
+                # over rows.  1.0 = every sample's own counterpart is retrieved
+                # first; chance ≈ 1/n.  Measures how well the alignment preserves
+                # instance identity in whitened space — decoder-free, so unlike
+                # the decoder-floored comm accuracy it tracks the coboundary.
+                n_rows = int(diff.shape[0])
+                if n_rows >= 2:
+                    a = torch.nn.functional.normalize(Z_i_to_j, dim=1)
+                    b = torch.nn.functional.normalize(Z_j_w, dim=1)
+                    sim = a @ b.T  # (n, n): transported sender row vs receiver rows
+                    correct = sim.diagonal().unsqueeze(1)
+                    # rank = 1 + #{receiver rows strictly more similar than the match}
+                    ranks = (sim >= correct).sum(dim=1).clamp(min=1)
+                    mrr = float((1.0 / ranks.float()).mean().item())
+                    # MRR is a *pilot-set* retrieval metric — namespaced under
+                    # 'pilots/' (not the {prefix} test/train group) to reflect
+                    # the data it is measured on.
+                    logs[
+                        f'pilots/mrr_edge_{sender_idx}_{receiver_idx}'
+                    ] = mrr
+                    per_edge_mrr.append(mrr)
+
         all_vals = [v for vs in per_receiver.values() for v in vs]
         if all_vals:
             logs[f'{prefix}/misalignment_loss'] = sum(all_vals) / len(all_vals)
+        if per_edge_mrr:
+            logs['pilots/mean_reciprocal_rank'] = (
+                sum(per_edge_mrr) / len(per_edge_mrr)
+            )
 
+        return logs
+
+    @torch.no_grad()
+    def evaluate_whitening_quality(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
+        """How white are the whitened latents — mean ‖cov − I‖_F / √d over agents.
+
+        Encodes each agent's ``{prefix}`` split, applies that agent's own
+        whitening (``_whiten_own_latents`` — SWBN for learnable, closed-form ZCA
+        otherwise), and measures how far the resulting covariance is from the
+        identity (0 = perfectly white; captures both non-unit variances and
+        residual correlations).  Logged as ``{prefix}/whitening_cov_identity_dist``
+        (average) and per agent.  Returns ``{}`` for orchestrators without a
+        whitening operator (``_whiten_own_latents`` raises), so it is a safe
+        no-op for the baselines that don't whiten (e.g. ComFed).
+        """
+        split_datasets = getattr(dm, f'{prefix}_datasets', None) or getattr(
+            dm, 'test_datasets', None
+        )
+        if not split_datasets:
+            return {}
+
+        def _collate_x(batch):
+            xs = []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+            return torch.stack(xs)
+
+        logs: dict[str, float] = {}
+        dists: list[float] = []
+        for idx_str, agent in self.agents.items():
+            if not hasattr(agent, 'encode'):
+                continue
+            idx = int(idx_str)
+            ds = split_datasets.get(idx)
+            if ds is None or len(ds) == 0:
+                continue
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=256, shuffle=False, num_workers=0,
+                collate_fn=_collate_x,
+            )
+            was_training = agent.training
+            agent.eval()
+            Zs = []
+            for x_batch in loader:
+                Zs.append(
+                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                )
+            agent.train(was_training)
+            if not Zs:
+                continue
+            Z = torch.cat(Zs, dim=0)
+            try:
+                Zw = (
+                    self._whiten_own_latents(idx, Z.to(self.device))
+                    .detach().cpu().float()
+                )
+            except NotImplementedError:
+                return {}
+            if Zw.shape[0] < 2:
+                continue
+            Zc = Zw - Zw.mean(dim=0, keepdim=True)
+            C = (Zc.T @ Zc) / (Zc.shape[0] - 1)
+            d = C.shape[0]
+            # ‖C − I‖_F normalised by ‖I‖_F = √d → dimension-free, comparable
+            # across agents of different latent size.
+            dist = float(
+                torch.linalg.norm(C - torch.eye(d)) / (d ** 0.5)
+            )
+            logs[f'{prefix}/whitening_cov_identity_dist_agent_{idx}'] = dist
+            dists.append(dist)
+
+        if dists:
+            logs[f'{prefix}/whitening_cov_identity_dist'] = (
+                sum(dists) / len(dists)
+            )
         return logs
 
     def _validation_prefix(self, dataloader_idx: int) -> str:

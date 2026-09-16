@@ -937,32 +937,48 @@ class SheafFRL(BaseOrchestrator):
         Z_i: torch.Tensor,
         Z_j: torch.Tensor,
         prefix: str = 'train',
+        *,
+        mode: str = 'refit',
     ) -> None:
-        """Record the communication payload for one edge's freshly (re)selected anchors.
+        """Record the ONE-DIRECTIONAL communication payload for one edge.
 
-        Called once per edge per refresh from :meth:`_rebuild_edge_anchor_caches`
-        — *not* once per step: under the fixed-anchor-cache design the same
-        ``num_anchors`` rows drive every step's penalty until the next
-        refresh, so the real "wire" cost is paid exactly once per window.
-        ``edge_key`` is unused here but available to overrides (e.g.
-        :class:`SheafCFRL`, which sends the shared compressed dimension
-        ``c_ij`` on both sides instead of ``Z_i``/``Z_j``'s own raw dims).
+        Distributed protocol convention: **the larger model is the receiver**
+        (it holds the alignment map, fits it, and forms the coboundary), so the
+        **smaller** endpoint ``node_j`` is always the transmitter.  Edge key
+        ``'{node_i}_{node_j}'`` is oriented with ``d_i ≥ d_j``, so every message
+        is at the smaller dimension ``d_j``:
+
+        * ``mode='refit'``   — the smaller node sends its RAW pilots (``n × d_j``)
+          so the larger node can fit the map from them and its own local latents.
+          Charged once per edge per refresh from :meth:`_rebuild_edge_anchor_caches`.
+        * ``mode='penalty'`` — the smaller node sends its latents (``n × d_j``,
+          the coboundary space) so the larger node forms ``Z_i·V − Z_j``.
+          Charged every step of a communication epoch under
+          ``anchor_selection='all'`` (fresh pilots re-encoded each step).
+
+        Both terms are therefore ``n × d_j`` (one-directional, smaller→larger),
+        so a collaborative epoch = refit + one penalty pass ≈ 2 × the single
+        pilot exchange of a post-hoc baseline.  ``edge_key`` is available to
+        overrides (e.g. :class:`SheafCFRL`, which charges the compressed
+        dimension ``c_ij`` for the penalty).
         """
         n_rows = int(Z_i.shape[0])
         if n_rows <= 0:
             return
+        # Smaller endpoint (node_j, d_j) always transmits — the larger node is
+        # the receiver/fitter, for both the refit and the penalty message.
+        payload_tensor = Z_j
         if bool(self.hparams.sparse_communication):
-            payload_i = communication_anchor_payload(
-                anchor_matrix=Z_i.detach(), labels=None, config=self._sparse_payload_config
+            payload = communication_anchor_payload(
+                anchor_matrix=payload_tensor.detach(),
+                labels=None,
+                config=self._sparse_payload_config,
             )
-            payload_j = communication_anchor_payload(
-                anchor_matrix=Z_j.detach(), labels=None, config=self._sparse_payload_config
-            )
-            self._record_communication(payload_i, prefix=prefix)
-            self._record_communication(payload_j, prefix=prefix)
+            self._record_communication(payload, prefix=prefix)
         else:
-            self._record_communication(n_rows * Z_i.shape[1], prefix=prefix)
-            self._record_communication(n_rows * Z_j.shape[1], prefix=prefix)
+            self._record_communication(
+                n_rows * payload_tensor.shape[1], prefix=prefix
+            )
 
     @torch.no_grad()
     def _rebuild_edge_anchor_caches(self) -> dict[str, float]:
@@ -1096,7 +1112,9 @@ class SheafFRL(BaseOrchestrator):
             if not recorded_round:
                 self._record_communication_round(n_rounds=1, prefix='train')
                 recorded_round = True
-            self._record_edge_exchange(edge_key, Z_i_sel, Z_j_sel, prefix='train')
+            self._record_edge_exchange(
+                edge_key, Z_i_sel, Z_j_sel, prefix='train', mode='refit'
+            )
             edge_metrics.update(
                 self._fit_edge_map(
                     edge_key,
@@ -1394,7 +1412,8 @@ class SheafFRL(BaseOrchestrator):
             Z_i, y_i_shared, Z_j, y_j_shared = matched
             if record_step_exchange:
                 self._record_edge_exchange(
-                    edge_key, Z_i.detach(), Z_j.detach(), prefix='train'
+                    edge_key, Z_i.detach(), Z_j.detach(),
+                    prefix='train', mode='penalty',
                 )
             diff = torch.matmul(Z_i, V) - Z_j
             sheaf_penalty += self._edge_penalty_term(edge_key, diff)
@@ -1692,6 +1711,7 @@ class SheafFRL(BaseOrchestrator):
         """
         logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
         logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+        logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
         return logs
 
     def on_test_epoch_end(self) -> None:

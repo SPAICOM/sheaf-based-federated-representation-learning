@@ -1,28 +1,35 @@
-"""Communication-Efficient Sheaf-FRL orchestrator (decoupled local/collaborative schedule).
+"""Communication-Efficient Sheaf-FRL orchestrator (uniformly-scheduled communication).
 
 ``CESheafFRL`` is :class:`SheafFRL` with a decoupled training schedule that trades
-some pilot communication for cheaper rounds.  Training epochs are split into two
-kinds, interleaved in a fixed repeating cycle (collaborative epochs lead):
+some pilot communication for cheaper rounds.  Each of the ``total_epochs`` training
+epochs is one of two kinds:
 
-    Collaborative epoch : ``collab_epochs`` epochs of *classical* SheafFRL — the
-        alignment maps refit and each edge's anchor set is re-selected
-        (``_rebuild_edge_anchor_caches``) at the end of EVERY such epoch, and a
-        fresh pilot exchange is recorded.  (Collaborative epoch ≡ SheafFRL.)
-    Local epoch : ``local_epochs`` epochs that AVOID any new pilot exchange.
-        By default the sheaf regularization simply *disappears* here and each
-        node trains its task loss alone.  With ``local_reg=True`` a
-        communication-free local regularizer is instead applied: each node's
-        current (freshly re-encoded) representation is pulled toward the rotated,
-        whitened representations its neighbours sent during the last
-        collaborative epoch (``self._frozen_edge_anchors``) — a consensus toward
-        the last-known neighbour state that needs no new communication.
+    Collaborative epoch : *classical* SheafFRL — the alignment maps refit, each
+        edge's anchor set is re-selected (``_rebuild_edge_anchor_caches``) at the
+        epoch end, and a fresh pilot exchange is recorded.  (≡ SheafFRL.)
+    Local epoch : AVOIDS any new pilot exchange.  By default the sheaf
+        regularization simply *disappears* here and each node trains its task
+        loss alone.  With ``local_reg=True`` a communication-free local
+        regularizer is instead applied: each node's current (freshly re-encoded)
+        representation is pulled toward the rotated, whitened representations its
+        neighbours sent during the last collaborative epoch
+        (``self._frozen_edge_anchors``) — a consensus toward the last-known
+        neighbour state that needs no new communication.
 
-So the maps and anchor caches refresh exactly as in plain SheafFRL, but only on
-collaborative epochs; the ``local_reg`` flag controls whether the intervening
-local epochs regularize toward the frozen neighbours or train purely locally.
-The fraction of collaborative (communication) epochs is set by the
-``collab_epochs`` / ``local_epochs`` split, which is what the communication
-ablation sweeps.  ``SheafFRL`` itself stays the simple version with no schedule.
+**Schedule.** The user sets a single knob, ``comm_percentage`` (in ``(0, 100]``),
+together with the training horizon ``total_epochs`` (``None`` → read from
+``trainer.max_epochs``).  This fixes the *exact* number of collaborative epochs
+``K = max(1, round(comm_percentage/100 · N))`` out of ``N = total_epochs``, and
+those ``K`` epochs are spread **as uniformly as possible** by a largest-remainder
+(Bresenham) rule anchored to the END: the final epoch ``N-1`` always communicates,
+so the alignment maps refit on the last epoch's (most up-to-date) representations
+before testing.  ``comm_percentage`` replaces the old
+``collab_epochs`` / ``local_epochs`` cyclic split (kept as deprecated aliases,
+now mapped onto the uniform schedule); ``0%`` is intentionally *not* allowed —
+with no collaborative epoch the maps never refit, so use the ``non_cooperative``
+orchestrator (post-hoc alignment) for the zero-communication baseline instead.
+
+``SheafFRL`` itself stays the simple version with no schedule.
 """
 
 from __future__ import annotations
@@ -35,81 +42,145 @@ from src.orchestrators.sheaf_frl import SheafFRL
 
 
 class CESheafFRL(SheafFRL):
-    """Decoupled, communication-efficient Sheaf-FRL (collaborative ≡ SheafFRL + local)."""
+    """Decoupled, communication-efficient Sheaf-FRL (uniformly-scheduled collaborative epochs)."""
+
+    # Deprecated cyclic-split knobs, now folded into ``comm_percentage``.
+    _LEGACY_SCHEDULE_KEYS = (
+        'collab_epochs', 'local_epochs', 'phase_c_epochs', 'phase_a_epochs',
+    )
 
     def __init__(
         self,
         *,
-        collab_epochs: int = 1,
-        local_epochs: int = 1,
+        comm_percentage: float | None = None,
+        total_epochs: int | None = None,
         local_reg: bool = False,
         **kwargs,
     ):
-        # Back-compat: phase_c_epochs / phase_a_epochs were renamed to
-        # collab_epochs / local_epochs.  Some experiment configs still use the
-        # old names, so accept them (popped from kwargs so they never reach the
-        # base orchestrator) as deprecated aliases.
-        collab_epochs = self._pop_deprecated(
-            kwargs, 'phase_c_epochs', 'collab_epochs', collab_epochs
-        )
-        local_epochs = self._pop_deprecated(
-            kwargs, 'phase_a_epochs', 'local_epochs', local_epochs
-        )
-
-        ce, le = int(collab_epochs), int(local_epochs)
-        if ce < 1:
+        comm_percentage = self._resolve_comm_percentage(comm_percentage, kwargs)
+        if not 0.0 < float(comm_percentage) <= 100.0:
             raise ValueError(
-                'collab_epochs (collaborative epochs per cycle) must be >= 1: '
-                'the alignment maps only ever refit on collaborative epochs.'
+                'comm_percentage must lie in (0, 100]. For 0% communication use '
+                'the non_cooperative orchestrator: CESheafFRL never fits its '
+                'alignment maps without at least one collaborative epoch, so a '
+                '0% run would transport through the untrained (identity) maps.'
             )
-        if le < 0:
-            raise ValueError('local_epochs must be >= 0.')
         super().__init__(**kwargs)
-        self._collab_epochs = ce
-        self._local_epochs = le
+        self._comm_percentage = float(comm_percentage)
         self._local_reg = bool(local_reg)
+        # ``N`` (total epochs) and ``K`` (collaborative epochs) — resolved now if
+        # total_epochs was given, else finalised from the trainer at train start.
+        self._total_epochs_cfg = (
+            None if total_epochs is None else int(total_epochs)
+        )
+        self._n_epochs: int | None = self._total_epochs_cfg
+        self._comm_epochs: int | None = (
+            self._comm_epochs_for(self._n_epochs) if self._n_epochs else None
+        )
         # Local-epoch minibatch rotation offsets per edge (anchor_selection='all'
         # only, where the frozen snapshot spans the full pilot pool).
         self._local_offsets: dict[tuple[int, int], int] = {}
         # Expose for logging (not captured by the parent's save_hyperparameters,
         # which only sees SheafFRL's signature).
-        self.hparams['collab_epochs'] = ce
-        self.hparams['local_epochs'] = le
+        self.hparams['comm_percentage'] = self._comm_percentage
         self.hparams['local_reg'] = self._local_reg
+        if self._total_epochs_cfg is not None:
+            self.hparams['total_epochs'] = self._total_epochs_cfg
 
-    @staticmethod
-    def _pop_deprecated(kwargs: dict, old: str, new: str, current):
-        """Return the value of a renamed kwarg, honouring the deprecated alias.
+    def _resolve_comm_percentage(
+        self, comm_percentage: float | None, kwargs: dict
+    ) -> float:
+        """Resolve ``comm_percentage``, folding in the deprecated cyclic knobs.
 
-        If ``old`` is present in ``kwargs`` it is popped and used (with a
-        warning); otherwise ``current`` (the value bound to the new name) is
-        returned unchanged.
+        The old ``collab_epochs`` / ``local_epochs`` split (and their
+        ``phase_c_epochs`` / ``phase_a_epochs`` aliases) are popped from
+        ``kwargs`` (so they never reach the base orchestrator).  When present
+        they **take precedence** and are converted to the equivalent percentage
+        ``100·collab/(collab+local)`` — the same communication budget, now
+        distributed uniformly rather than clustered.  This deliberately wins
+        over ``comm_percentage`` so that an experiment config still expressing
+        its schedule as a phase split keeps that intent even though the
+        ``ce_sheaf_frl`` group now carries a ``comm_percentage`` default.
         """
-        if old in kwargs:
-            value = kwargs.pop(old)
+        legacy = {
+            k: kwargs.pop(k)
+            for k in self._LEGACY_SCHEDULE_KEYS
+            if k in kwargs
+        }
+        if legacy:
+            collab = legacy.get('collab_epochs', legacy.get('phase_c_epochs'))
+            local = legacy.get('local_epochs', legacy.get('phase_a_epochs'))
             warnings.warn(
-                f'{old} is deprecated; use {new} instead.',
+                'collab_epochs/local_epochs (and the phase_c/phase_a aliases) '
+                'are deprecated; CESheafFRL now takes comm_percentage + '
+                'total_epochs and spreads the collaborative epochs uniformly. '
+                'Mapping the given split to an equivalent comm_percentage.',
                 DeprecationWarning,
                 stacklevel=3,
             )
-            return value
-        return current
+            if collab is not None and local is not None:
+                total = int(collab) + int(local)
+                if total > 0:
+                    return 100.0 * int(collab) / total
+        if comm_percentage is not None:
+            return float(comm_percentage)
+        # Nothing usable supplied — a sensible middle default.
+        return 50.0
 
-    # ── Local/collaborative schedule (collaborative epochs lead each cycle) ────
+    # ── Uniform communication schedule ─────────────────────────────────────────
 
-    def _cycle_len(self) -> int:
-        return self._collab_epochs + self._local_epochs
+    def _comm_epochs_for(self, n_epochs: int) -> int:
+        """Exact number of collaborative epochs for an ``n_epochs`` horizon.
+
+        ``max(1, ·)`` guarantees at least one collaborative epoch for any
+        positive ``comm_percentage`` (a run with none would never fit its maps).
+        """
+        return max(1, round(self._comm_percentage / 100.0 * int(n_epochs)))
+
+    def on_train_start(self) -> None:
+        super().on_train_start()
+        # ``total_epochs`` (the schedule horizon) is the actual training length.
+        # Prefer the trainer's value; warn if an explicit total_epochs disagrees.
+        n_trainer = getattr(self.trainer, 'max_epochs', None)
+        if isinstance(n_trainer, int) and n_trainer > 0:
+            if (
+                self._total_epochs_cfg is not None
+                and self._total_epochs_cfg != n_trainer
+            ):
+                warnings.warn(
+                    f'CESheafFRL: total_epochs={self._total_epochs_cfg} '
+                    f'disagrees with trainer.max_epochs={n_trainer}; using '
+                    'trainer.max_epochs for the communication schedule.',
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self._n_epochs = n_trainer
+        if not self._n_epochs:
+            raise RuntimeError(
+                'CESheafFRL: cannot resolve total_epochs for the communication '
+                'schedule — pass total_epochs or set trainer.max_epochs.'
+            )
+        self._comm_epochs = self._comm_epochs_for(self._n_epochs)
 
     def _is_collab_epoch(self, epoch: int) -> bool:
-        """True for the first ``collab_epochs`` epochs of each cycle.
+        """True on the collaborative epochs of the uniform schedule.
 
-        Those lead epochs communicate (refit maps, re-select anchors, exchange
-        pilots); the trailing ``local_epochs`` are communication-free.  With
-        ``local_epochs == 0`` every epoch is collaborative (≡ SheafFRL).
+        With ``K`` collaborative epochs over ``N`` total, epoch ``e`` communicates
+        iff ``floor((e+1)·K/N) > floor(e·K/N)`` — exactly ``K`` epochs, spread as
+        evenly as the integers allow, and anchored so the FINAL epoch (``N-1``) is
+        always included: the maps refit on the last epoch's (most up-to-date)
+        representations before testing.  (Epoch 0 communicates only at 100%.)
+        Until the first collaborative epoch the maps sit at their init and, with
+        ``local_reg=True``, there is no neighbour snapshot yet — those leading
+        local epochs therefore train purely locally, see
+        :meth:`_frozen_alignment_losses`.
         """
-        if self._local_epochs == 0:
+        n, k = self._n_epochs, self._comm_epochs
+        if not n or not k:
+            return False
+        if k >= n:
             return True
-        return (epoch % self._cycle_len()) < self._collab_epochs
+        return (epoch + 1) * k // n > epoch * k // n
 
     # ── Overridden hooks ──────────────────────────────────────────────────────
 
@@ -167,9 +238,9 @@ class CESheafFRL(SheafFRL):
         so each step re-encodes only a rotating ``pilot_batch_size``-sized row
         window of it (the frozen side is sliced with the same rows, keeping the
         pairing aligned); an epoch of local steps therefore cycles the whole
-        snapshot.  Falls back to the both-live penalty (no comm recorded —
-        ``comm_weight=0.0``) before the first collaborative refresh has ever
-        populated a snapshot.
+        snapshot.  Before the first collaborative epoch has populated a snapshot
+        there is nothing to regularize toward, so these leading local epochs
+        train purely locally (zero penalty, no communication).
         """
         sheaf_penalty = torch.tensor(0.0, device=self.device)
         after_comm = torch.tensor(0.0, device=self.device)
@@ -177,7 +248,7 @@ class CESheafFRL(SheafFRL):
             return sheaf_penalty, after_comm
 
         if not self._frozen_edge_anchors:
-            return self._both_live_alignment_losses(0.0, skip)
+            return sheaf_penalty, after_comm
 
         minibatch = self.hparams.anchor_selection == 'all'
         budget = self._row_budget() if minibatch else None

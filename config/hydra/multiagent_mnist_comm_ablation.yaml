@@ -3,7 +3,6 @@ defaults:
   - model: cnn_classifier
   - orchestrator: ce_sheaf_frl
   - optimizer: sgd
-  - comm_frac: f50            # collab/local epoch split (# @package orchestrator); swept below
   - _self_
 
 seed: 42
@@ -11,12 +10,16 @@ study_name: "CommFrac ablation CESheafFRL MNIST 15 agents"
 
 # ── Communication-fraction ablation ───────────────────────────────────────────
 # Replicates the multiagent_mnist_shift_distr setup (same 15-agent heterogeneous
-# MNIST, same class_overlap graph, same models) but runs CESheafFRL for 100
-# epochs and sweeps *how often agents communicate*: the collaborative/local split
-# is a 10-epoch cycle, so `comm_frac=f10..f90` gives 10..90 collaborative
-# (communication) epochs out of 100. Crossed with orchestrator.local_reg =
-# {false, true} to see whether regularizing toward frozen neighbours during the
-# communication-free local epochs helps. shift_strength is held FIXED at 0.7.
+# MNIST, same class_overlap graph, same models), runs for 100 epochs, and varies
+# *how often agents communicate* via orchestrator.comm_percentage (the exact
+# collaborative-epoch count = round(comm_percentage/100 * total_epochs), spread
+# uniformly, last epoch anchored). shift_strength is held FIXED.
+#
+# SWEEPS ARE DRIVEN FROM THE CLI (see the `comm-ablation-*` recipes in justfile),
+# not hard-coded here — a plain run uses the single defaults below; add
+# `--multirun orchestrator.comm_percentage=1,5,... orchestrator.local_reg=false,true`
+# for the CESheafFRL grid, or `--multirun orchestrator=non_cooperative,sheaf_frl`
+# for the baselines.
 #
 # lmb_study is DISABLED on purpose: max_lmb is held fixed across every run so the
 # only thing varying is the communication fraction (and local_reg) — an Optuna
@@ -39,7 +42,7 @@ logger:
   _target_: lightning.pytorch.loggers.WandbLogger
   project: comm_ablation
   group: ${study_name}
-  name: ${hydra:runtime.choices.comm_frac}_trial_${hydra:job.num}
+  name: ${hydra:runtime.choices.orchestrator}_p${orchestrator.comm_percentage}_lr${orchestrator.local_reg}_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
@@ -220,7 +223,13 @@ orchestrator:
   warmup_epochs: 0
   use_general_maps: false
   soft_maps: false
-  align_on_intersection: false
+  # Fair comparison with non_cooperative: score misalignment/MRR — and fit the
+  # post-hoc alignment maps (non_cooperative & the post-hoc baselines) — only on
+  # pilots whose class is in the edge's target-class overlap (the region both
+  # agents trained on). align_on_intersection makes SheafFRL/CE's TRAINING map
+  # use the same intersection support, so every method is fit+scored alike.
+  eval_on_class_intersection: true
+  align_on_intersection: true
   learn_whitening: true
   anchor_selection: all
   num_anchors: 32
@@ -228,19 +237,20 @@ orchestrator:
   learn_lmb: false
   dual_rho: null
   comm_task_coeff: 0
-  # collab_epochs / local_epochs come from the comm_frac group (swept below).
-  # local_reg default lives in orchestrator/ce_sheaf_frl.yaml (false); swept below.
-  # Post-training alignment baseline
+  total_epochs: ${trainer.max_epochs}   # schedule horizon (100); comm epochs = round(comm_percentage/100 * this)
+  # Single-run defaults; the CLI sweeps override these (see justfile recipes).
+  # comm_percentage → exact number of collaborative epochs (uniform, last-anchored);
+  # local_reg → regularize toward frozen neighbours during local epochs.
+  comm_percentage: 50
+  local_reg: false
+  # Post-training alignment method (used by the non_cooperative / sheaf_frl-family
+  # post-hoc baselines; ignored by the SheafFRL/CE learned maps).
   alignment_method: procrustes
 
 optimization:
   objective_metric: validation/avg_task_performance_epoch
   run_test: true
 
-hydra:
-  mode: MULTIRUN
-  sweeper:
-    params:
-      orchestrator: non_cooperative
-      # comm_frac: f10, f20, f30, f40, f50, f60, f70, f80, f90
-      # orchestrator.local_reg: false, true
+# Sweeps are CLI-driven (justfile: comm-ablation-ce / comm-ablation-baselines), so
+# no hydra.sweeper.params here. A plain run is a single job with the defaults above;
+# add `--multirun` plus the swept overrides to launch a grid.

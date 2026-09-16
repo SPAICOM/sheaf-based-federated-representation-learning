@@ -144,3 +144,32 @@ plot-homo *args="":
 network-ablation exp_args="" plot_args="":
     uv run scripts/multi_agent_experiment.py --config-name=multiagent_mnist_network_analyisis {{exp_args}}
     just plot-network {{plot_args}}
+
+# Plot the comm_ablation sweep (comm accuracy vs comm fraction, one curve per local_reg)
+plot-comm-ablation *args="":
+    uv run scripts/plot_comm_ablation_metrics.py --project comm_ablation {{args}}
+
+# ── Communication-efficiency ablation (config: multiagent_mnist_comm_ablation) ──
+# Sweeps are CLI-driven here, not hard-coded in the config.
+
+# (i) CESheafFRL grid: comm_percentage × local_reg (edit the lists as needed)
+comm-ablation-ce *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=multiagent_mnist_comm_ablation --multirun \
+        orchestrator=ce_sheaf_frl \
+        'orchestrator.comm_percentage=2,10,30,60,90' \
+        'orchestrator.local_reg=true' {{args}}
+
+# (ii) Baselines: non_cooperative (0% comm) and sheaf_frl (communicates every step)
+comm-ablation-baselines *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=multiagent_mnist_comm_ablation --multirun \
+        'orchestrator=non_cooperative,sheaf_frl' {{args}}
+
+# (iii) Build the comparison table from the wandb comm_ablation project
+comm-ablation-table *args="":
+    uv run scripts/comm_ablation_table.py --project comm_ablation {{args}}
+
+# Run everything end to end: CE grid, then baselines, then the table
+comm-ablation-all:
+    just comm-ablation-ce
+    just comm-ablation-baselines
+    just comm-ablation-table

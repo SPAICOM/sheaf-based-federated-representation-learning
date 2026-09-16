@@ -59,13 +59,14 @@ compression_admm_rel_tol: 1e-2  # ε_rel: relative tolerance (only used when com
 compression_admm_max_iter: 500  # k_max: iteration cap when running to convergence
                                 # (nonconvex SOC: the dual residual can plateau; the cap guards that)
 
-# ── Decoupled local/collaborative schedule (communication-efficient; inherited from CESheafFRL) ─
-# Each cycle: collab_epochs collaborative epochs (compressed coboundary every step,
-# maps refreshed via SOC-ADMM at each collaborative epoch end), then local_epochs
-# local epochs (NO pilot exchange: frozen neighbour pilots cached over the last
-# collaborative epoch, maps held fixed). Cycle = collab_epochs + local_epochs.
-collab_epochs: 1    # collaborative (communication) epochs per cycle  (was phase_c_epochs)
-local_epochs: 1     # communication-free local epochs per cycle       (was phase_a_epochs)
+# ── Decoupled communication schedule (communication-efficient; inherited from CESheafFRL) ─
+# comm_percentage (in (0, 100]) fixes the EXACT number of collaborative epochs
+# (compressed coboundary every step, maps refreshed via SOC-ADMM at each such
+# epoch end), round(comm_percentage/100 * total_epochs), spread uniformly over
+# the run; the rest are communication-free local epochs (frozen neighbour pilots,
+# maps held fixed). total_epochs: null reads the horizon from trainer.max_epochs.
+comm_percentage: 50
+total_epochs: null
 local_reg: false    # during local epochs: false = pure local task, true = pull toward frozen neighbours
 
 # Information-theoretic PID logging (Liang et al. 2023).

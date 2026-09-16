@@ -208,6 +208,22 @@ class PostTrainingAlignmentMixin:
         self._relative_reverse_maps: dict[tuple[int, int], torch.Tensor] = {}
 
         any_fitted = False
+        # Charge the post-hoc alignment's pilot exchange exactly once per fit()
+        # run — this method also runs every train epoch for monitoring, but the
+        # real protocol communicates the pilots a single time.
+        record_comm = not getattr(self, '_posthoc_comm_recorded', False)
+        # Optionally fit each edge's map only on the pilots whose class lies in
+        # the endpoints' class overlap (the region both agents trained on), so
+        # this baseline is scoped exactly like the misalignment / MRR eval and
+        # the comparison with SheafFRL is like-for-like.
+        scope_intersection = getattr(
+            self, '_eval_on_class_intersection', False
+        )
+        agent_tc = (
+            self._resolve_agent_target_classes()
+            if scope_intersection
+            else None
+        )
         seen_edges: set[frozenset[int]] = set()
         for i, receiver_set in neighbors_map.items():
             if i not in pilot_Z:
@@ -239,6 +255,22 @@ class PostTrainingAlignmentMixin:
                 if len(idx_i) < 2:
                     continue
 
+                # Scope the fit to the edge's class overlap when requested
+                # (matched rows share a sample id, so the sender labels both).
+                if scope_intersection:
+                    labels_i = pilot_y[sender_idx][
+                        torch.as_tensor(idx_i, dtype=torch.long)
+                    ]
+                    mask = self._class_intersection_mask(
+                        agent_tc, sender_idx, receiver_idx, labels_i
+                    )
+                    if mask is not None:
+                        keep = mask.nonzero(as_tuple=True)[0].tolist()
+                        if len(keep) < 2:
+                            continue
+                        idx_i = [idx_i[k] for k in keep]
+                        idx_j = [idx_j[k] for k in keep]
+
                 X_i = pilot_Z[sender_idx][idx_i]
                 X_j = pilot_Z[receiver_idx][idx_j]
                 A_s, A_r = select_paired_anchors(
@@ -262,6 +294,22 @@ class PostTrainingAlignmentMixin:
 
                 self._alignment_maps[sender_idx][receiver_idx] = M
                 any_fitted = True
+
+                if record_comm:
+                    # Distributed protocol: the LARGER model is the receiver/
+                    # fitter (here sender_idx, the larger latent dim), so the
+                    # SMALLER model transmits its raw whitened pilots — A_r
+                    # (n × d_smaller), the receiver_idx side.  One-directional,
+                    # recorded into the 'train' bucket so post-hoc baselines
+                    # share the cumulative-kB column with SheafFRL/CE (their one
+                    # alignment ≈ one SheafFRL communication round).
+                    self._record_communication(
+                        int(A_r.shape[0]) * int(A_r.shape[1]), prefix='train'
+                    )
+
+        if record_comm and any_fitted:
+            self._record_communication_round(n_rounds=1, prefix='train')
+            self._posthoc_comm_recorded = True
 
         return any_fitted
 
@@ -396,6 +444,7 @@ class PostTrainingAlignmentMixin:
         if alignment_method is None:
             logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+            logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
             return logs
 
         if not self._fit_alignment_maps(dm):
@@ -403,6 +452,9 @@ class PostTrainingAlignmentMixin:
         try:
             logs = dict(self._comm_accuracy_with_fitted_maps(dm, prefix=prefix))
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+            # Computed while the post-hoc whitening operators are still active
+            # (before cleanup), same as the misalignment loss above.
+            logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
         finally:
             self._cleanup_alignment()
 
