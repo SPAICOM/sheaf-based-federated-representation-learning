@@ -51,6 +51,11 @@ If you find this code useful for your research, please consider citing the follo
 ```
 ```
 
+## Reconstruction experiments
+
+See [the matched inpainting protocol](docs/reconstruction.md) for the VAE,
+masking setup, Sheaf versus post-hoc baseline, commands and result metrics.
+
 ## Authors
 
 - [EXAMPLE](https://scholar.google.com/citations?user=EXAMPLE)

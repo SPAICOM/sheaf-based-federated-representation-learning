@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+from datasets import Dataset, DatasetDict
 from lightning.pytorch import Trainer
 
 from src.agents.cnn_classifier import CNNClassifier
@@ -16,6 +17,20 @@ class MockOptimizer:
 
 def _make_agent():
     return LatentClassifier(in_features=128, num_classes=10, latent_dim=64)
+
+
+class MaskAwareAgent(LatentClassifier):
+    def __init__(self):
+        super().__init__(in_features=128, num_classes=10, latent_dim=64)
+        self.last_eval_mask = None
+
+    def compute_loss(self, y_hat, y, eval_mask=None):
+        self.last_eval_mask = eval_mask
+        return super().compute_loss(y_hat, y)
+
+    def task_performance(self, y_hat, y, eval_mask=None):
+        self.last_eval_mask = eval_mask
+        return super().task_performance(y_hat, y)
 
 
 def _batch(n_agents: int = 2) -> dict:
@@ -61,6 +76,21 @@ class TestNonCooperativeLearning:
         assert isinstance(loss, torch.Tensor)
         assert loss.ndim == 0
 
+    def test_training_step_passes_eval_mask_when_present(self):
+        agent = MaskAwareAgent()
+        orch = NonCooperativeLearning(
+            agents={0: agent},
+            neighbors={0: set()},
+            optimizer=MockOptimizer(),
+        )
+        mask = torch.ones(8, 1, 1)
+        batch = {'0': (torch.randn(8, 128), torch.randint(0, 10, (8,)), mask)}
+
+        loss = orch.training_step(batch, batch_idx=0)
+
+        assert isinstance(loss, torch.Tensor)
+        assert agent.last_eval_mask is mask
+
     def test_communication_stays_zero(self):
         """No communication should be recorded during training."""
         orch = NonCooperativeLearning(
@@ -95,11 +125,20 @@ class TestNonCooperativeLearning:
         assert isinstance(loss, torch.Tensor)
 
     @pytest.mark.slow
-    def test_one_epoch_with_trainer(self):
+    def test_one_epoch_with_trainer(self, monkeypatch):
         """Smoke test: full training epoch via Lightning Trainer."""
+        import src.datamodules.classification_datamodule as dm_module
         from src.datamodules.classification_datamodule import (
             ClassificationDataModule,
         )
+
+        def fake_load_dataset(_name):
+            images = torch.rand(64, 3, 32, 32).tolist()
+            labels = [idx % 10 for idx in range(64)]
+            dataset = Dataset.from_dict({'img': images, 'label': labels})
+            return DatasetDict({'train': dataset})
+
+        monkeypatch.setattr(dm_module, 'load_dataset', fake_load_dataset)
 
         agents = {
             i: CNNClassifier(

@@ -85,6 +85,7 @@ from src.agents.cnn_classifier import CNNClassifier
 from src.agents.latent_classifier import LatentClassifier
 from src.agents.personalized_classifier import PersonalizedClassifier
 from src.agents.timm_classifier import TimmClassifier
+from src.agents.resnet_classifier import ResNetClassifier
 
 # All agents can be used interchangeably due to common interface
 def create_agent(agent_type: str, **kwargs) -> BaseAgent:

@@ -5,12 +5,14 @@ This package provides agent classes for federated learning scenarios:
 - BaseAgent: Abstract base class defining the agent interface
 - LatentClassifier: MLP-based classifier with encoder-decoder structure
 - CNNClassifier: CNN-based image classifier
+- CNNVariationalAE: CNN-based variational autoencoder
 - TransformerClassifier: Vision Transformer image classifier (ViT-style)
 - TimmClassifier: Vision transformer/CNN classifier using timm library
 - DeepSenseRGBClassifier: RGB camera classifier for the DeepSense dataset
 - DeepSenseLiDARClassifier: LiDAR classifier for the DeepSense dataset
 - DeepSenseMMWaveClassifier: mmWave classifier for the DeepSense dataset
 - MFeatMLPClassifier: single MLP classifier for all MFeat modalities
+- ResNetClassifier: ResNet-based image classifier
 
 Each agent implements:
 - forward: Standard forward pass returning predictions (logits)
@@ -22,6 +24,7 @@ Each agent implements:
 from .base_agent import BaseAgent
 from .cnn_autoencoder import CNNAutoencoder
 from .cnn_classifier import CNNClassifier
+from .cnn_variationalae import CNNVariationalAE
 from .deepsense_classifiers import (
     DeepSenseLiDARClassifier,
     DeepSenseMMWaveClassifier,
@@ -51,6 +54,7 @@ from .mhealth_encoders import (
 )
 from .personalized_ae import PersonalizedAE
 from .personalized_classifier import PersonalizedClassifier
+from .resnet_classifier import ResNetClassifier
 from .timm_classifier import TimmClassifier
 from .transformer_classifier import TransformerClassifier
 from .utils import (
@@ -61,6 +65,7 @@ from .utils import (
     CNNAEEncoder,
     HeteroCNN,
     HeteroMLP,
+    ResNetEncoder,
     TimmEncoder,
     ViTEncoder,
 )
@@ -73,6 +78,7 @@ __all__ = [
     'CNNAEEncoder',
     'CNNAutoencoder',
     'CNNClassifier',
+    'CNNVariationalAE',
     'DeepSenseLiDARClassifier',
     'DeepSenseLiDAREncoder',
     'DeepSenseMMWaveClassifier',
@@ -101,4 +107,6 @@ __all__ = [
     'TimmEncoder',
     'TransformerClassifier',
     'ViTEncoder',
+    'ResNetEncoder',
+    'ResNetClassifier',
 ]

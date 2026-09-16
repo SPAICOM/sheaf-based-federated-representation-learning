@@ -6,6 +6,8 @@ updates its parameters by averaging only with neighboring agents in a
 predefined communication graph.
 """
 
+import inspect
+
 import torch
 import torch.nn as nn
 import torch.utils.data
@@ -52,6 +54,12 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
       aggregated via ``state_dict()``.
     - Each agent is always included in its own aggregation set.
     - Aggregation is performed synchronously to avoid update order bias.
+    - Fresh training starts from the same initial weights on every client.
+    - Client optimizer moments reset after aggregation by default; learning
+      rates are retained. Set reset_optimizer_on_aggregation=False to retain
+      local optimizer history explicitly.
+    - Reconstruction batches may include masks. Local pilot supervision uses
+      the same agent.pilot_loss_weight as the other reconstruction baselines.
     """
 
     def __init__(
@@ -60,6 +68,8 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         neighbors: dict[int, set[int]],
         optimizer,
         alignment_method: str | None = None,
+        synchronize_initial_weights: bool = True,
+        reset_optimizer_on_aggregation: bool = True,
         **kwargs,
     ):
         if alignment_method is not None:
@@ -78,6 +88,19 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         )
         self.save_hyperparameters(ignore=['agents'])
         self._validate_agents_for_fedavg()
+
+    def on_train_start(self) -> None:
+        super().on_train_start()
+        # Broadcast the same initial model before the first local update.
+        # Do not overwrite client states when resuming an existing training run.
+        if (
+            self.hparams.synchronize_initial_weights
+            and self.global_step == 0
+            and self.current_epoch == 0
+        ):
+            reference = next(iter(self.agents.values())).state_dict()
+            for agent in self.agents.values():
+                agent.load_state_dict(reference)
 
     def _validate_agents_for_fedavg(self):
         """Validate that all agents have compatible architectures.
@@ -113,6 +136,9 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
             buffers = dict(agent.named_buffers())
             if buffers.keys() != ref_buffers.keys():
                 raise ValueError(f'Agent {i} buffer mismatch.')
+            for k in ref_buffers:
+                if buffers[k].shape != ref_buffers[k].shape:
+                    raise ValueError(f'Buffer shape mismatch in {k}')
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
@@ -191,8 +217,23 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         for idx_i, agent in agents.items():
             agent.load_state_dict(new_states[idx_i])
 
+        # Client Adam/momentum state belongs to the preceding local round.
+        # Keep learning rates/schedulers intact, but start fresh local state.
+        trainer = getattr(self, '_trainer', None)
+        if (
+            total_transmissions > 0
+            and self.hparams.reset_optimizer_on_aggregation
+            and trainer is not None
+        ):
+            for optimizer in trainer.optimizers:
+                for idx_i, agent in agents.items():
+                    if self.hparams.neighbors[idx_i] - {idx_i}:
+                        for parameter in agent.parameters():
+                            optimizer.state.pop(parameter, None)
+
         self._finalize_train_epoch_communication()
-        self._log_train_comm_task_perf()
+        if trainer is not None:
+            self._log_train_comm_task_perf()
 
     def _shared_eval(
         self,
@@ -225,15 +266,32 @@ class FederatedLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
 
         # Compute loss and performance for each agent
         for idx, agent in self.agents.items():
-            y_hat, y = outputs[idx]
+            y_hat, y, *rest = outputs[idx]
+            mask = rest[0] if rest else None
 
-            # Compute task-specific loss (e.g., cross-entropy)
-            loss = agent.compute_loss(y_hat, y)
-            # Compute task-specific metric (e.g., accuracy)
-            performance = agent.task_performance(y_hat, y)
+            loss_kwargs = (
+                {'eval_mask': mask}
+                if 'eval_mask'
+                in inspect.signature(agent.compute_loss).parameters
+                else {}
+            )
+            perf_kwargs = (
+                {'eval_mask': mask}
+                if 'eval_mask'
+                in inspect.signature(agent.task_performance).parameters
+                else {}
+            )
+            loss = agent.compute_loss(y_hat, y, **loss_kwargs)
+            performance = agent.task_performance(y_hat, y, **perf_kwargs)
 
             agent_losses[int(idx)] = loss
             agent_performances[int(idx)] = performance
+
+        if prefix == 'train':
+            for idx, agent in self.agents.items():
+                agent_losses[int(idx)] += self._local_pilot_loss(
+                    agent, batch, int(idx)
+                )
 
         total_loss, _avg_performance = self._log_shared_metrics(
             prefix=prefix,

@@ -1,5 +1,10 @@
 _target_: src.orchestrators.FederatedLearning
 
+alignment_method: null
+synchronize_initial_weights: true
+# Reset client Adam/momentum state at each model-averaging round.
+reset_optimizer_on_aggregation: true
+
 # Information-theoretic PID logging (Liang et al. 2023).
 # Implemented in BaseOrchestrator → applies to *every* orchestrator that
 # forwards **kwargs to super().__init__.  Toggle pid_logging to enable.

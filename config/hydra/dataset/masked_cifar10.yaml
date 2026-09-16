@@ -1,0 +1,50 @@
+_target_: src.datamodules.MaskedCIFARDataModule
+
+repo: uoft-cs
+name: cifar10
+data_key: img
+
+n_agents: 4
+
+# fixed_overlap:
+#   each agent sees a cyclic vertical stripe. fixed_overlap_px is the single
+#   continuous overlap knob; larger values make neighbouring views share more.
+# agent_random_spatial:
+#   each agent samples block masks from a different spatial probability map.
+#   random_shared_visible_probability is an explicit same-sample shared mask,
+#   so it directly controls the expected overlap across all agents.
+#   random_private_visible_probability controls the preferred agent region.
+# constant_visible_shared:
+#   each agent sees exactly constant_visible_fraction of blocks. The shared
+#   fraction is relative to that visible budget (not the full image), and the
+#   remaining private blocks are disjoint from the shared blocks and each
+#   other.
+mask_mode: agent_random_spatial
+fixed_overlap_px: 2.0
+min_fixed_overlap_px: 1.0
+region_visible_fraction: 0.5
+region_overlap_fraction: 0.3
+region_boundary_jitter_px: 0
+random_focus_regions: [top_right, bottom_left, top_left, bottom_right]
+random_private_visible_probability: 0.7
+random_off_focus_visible_probability: 0.0
+random_shared_visible_probability: 0.1
+constant_visible_fraction: 0.2
+constant_shared_visible_probability: 0.1
+random_block_size: 4
+share_private_data: false
+
+batch_size: 64
+num_workers: 4
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.05
+pilot_num_samples: null
+pilot_batch_size: 64
+comm_data: shared_global_pilots
+monitor_test_during_fit: true
+seed: ${seed}
+return_mask: true
+include_mask_in_input: false

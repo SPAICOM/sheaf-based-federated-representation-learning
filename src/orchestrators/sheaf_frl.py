@@ -163,7 +163,10 @@ class SheafFRL(BaseOrchestrator):
         if num_anchors < 1:
             raise ValueError('num_anchors must be at least 1')
         _valid_anchor_selections = (
-            'all', 'random', 'proto_class', 'proto_kmeans'
+            'all',
+            'random',
+            'proto_class',
+            'proto_kmeans',
         )
         if anchor_selection not in _valid_anchor_selections:
             raise ValueError(
@@ -224,7 +227,9 @@ class SheafFRL(BaseOrchestrator):
         # not just on_train_start: Lightning's sanity-check validation pass
         # runs _shared_eval (and therefore the anchor paths) *before*
         # on_train_start fires.
-        self._edge_anchor_cache: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        self._edge_anchor_cache: dict[
+            tuple[int, int], dict[str, torch.Tensor]
+        ] = {}
         self._frozen_edge_anchors: dict[
             tuple[int, int],
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -306,9 +311,7 @@ class SheafFRL(BaseOrchestrator):
         replace the (empty) Stiefel dict.  ``dual_lambdas`` is a buffer so the
         multipliers follow the module across devices and checkpoints.
         """
-        self._dual_edge_index = {
-            k: i for i, k in enumerate(sorted(edge_keys))
-        }
+        self._dual_edge_index = {k: i for i, k in enumerate(sorted(edge_keys))}
         self.register_buffer(
             'dual_lambdas', torch.zeros(len(self._dual_edge_index))
         )
@@ -414,7 +417,9 @@ class SheafFRL(BaseOrchestrator):
         op = self._whitening_ops.get(idx)
         return whiten(A, op) if op is not None else A
 
-    def _apply_frozen_whitening(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+    def _apply_frozen_whitening(
+        self, idx: int, Z: torch.Tensor
+    ) -> torch.Tensor:
         """Apply agent ``idx``'s current whitening without re-estimating it.
 
         Gradient-carrying counterpart of :meth:`_whiten_own_latents`: SWBN
@@ -440,26 +445,32 @@ class SheafFRL(BaseOrchestrator):
 
     def _extract_pilot_batch(
         self, batch: dict, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+    ]:
         """Extract pilot data for an agent, handling global, private, or pairwise keys."""
+
+        def _parts(value):
+            sample_ids = None
+            mask = None
+            if (
+                len(value) >= 3
+                and isinstance(value[2], torch.Tensor)
+                and value[2].ndim >= value[0].ndim - 1
+            ):
+                mask = value[2]
+            if len(value) >= 3:
+                candidate = value[-1]
+                if isinstance(candidate, torch.Tensor) and candidate.ndim == 1:
+                    sample_ids = candidate
+            return value[0], value[1], sample_ids, mask
+
         if f'pilot_{idx}' in batch:
-            return (
-                batch[f'pilot_{idx}'][0],
-                batch[f'pilot_{idx}'][1],
-                batch[f'pilot_{idx}'][2],
-            )
+            return _parts(batch[f'pilot_{idx}'])
         if f'global_pilot_{idx}' in batch:
-            return (
-                batch[f'global_pilot_{idx}'][0],
-                batch[f'global_pilot_{idx}'][1],
-                batch[f'global_pilot_{idx}'][2],
-            )
+            return _parts(batch[f'global_pilot_{idx}'])
         if 'global_pilot' in batch:
-            return (
-                batch['global_pilot'][0],
-                batch['global_pilot'][1],
-                batch['global_pilot'][2],
-            )
+            return _parts(batch['global_pilot'])
 
         for key, value in batch.items():
             if isinstance(key, str) and key.startswith('pilot_'):
@@ -467,9 +478,9 @@ class SheafFRL(BaseOrchestrator):
                 if len(parts) == 3:
                     i, j = int(parts[1]), int(parts[2])
                     if i == idx:
-                        return value[0], value[1], value[2]
+                        return value[0], value[1], value[-1], None
                     if j == idx:
-                        return value[3], value[4], value[5]
+                        return value[1], value[2], value[-1], None
 
         raise ValueError(f'Pilot batch missing for agent {idx}.')
 
@@ -503,7 +514,9 @@ class SheafFRL(BaseOrchestrator):
         A_i, A_j = Z_i.float(), Z_j.float()
 
         C = torch.matmul(A_i.T, A_j)
-        edge_metrics[f'crosscov_effective_rank_edge_{edge_key}'] = self._effective_rank(C)
+        edge_metrics[f'crosscov_effective_rank_edge_{edge_key}'] = (
+            self._effective_rank(C)
+        )
 
         if self.hparams.use_general_maps:
             # Unconstrained least-squares: A s.t. A_i @ A.T ≈ A_j.
@@ -515,19 +528,23 @@ class SheafFRL(BaseOrchestrator):
             C_svd = C + torch.randn_like(C) * 1e-6
             if not torch.isfinite(C_svd).all():
                 warnings.warn(
-                    f"_fit_edge_map: cross-covariance for edge {edge_key} "
-                    f"contains non-finite values "
-                    f"({(~torch.isfinite(C_svd)).sum().item()} entries). "
-                    "Replacing with 0.0 — Stiefel update for this edge may be unreliable.",
+                    f'_fit_edge_map: cross-covariance for edge {edge_key} '
+                    f'contains non-finite values '
+                    f'({(~torch.isfinite(C_svd)).sum().item()} entries). '
+                    'Replacing with 0.0 — Stiefel update for this edge may be unreliable.',
                     RuntimeWarning,
                     stacklevel=2,
                 )
-                C_svd = torch.nan_to_num(C_svd, nan=0.0, posinf=0.0, neginf=0.0)
+                C_svd = torch.nan_to_num(
+                    C_svd, nan=0.0, posinf=0.0, neginf=0.0
+                )
             try:
                 U, S, W_T = torch.linalg.svd(C_svd, full_matrices=False)
             except RuntimeError:
                 C_svd = C_svd.cpu()
-                U_cpu, S, W_T_cpu = torch.linalg.svd(C_svd, full_matrices=False)
+                U_cpu, S, W_T_cpu = torch.linalg.svd(
+                    C_svd, full_matrices=False
+                )
                 U, W_T = U_cpu.to(param_device), W_T_cpu.to(param_device)
             n_matched = A_i.shape[0]
             if n_matched > 1:
@@ -536,7 +553,9 @@ class SheafFRL(BaseOrchestrator):
                 )
             if update_maps:
                 V_param.copy_(
-                    torch.matmul(U, W_T).to(dtype=V_param.dtype, device=param_device)
+                    torch.matmul(U, W_T).to(
+                        dtype=V_param.dtype, device=param_device
+                    )
                 )
 
         return edge_metrics
@@ -569,8 +588,12 @@ class SheafFRL(BaseOrchestrator):
         keys_j: torch.Tensor,
         labels_j: torch.Tensor,
     ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor, torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Filter pilot rows to the union of target classes for edge (node_i, node_j).
 
@@ -591,12 +614,18 @@ class SheafFRL(BaseOrchestrator):
             target = tc_i | tc_j
         if not target:
             return A_i, keys_i, labels_i, A_j, keys_j, labels_j
-        union_t = torch.tensor(sorted(target), dtype=labels_i.dtype, device=labels_i.device)
+        union_t = torch.tensor(
+            sorted(target), dtype=labels_i.dtype, device=labels_i.device
+        )
         mask_i = torch.isin(labels_i, union_t)
         mask_j = torch.isin(labels_j, union_t.to(labels_j.device))
         return (
-            A_i[mask_i], keys_i[mask_i], labels_i[mask_i],
-            A_j[mask_j], keys_j[mask_j], labels_j[mask_j],
+            A_i[mask_i],
+            keys_i[mask_i],
+            labels_i[mask_i],
+            A_j[mask_j],
+            keys_j[mask_j],
+            labels_j[mask_j],
         )
 
     def _match_pilots_with_labels(
@@ -608,7 +637,13 @@ class SheafFRL(BaseOrchestrator):
         keys_j: torch.Tensor,
         labels_j: torch.Tensor,
     ) -> (
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ]
         | None
     ):
         """Match pilot rows by shared key; return (A_i, y_i, A_j, y_j, keys) for matched rows.
@@ -769,7 +804,8 @@ class SheafFRL(BaseOrchestrator):
                 yj_rows.append(y_j.new_full((1,), c))
                 continue
             cluster_labels = kmeans_cluster(
-                Zi_c.detach().float().cpu().numpy(), n_clusters=protos_per_class
+                Zi_c.detach().float().cpu().numpy(),
+                n_clusters=protos_per_class,
             )
             cluster_ids = torch.as_tensor(
                 cluster_labels, device=Z_i.device, dtype=torch.long
@@ -868,7 +904,9 @@ class SheafFRL(BaseOrchestrator):
         if rows is not None:
             keys = keys[rows]
         keys = keys.to(self.device)
-        return self._select_edge_anchors(node_i, node_j, Z_i, y_i, Z_j, y_j, keys)
+        return self._select_edge_anchors(
+            node_i, node_j, Z_i, y_i, Z_j, y_j, keys
+        )
 
     def _edge_live_one_side(
         self,
@@ -1021,9 +1059,7 @@ class SheafFRL(BaseOrchestrator):
         # per-edge matched copies) on the GPU next to the d_i×d_j Stiefel
         # parameters OOMs.  The GPU is touched only transiently — whitening in
         # chunks here, and the per-edge map fit below.
-        pool: dict[
-            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
+        pool: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         whiten_chunk = 1024
         for idx, (Z, y, sids) in encoded.items():
             if sids is None:
@@ -1031,9 +1067,7 @@ class SheafFRL(BaseOrchestrator):
             Z_w_chunks = []
             for start in range(0, Z.shape[0], whiten_chunk):
                 zc = Z[start : start + whiten_chunk].to(self.device).float()
-                Z_w_chunks.append(
-                    self._apply_frozen_whitening(idx, zc).cpu()
-                )
+                Z_w_chunks.append(self._apply_frozen_whitening(idx, zc).cpu())
             pool[idx] = (torch.cat(Z_w_chunks, dim=0), y.cpu(), sids.cpu())
         if not pool:
             return {}
@@ -1043,9 +1077,7 @@ class SheafFRL(BaseOrchestrator):
 
         def _positions(node: int, sids: torch.Tensor) -> torch.Tensor:
             if node not in pos_maps:
-                ds_ids = getattr(
-                    pilot_datasets.get(node), 'sample_ids', None
-                )
+                ds_ids = getattr(pilot_datasets.get(node), 'sample_ids', None)
                 pos_maps[node] = {
                     int(s): p for p, s in enumerate(ds_ids or [])
                 }
@@ -1069,8 +1101,10 @@ class SheafFRL(BaseOrchestrator):
             Z_i, y_i, sid_i = pool[node_i]
             Z_j, y_j, sid_j = pool[node_j]
 
-            Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
-                node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
+            Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = (
+                self._apply_edge_class_filter(
+                    node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
+                )
             )
             matched = self._match_pilots_with_labels(
                 Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f
@@ -1082,9 +1116,15 @@ class SheafFRL(BaseOrchestrator):
             if strategy == 'random':
                 budget = int(self.hparams.num_anchors)
                 if Z_i_m.shape[0] > budget:
-                    idx = torch.randperm(Z_i_m.shape[0], device=Z_i_m.device)[:budget]
+                    idx = torch.randperm(Z_i_m.shape[0], device=Z_i_m.device)[
+                        :budget
+                    ]
                     Z_i_m, y_i_m, Z_j_m, y_j_m, sids_m = (
-                        Z_i_m[idx], y_i_m[idx], Z_j_m[idx], y_j_m[idx], sids_m[idx]
+                        Z_i_m[idx],
+                        y_i_m[idx],
+                        Z_j_m[idx],
+                        y_j_m[idx],
+                        sids_m[idx],
                     )
             elif strategy == 'proto_kmeans':
                 pair = (node_i, node_j)
@@ -1132,9 +1172,13 @@ class SheafFRL(BaseOrchestrator):
                 strategy in ('proto_class', 'proto_kmeans')
                 and n_rows > membership_cap
             ):
-                cache_rows = torch.randperm(n_rows, device=Z_i_m.device)[
-                    :membership_cap
-                ].sort().values
+                cache_rows = (
+                    torch.randperm(n_rows, device=Z_i_m.device)[
+                        :membership_cap
+                    ]
+                    .sort()
+                    .values
+                )
             else:
                 cache_rows = torch.arange(n_rows, device=Z_i_m.device)
 
@@ -1338,7 +1382,7 @@ class SheafFRL(BaseOrchestrator):
 
     def _edge_step_anchors(
         self, node_i: int, node_j: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, ...] | None:
         """Per-step anchors for one edge, per the active ``anchor_selection``.
 
         ``'random'`` keeps the fixed-cache path (:meth:`_edge_live_anchors`),
@@ -1366,8 +1410,10 @@ class SheafFRL(BaseOrchestrator):
             )
         Z_i, y_i, sid_i = sp_i
         Z_j, y_j, sid_j = sp_j
-        Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = self._apply_edge_class_filter(
-            node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
+        Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f = (
+            self._apply_edge_class_filter(
+                node_i, node_j, Z_i, sid_i, y_i, Z_j, sid_j, y_j
+            )
         )
         matched = self._match_pilots_with_labels(
             Z_i_f, sid_i_f, y_i_f, Z_j_f, sid_j_f, y_j_f
@@ -1409,11 +1455,14 @@ class SheafFRL(BaseOrchestrator):
                 continue
 
             # Rows are already whitened (upstream of _edge_step_anchors).
-            Z_i, y_i_shared, Z_j, y_j_shared = matched
+            Z_i, y_i_shared, Z_j, y_j_shared = matched[:4]
             if record_step_exchange:
                 self._record_edge_exchange(
-                    edge_key, Z_i.detach(), Z_j.detach(),
-                    prefix='train', mode='penalty',
+                    edge_key,
+                    Z_i.detach(),
+                    Z_j.detach(),
+                    prefix='train',
+                    mode='penalty',
                 )
             diff = torch.matmul(Z_i, V) - Z_j
             sheaf_penalty += self._edge_penalty_term(edge_key, diff)
@@ -1424,9 +1473,17 @@ class SheafFRL(BaseOrchestrator):
             # • i→j: align Z_i into node_j's space, decode with agent_j's decoder,
             #         compute task loss against node_i's pilot labels.
             if comm_weight > 0.0:
-                agent_i = self.agents[str(node_i)] if str(node_i) in self.agents else None
-                agent_j = self.agents[str(node_j)] if str(node_j) in self.agents else None
-                _is_clf = lambda a: getattr(a, 'task_type', 'classification') == 'classification'
+                agent_i = self.agents.get(str(node_i), None)
+                agent_j = self.agents.get(str(node_j), None)
+
+                def _task_type(a) -> str:
+                    return getattr(a, 'task_type', 'classification')
+
+                def _supports_comm_task(a) -> bool:
+                    return _task_type(a) in {
+                        'classification',
+                        'reconstruction',
+                    }
 
                 # Inverse map: for Stiefel (semi-orthogonal cols) V.T; general → pinv(V).
                 if self.hparams.use_general_maps:
@@ -1435,22 +1492,32 @@ class SheafFRL(BaseOrchestrator):
                     V_inv = V.float().T
 
                 # j → i direction
-                if agent_i is not None and _is_clf(agent_i):
+                if agent_i is not None and _supports_comm_task(agent_i):
                     Z_j_to_i = torch.matmul(Z_j.float(), V_inv)
                     Z_j_to_i = self._recolour_node(node_i, Z_j_to_i)
                     logits_ji = agent_i.decoder(Z_j_to_i.to(dtype=Z_i.dtype))
-                    after_comm_task_loss += agent_i.compute_loss(
-                        logits_ji, y_j_shared.to(self.device)
-                    )
+                    if _task_type(agent_i) == 'reconstruction':
+                        after_comm_task_loss += torch.nn.functional.mse_loss(
+                            logits_ji, y_j_shared.to(self.device)
+                        )
+                    else:
+                        after_comm_task_loss += agent_i.compute_loss(
+                            logits_ji, y_j_shared.to(self.device)
+                        )
 
                 # i → j direction
-                if agent_j is not None and _is_clf(agent_j):
+                if agent_j is not None and _supports_comm_task(agent_j):
                     Z_i_to_j = torch.matmul(Z_i.float(), V.float())
                     Z_i_to_j = self._recolour_node(node_j, Z_i_to_j)
                     logits_ij = agent_j.decoder(Z_i_to_j.to(dtype=Z_j.dtype))
-                    after_comm_task_loss += agent_j.compute_loss(
-                        logits_ij, y_i_shared.to(self.device)
-                    )
+                    if _task_type(agent_j) == 'reconstruction':
+                        after_comm_task_loss += torch.nn.functional.mse_loss(
+                            logits_ij, y_i_shared.to(self.device)
+                        )
+                    else:
+                        after_comm_task_loss += agent_j.compute_loss(
+                            logits_ij, y_i_shared.to(self.device)
+                        )
 
         return sheaf_penalty, after_comm_task_loss
 
@@ -1466,6 +1533,8 @@ class SheafFRL(BaseOrchestrator):
         outputs = {}
         agent_losses = {}
         agent_performances = {}
+        visible_mses = {}
+        missing_mses = {}
 
         pilots_available = True
 
@@ -1473,17 +1542,37 @@ class SheafFRL(BaseOrchestrator):
             idx = int(idx_str)
 
             # ── Task loss ────────────────────────────────────────────────────
-            x_task, y_task = batch[self._resolve_key(batch, idx)]
+            task_batch = batch[self._resolve_key(batch, idx)]
+            x_task, y_task = task_batch[0], task_batch[1]
+            mask_task = (
+                task_batch[2]
+                if len(task_batch) >= 3
+                and isinstance(task_batch[2], torch.Tensor)
+                and task_batch[2].ndim >= y_task.ndim - 1
+                else None
+            )
             latent_task = agent.encode(x_task)
-            y_hat = agent.decoder(latent_task)
+            y_hat = (
+                agent.decode_posterior(latent_task)
+                if hasattr(agent, 'decode_posterior')
+                else agent.decoder(latent_task)
+            )
             outputs[idx_str] = (y_hat.detach(), y_task)
-            agent_losses[idx] = agent.compute_loss(y_hat, y_task)
+            if hasattr(agent, 'reconstruction_mse'):
+                agent_losses[idx] = agent.compute_loss(
+                    y_hat, y_task, eval_mask=mask_task
+                )
+            else:
+                agent_losses[idx] = agent.compute_loss(y_hat, y_task)
             agent_performances[idx] = agent.task_performance(y_hat, y_task)
 
             if prefix == 'train':
                 self._task_latent_buffer.setdefault(idx, []).append(
                     latent_task.detach().cpu()
                 )
+
+            if prefix == 'train':
+                agent_losses[idx] += self._local_pilot_loss(agent, batch, idx)
 
             # ── Pilot extraction ─────────────────────────────────────────────
             if pilots_available:
@@ -1504,19 +1593,24 @@ class SheafFRL(BaseOrchestrator):
                     Z_pilot_w = self._whiten_node_pilots(idx, pilot_latents)
                     if sample_ids is not None:
                         self._step_pilot_latents[idx] = (
-                            Z_pilot_w, y_pilot, sample_ids
+                            Z_pilot_w,
+                            y_pilot,
+                            sample_ids,
                         )
 
-                    if prefix == 'train':
-                        if getattr(self.hparams, 'log_latent_diagnostics', False):
-                            self.log(
-                                f'train/global_pilot_effective_rank_agent_{idx}',
-                                self._effective_rank(pilot_latents.detach().float()),
-                                on_step=True,
-                                on_epoch=False,
-                                prog_bar=False,
-                                add_dataloader_idx=False,
-                            )
+                    if prefix == 'train' and getattr(
+                        self.hparams, 'log_latent_diagnostics', False
+                    ):
+                        self.log(
+                            f'train/global_pilot_effective_rank_agent_{idx}',
+                            self._effective_rank(
+                                pilot_latents.detach().float()
+                            ),
+                            on_step=True,
+                            on_epoch=False,
+                            prog_bar=False,
+                            add_dataloader_idx=False,
+                        )
 
         total_task_loss = torch.stack(list(agent_losses.values())).sum()
 
@@ -1565,6 +1659,26 @@ class SheafFRL(BaseOrchestrator):
                 list(self._step_edge_residuals.values())
             ).mean()
             extra[f'{prefix}/mean_dual_lmb'] = self.dual_lambdas.mean()
+        if visible_mses:
+            extra.update(
+                {
+                    f'{prefix}/mse_visible_agent_{idx}': value
+                    for idx, value in visible_mses.items()
+                }
+            )
+            extra[f'{prefix}/avg_mse_visible'] = torch.stack(
+                list(visible_mses.values())
+            ).mean()
+        if missing_mses:
+            extra.update(
+                {
+                    f'{prefix}/mse_missing_agent_{idx}': value
+                    for idx, value in missing_mses.items()
+                }
+            )
+            extra[f'{prefix}/avg_mse_missing'] = torch.stack(
+                list(missing_mses.values())
+            ).mean()
 
         self._log_shared_metrics(
             prefix=prefix,
@@ -1582,6 +1696,35 @@ class SheafFRL(BaseOrchestrator):
         return outputs, total_loss
 
     # ── Communication accuracy evaluation ─────────────────────────────────────
+
+    @staticmethod
+    def _visible_reconstruction_mse(
+        y_hat: torch.Tensor,
+        target: torch.Tensor,
+        visible_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = visible_mask.to(device=y_hat.device, dtype=y_hat.dtype)
+        while mask.ndim < y_hat.ndim:
+            mask = mask.unsqueeze(1)
+        if mask.shape[1] == 1 and y_hat.shape[1] != 1:
+            mask = mask.expand_as(y_hat)
+        diff_sq = (y_hat - target.to(y_hat.device)).pow(2)
+        return (diff_sq * mask).sum() / mask.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _masked_reconstruction_mse(
+        y_hat: torch.Tensor,
+        target: torch.Tensor,
+        visible_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = visible_mask.to(device=y_hat.device, dtype=y_hat.dtype)
+        while mask.ndim < y_hat.ndim:
+            mask = mask.unsqueeze(1)
+        if mask.shape[1] == 1 and y_hat.shape[1] != 1:
+            mask = mask.expand_as(y_hat)
+        missing = 1.0 - mask
+        diff_sq = (y_hat - target.to(y_hat.device)).pow(2)
+        return (diff_sq * missing).sum() / missing.sum().clamp_min(1.0)
 
     @torch.no_grad()
     def send_message(
@@ -1647,7 +1790,9 @@ class SheafFRL(BaseOrchestrator):
         elif edge_key_ji in self.stiefel_matrices:
             V = self.stiefel_matrices[edge_key_ji].float().to(work_dev)
             # For general (non-orthogonal) maps V.T is not the inverse; use pinv.
-            V_inv = torch.linalg.pinv(V) if self.hparams.use_general_maps else V.T
+            V_inv = (
+                torch.linalg.pinv(V) if self.hparams.use_general_maps else V.T
+            )
             Z_aligned = Z @ V_inv
         else:
             Z_aligned = Z
@@ -1728,4 +1873,3 @@ class SheafFRL(BaseOrchestrator):
                 prog_bar=False,
                 add_dataloader_idx=False,
             )
-

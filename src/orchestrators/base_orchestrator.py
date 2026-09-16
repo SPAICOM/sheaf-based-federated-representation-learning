@@ -395,17 +395,27 @@ class BaseOrchestrator(l.LightningModule, ABC):
             for idx, chunks in self._global_pilot_buffer.items()
         }
         logs = {
-            f'validation/global_pilot_sparsity_agent_{idx}': self._latent_sparsity(Z, epsilon)
+            f'validation/global_pilot_sparsity_agent_{idx}': self._latent_sparsity(
+                Z, epsilon
+            )
             for idx, Z in agent_matrices.items()
         }
-        logs.update({
-            f'validation/global_pilot_effective_rank_agent_{idx}': self._effective_rank(Z)
-            for idx, Z in agent_matrices.items()
-        })
-        logs.update({
-            f'validation/global_pilot_isotropy_agent_{idx}': self._isotropy(Z)
-            for idx, Z in agent_matrices.items()
-        })
+        logs.update(
+            {
+                f'validation/global_pilot_effective_rank_agent_{idx}': self._effective_rank(
+                    Z
+                )
+                for idx, Z in agent_matrices.items()
+            }
+        )
+        logs.update(
+            {
+                f'validation/global_pilot_isotropy_agent_{idx}': self._isotropy(
+                    Z
+                )
+                for idx, Z in agent_matrices.items()
+            }
+        )
         self.log_dict(
             logs,
             on_step=False,
@@ -594,14 +604,29 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def on_validation_epoch_end(self) -> None:
         """Log cumulative validation communication metrics."""
         for prefix in sorted(self._validation_prefixes_seen):
-            if prefix == 'test_monitor':
-                continue
             self._finalize_stage_communication(prefix)
+            if prefix == 'test_monitor':
+                self._finalize_paired_communication(
+                    prefix,
+                    source_prefix='train',
+                )
         if getattr(self.hparams, 'log_latent_diagnostics', True):
             self._collect_all_val_latents()
             self._log_latent_diagnostics()
             self._collect_all_global_pilot_latents()
             self._log_global_pilot_diagnostics()
+
+    def _log_communication_reconstruction(
+        self, dm, sender_idx: int, receiver_idx: int, prediction: torch.Tensor
+    ) -> None:
+        """Dispatch predictions while the evaluation transport maps are active."""
+        trainer = getattr(self, '_trainer', None)
+        if trainer is None:
+            return
+        for callback in trainer.callbacks:
+            hook = getattr(callback, 'log_communication_reconstruction', None)
+            if hook is not None:
+                hook(trainer, self, dm, sender_idx, receiver_idx, prediction)
 
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
@@ -637,8 +662,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if not test_datasets:
             return {}
 
-        def _collate_xy(batch):
+        def _collate_xy_mask(batch):
             xs, ys = [], []
+            masks = (
+                []
+                if len(batch[0]) >= 3
+                and isinstance(batch[0][2], torch.Tensor)
+                and batch[0][2].ndim >= 2
+                else None
+            )
             for item in batch:
                 x = item[0]
                 if isinstance(x, _PILImage.Image):
@@ -648,11 +680,17 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 ys.append(
                     y if isinstance(y, torch.Tensor) else torch.tensor(y)
                 )
-            return torch.stack(xs), torch.stack(ys)
+                if masks is not None:
+                    masks.append(item[2])
+            out = (torch.stack(xs), torch.stack(ys))
+            if masks is not None:
+                out = out + (torch.stack(masks),)
+            return out
 
         # Encode test latents and collect labels for every agent.
         test_Z: dict[int, torch.Tensor] = {}
         test_y: dict[int, torch.Tensor] = {}
+        test_masks: dict[int, torch.Tensor] = {}
 
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode') or not hasattr(agent, 'decoder'):
@@ -667,12 +705,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 batch_size=256,
                 shuffle=False,
                 num_workers=0,
-                collate_fn=_collate_xy,
+                collate_fn=_collate_xy_mask,
             )
             was_training = agent.training
             agent.eval()
-            Zs, ys = [], []
-            for x_batch, y_batch in loader:
+            Zs, ys, masks = [], [], []
+            for batch_values in loader:
+                x_batch, y_batch = batch_values[0], batch_values[1]
                 z = (
                     agent.encode(x_batch.to(self.device))
                     .detach()
@@ -681,11 +720,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 )
                 Zs.append(z)
                 ys.append(y_batch.cpu())
+                if len(batch_values) >= 3:
+                    masks.append(batch_values[2].cpu())
             agent.train(was_training)
 
             if Zs:
                 test_Z[idx] = torch.cat(Zs, dim=0)
                 test_y[idx] = torch.cat(ys, dim=0)
+                if masks:
+                    test_masks[idx] = torch.cat(masks, dim=0)
 
         if not test_Z:
             return {}
@@ -695,33 +738,134 @@ class BaseOrchestrator(l.LightningModule, ABC):
             for k, v in self.hparams.neighbors.items()
         }
 
-        # Communication accuracy is a classification-only metric: the
-        # receiver's decoder is expected to return logits, so AE agents
-        # (decoder returns an image) are skipped both as receivers and as
-        # self-accuracy targets. They can still act as senders.
         def _is_classifier(agent) -> bool:
-            return getattr(agent, 'task_type', 'classification') == 'classification'
+            return (
+                getattr(agent, 'task_type', 'classification')
+                == 'classification'
+            )
+
+        def _is_reconstruction(agent) -> bool:
+            return (
+                getattr(agent, 'task_type', 'classification')
+                == 'reconstruction'
+            )
+
+        def _expand_mask(
+            eval_mask: torch.Tensor | None,
+            reference: torch.Tensor,
+        ) -> torch.Tensor | None:
+            if eval_mask is None:
+                return None
+            mask = eval_mask.to(device=reference.device, dtype=reference.dtype)
+            while mask.ndim < reference.ndim:
+                mask = mask.unsqueeze(1)
+            if mask.shape[1] == 1 and reference.shape[1] != 1:
+                mask = mask.expand_as(reference)
+            return mask
+
+        def _reconstruction_mse(
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            eval_mask: torch.Tensor | None = None,
+        ) -> float:
+            mask = _expand_mask(eval_mask, y_hat)
+            if mask is None:
+                mse_t = torch.nn.functional.mse_loss(
+                    y_hat.detach(),
+                    y.to(y_hat.device).detach(),
+                )
+            else:
+                diff_sq = (y_hat - y.to(y_hat.device)).detach().pow(2)
+                mse_t = (diff_sq * mask).sum() / mask.sum().clamp_min(1.0)
+            return float(mse_t.detach().cpu().clamp_min(1e-10).item())
+
+        def _task_perf(
+            agent,
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            eval_mask: torch.Tensor | None = None,
+        ) -> float:
+            if _is_classifier(agent):
+                preds = y_hat.argmax(dim=1).cpu()
+                return float((preds == y).float().mean().item())
+            if _is_reconstruction(agent):
+                mse = _reconstruction_mse(y_hat, y, eval_mask=eval_mask)
+                return 10.0 * math.log10(1.0 / mse)
+            return float('nan')
+
+        def _missing_mse(
+            y_hat: torch.Tensor,
+            y: torch.Tensor,
+            visible_mask: torch.Tensor,
+        ) -> float:
+            mask = _expand_mask(visible_mask, y_hat)
+            if mask is None:
+                return float('nan')
+            missing = 1.0 - mask
+            diff_sq = (y_hat - y.to(y_hat.device)).pow(2)
+            return float(
+                ((diff_sq * missing).sum() / missing.sum().clamp_min(1.0))
+                .detach()
+                .cpu()
+                .item()
+            )
 
         self_accs: dict[int, float] = {}
         logs: dict[str, float] = {}
+        lpips_metric = None
+        if prefix == 'test' and any(
+            _is_reconstruction(agent) for agent in self.agents.values()
+        ):
+            from src.utils.reconstruction_metrics import ReconstructionLPIPS
+
+            lpips_metric = ReconstructionLPIPS(self.device)
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
                 continue
-            if not _is_classifier(agent):
+            if not (_is_classifier(agent) or _is_reconstruction(agent)):
                 continue
             was_training = agent.training
             agent.eval()
-            logits = agent.decoder(test_Z[idx].to(self.device))
+            y_hat = agent.decoder(test_Z[idx].to(self.device))
             agent.train(was_training)
-            preds = logits.argmax(dim=1).cpu()
-            self_accs[idx] = float(
-                (preds == test_y[idx]).float().mean().item()
+            self_accs[idx] = _task_perf(
+                agent,
+                y_hat,
+                test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
+            if lpips_metric is not None and _is_reconstruction(agent):
+                logs[f'{prefix}/private_lpips_full_agent_{idx}'] = (
+                    lpips_metric(y_hat, test_y[idx])
+                )
+            if _is_reconstruction(agent):
+                logs[f'{prefix}/private_mse_full_agent_{idx}'] = (
+                    _reconstruction_mse(
+                        y_hat,
+                        test_y[idx],
+                    )
+                )
+            if _is_reconstruction(agent) and idx in test_masks:
+                logs[f'{prefix}/private_mse_visible_agent_{idx}'] = (
+                    _reconstruction_mse(
+                        y_hat,
+                        test_y[idx],
+                        eval_mask=test_masks[idx],
+                    )
+                )
+                logs[f'{prefix}/private_mse_missing_agent_{idx}'] = (
+                    _missing_mse(
+                        y_hat,
+                        test_y[idx],
+                        test_masks[idx],
+                    )
+                )
 
         if self_accs:
-            logs[f'{prefix}/avg_private_task_perf'] = sum(self_accs.values()) / len(self_accs)
+            logs[f'{prefix}/avg_private_task_perf'] = sum(
+                self_accs.values()
+            ) / len(self_accs)
 
         # Communication accuracy and task fidelity per receiver.
         receiver_comm_accs: dict[int, float] = {}
@@ -731,12 +875,18 @@ class BaseOrchestrator(l.LightningModule, ABC):
             receiver_idx = int(idx_str)
             if not hasattr(agent_receiver, 'decoder'):
                 continue
-            if not _is_classifier(agent_receiver):
+            if not (
+                _is_classifier(agent_receiver)
+                or _is_reconstruction(agent_receiver)
+            ):
                 continue
             if receiver_idx not in test_Z:
                 continue
 
             neighbor_accs: list[float] = []
+            neighbor_visible_mses: list[float] = []
+            neighbor_missing_mses: list[float] = []
+            neighbor_lpips: list[float] = []
             for sender_idx in neighbors_map.get(receiver_idx, set()):
                 if sender_idx not in test_Z:
                     continue
@@ -749,24 +899,81 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
                 was_training = agent_receiver.training
                 agent_receiver.eval()
-                logits = agent_receiver.decoder(Z_received.to(self.device))
+                y_hat = agent_receiver.decoder(Z_received.to(self.device))
                 agent_receiver.train(was_training)
 
-                preds = logits.argmax(dim=1).cpu()
-                acc = float(
-                    (preds == test_y[sender_idx]).float().mean().item()
+                acc = _task_perf(
+                    agent_receiver,
+                    y_hat,
+                    test_y[sender_idx],
                 )
                 neighbor_accs.append(acc)
+                if prefix == 'test' and _is_reconstruction(agent_receiver):
+                    self._log_communication_reconstruction(
+                        dm, sender_idx, receiver_idx, y_hat
+                    )
+                if lpips_metric is not None and _is_reconstruction(
+                    agent_receiver
+                ):
+                    neighbor_lpips.append(
+                        lpips_metric(y_hat, test_y[sender_idx])
+                    )
+                if (
+                    _is_reconstruction(agent_receiver)
+                    and sender_idx in test_masks
+                ):
+                    neighbor_missing_mses.append(
+                        _missing_mse(
+                            y_hat, test_y[sender_idx], test_masks[sender_idx]
+                        )
+                    )
+                if _is_reconstruction(agent_receiver):
+                    neighbor_visible_mses.append(
+                        _reconstruction_mse(
+                            y_hat,
+                            test_y[sender_idx],
+                        )
+                    )
 
+            if neighbor_lpips:
+                logs[f'{prefix}/comm_lpips_full_agent_{receiver_idx}'] = sum(
+                    neighbor_lpips
+                ) / len(neighbor_lpips)
+            if neighbor_missing_mses:
+                logs[
+                    f'{prefix}/comm_mse_sender_missing_agent_{receiver_idx}'
+                ] = sum(neighbor_missing_mses) / len(neighbor_missing_mses)
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
                 logs[f'{prefix}/comm_task_perf_agent_{receiver_idx}'] = avg_acc
+                if neighbor_visible_mses:
+                    avg_mse = sum(neighbor_visible_mses) / len(
+                        neighbor_visible_mses
+                    )
+                    logs[f'{prefix}/comm_mse_full_agent_{receiver_idx}'] = (
+                        avg_mse
+                    )
+                    logs[
+                        f'{prefix}/comm_mse_tx_missing_rx_visible_agent_{receiver_idx}'
+                    ] = avg_mse
+                    logs[f'{prefix}/comm_mse_visible_agent_{receiver_idx}'] = (
+                        avg_mse
+                    )
 
                 self_acc = self_accs.get(receiver_idx, 0.0)
                 fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
                 task_fidelities[receiver_idx] = fidelity
                 logs[f'{prefix}/task_fidelity_agent_{receiver_idx}'] = fidelity
+
+        for metric_name in ('private_lpips_full', 'comm_lpips_full'):
+            values = [
+                value
+                for key, value in logs.items()
+                if key.startswith(f'{prefix}/{metric_name}_agent_')
+            ]
+            if values:
+                logs[f'{prefix}/avg_{metric_name}'] = sum(values) / len(values)
 
         if receiver_comm_accs:
             logs[f'{prefix}/avg_comm_task_perf'] = sum(
@@ -776,6 +983,54 @@ class BaseOrchestrator(l.LightningModule, ABC):
             logs[f'{prefix}/avg_task_fidelity'] = sum(
                 task_fidelities.values()
             ) / len(task_fidelities)
+        comm_visible = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/comm_mse_visible_agent_')
+        ]
+        if comm_visible:
+            logs[f'{prefix}/avg_comm_mse_visible'] = sum(comm_visible) / len(
+                comm_visible
+            )
+            logs[f'{prefix}/avg_comm_mse_tx_missing_rx_visible'] = logs[
+                f'{prefix}/avg_comm_mse_visible'
+            ]
+        private_visible = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_visible_agent_')
+        ]
+        if private_visible:
+            logs[f'{prefix}/avg_private_mse_visible'] = sum(
+                private_visible
+            ) / len(private_visible)
+        private_full = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_full_agent_')
+        ]
+        if private_full:
+            logs[f'{prefix}/avg_private_mse_full'] = sum(private_full) / len(
+                private_full
+            )
+        comm_missing = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/comm_mse_missing_agent_')
+        ]
+        if comm_missing:
+            logs[f'{prefix}/avg_comm_mse_missing'] = sum(comm_missing) / len(
+                comm_missing
+            )
+        private_missing = [
+            value
+            for key, value in logs.items()
+            if key.startswith(f'{prefix}/private_mse_missing_agent_')
+        ]
+        if private_missing:
+            logs[f'{prefix}/avg_private_mse_missing'] = sum(
+                private_missing
+            ) / len(private_missing)
 
         # Non-neighbour cross-agent accuracy is a test-only metric: it always
         # requires post-hoc map fitting (no orchestrator trains maps for
@@ -816,9 +1071,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if parseval is None:
             parseval = method == 'relative'
         return {
-            'selection': str(
-                getattr(self.hparams, 'anchor_selection', 'all')
-            ),
+            'selection': str(getattr(self.hparams, 'anchor_selection', 'all')),
             'num_anchors': int(getattr(self.hparams, 'num_anchors', 128)),
             'protos_per_class': int(
                 getattr(self.hparams, 'protos_per_class', 1)
@@ -947,9 +1200,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             int(k): {int(n) for n in v}
             for k, v in self.hparams.neighbors.items()
         }
-        latent_dims = {
-            idx: op.W.shape[0] for idx, op in whitening_ops.items()
-        }
+        latent_dims = {idx: op.W.shape[0] for idx, op in whitening_ops.items()}
 
         method = getattr(self.hparams, 'alignment_method', None)
         method = str(method) if method is not None else 'procrustes'
@@ -959,7 +1210,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         hetero_maps: dict[tuple[int, int], torch.Tensor] = {}
         agent_ids = sorted(pilot_Z)
         for pos, i in enumerate(agent_ids):
-            for j in agent_ids[pos + 1:]:
+            for j in agent_ids[pos + 1 :]:
                 if j in neighbors_map.get(i, set()) or i in neighbors_map.get(
                     j, set()
                 ):
@@ -1067,9 +1318,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                         else torch.linalg.pinv(M_rev)
                     )
 
-                Z_white = whiten(
-                    test_Z[sender_idx], whitening_ops[sender_idx]
-                )
+                Z_white = whiten(test_Z[sender_idx], whitening_ops[sender_idx])
                 Z_recv = color(Z_white @ M, whitening_ops[receiver_idx])
 
                 was_training = agent_receiver.training
@@ -1163,7 +1412,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         )
 
     @torch.no_grad()
-    def evaluate_misalignment_loss(self, dm, prefix: str = 'test') -> dict[str, float]:
+    def evaluate_misalignment_loss(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
         """Cross-agent coboundary misalignment loss on matched pilot pairs.
 
         For every directed edge (sender → receiver) that has a map fitted
@@ -1250,7 +1501,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             Zs, ys = [], []
             for x_batch, y_batch in loader:
                 Zs.append(
-                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
                 )
                 ys.append(y_batch.cpu())
             agent.train(was_training)
@@ -1313,13 +1567,17 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 Z_j = pilot_Z[receiver_idx][idx_j]
                 try:
                     Z_i_w = (
-                        self._whiten_own_latents(sender_idx, Z_i.to(self.device))
+                        self._whiten_own_latents(
+                            sender_idx, Z_i.to(self.device)
+                        )
                         .detach()
                         .cpu()
                         .float()
                     )
                     Z_j_w = (
-                        self._whiten_own_latents(receiver_idx, Z_j.to(self.device))
+                        self._whiten_own_latents(
+                            receiver_idx, Z_j.to(self.device)
+                        )
                         .detach()
                         .cpu()
                         .float()
@@ -1353,7 +1611,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 if n_rows >= 2:
                     a = torch.nn.functional.normalize(Z_i_to_j, dim=1)
                     b = torch.nn.functional.normalize(Z_j_w, dim=1)
-                    sim = a @ b.T  # (n, n): transported sender row vs receiver rows
+                    sim = (
+                        a @ b.T
+                    )  # (n, n): transported sender row vs receiver rows
                     correct = sim.diagonal().unsqueeze(1)
                     # rank = 1 + #{receiver rows strictly more similar than the match}
                     ranks = (sim >= correct).sum(dim=1).clamp(min=1)
@@ -1361,17 +1621,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     # MRR is a *pilot-set* retrieval metric — namespaced under
                     # 'pilots/' (not the {prefix} test/train group) to reflect
                     # the data it is measured on.
-                    logs[
-                        f'pilots/mrr_edge_{sender_idx}_{receiver_idx}'
-                    ] = mrr
+                    logs[f'pilots/mrr_edge_{sender_idx}_{receiver_idx}'] = mrr
                     per_edge_mrr.append(mrr)
 
         all_vals = [v for vs in per_receiver.values() for v in vs]
         if all_vals:
             logs[f'{prefix}/misalignment_loss'] = sum(all_vals) / len(all_vals)
         if per_edge_mrr:
-            logs['pilots/mean_reciprocal_rank'] = (
-                sum(per_edge_mrr) / len(per_edge_mrr)
+            logs['pilots/mean_reciprocal_rank'] = sum(per_edge_mrr) / len(
+                per_edge_mrr
             )
 
         return logs
@@ -1416,7 +1674,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             if ds is None or len(ds) == 0:
                 continue
             loader = torch.utils.data.DataLoader(
-                ds, batch_size=256, shuffle=False, num_workers=0,
+                ds,
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
                 collate_fn=_collate_x,
             )
             was_training = agent.training
@@ -1424,7 +1685,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             Zs = []
             for x_batch in loader:
                 Zs.append(
-                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
                 )
             agent.train(was_training)
             if not Zs:
@@ -1433,7 +1697,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             try:
                 Zw = (
                     self._whiten_own_latents(idx, Z.to(self.device))
-                    .detach().cpu().float()
+                    .detach()
+                    .cpu()
+                    .float()
                 )
             except NotImplementedError:
                 return {}
@@ -1444,21 +1710,40 @@ class BaseOrchestrator(l.LightningModule, ABC):
             d = C.shape[0]
             # ‖C − I‖_F normalised by ‖I‖_F = √d → dimension-free, comparable
             # across agents of different latent size.
-            dist = float(
-                torch.linalg.norm(C - torch.eye(d)) / (d ** 0.5)
-            )
+            dist = float(torch.linalg.norm(C - torch.eye(d)) / (d**0.5))
             logs[f'{prefix}/whitening_cov_identity_dist_agent_{idx}'] = dist
             dists.append(dist)
 
         if dists:
-            logs[f'{prefix}/whitening_cov_identity_dist'] = (
-                sum(dists) / len(dists)
+            logs[f'{prefix}/whitening_cov_identity_dist'] = sum(dists) / len(
+                dists
             )
         return logs
 
     def _validation_prefix(self, dataloader_idx: int) -> str:
         """Map validation dataloader indices to stable logging prefixes."""
         return 'validation' if int(dataloader_idx) == 0 else 'test_monitor'
+
+    def _agent_loss_component_logs(
+        self, prefix: str
+    ) -> dict[str, torch.Tensor]:
+        """Collect optional per-agent loss decompositions exposed by agents."""
+        logs: dict[str, torch.Tensor] = {}
+        grouped: dict[str, list[torch.Tensor]] = {}
+        for idx_str, agent in self.agents.items():
+            components = getattr(agent, 'last_loss_components', None)
+            if not components:
+                continue
+            idx = int(idx_str)
+            for name, value in components.items():
+                value_t = self._metric_tensor(value)
+                logs[f'{prefix}/loss_{name}_agent_{idx}'] = value_t
+                grouped.setdefault(str(name), []).append(value_t)
+
+        for name, values in grouped.items():
+            if values:
+                logs[f'{prefix}/avg_loss_{name}'] = torch.stack(values).mean()
+        return logs
 
     def _log_shared_metrics(
         self,
@@ -1491,7 +1776,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         per_agent_logs = {}
         for idx in sorted(normalized_losses):
             loss = normalized_losses[idx]
-            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = loss
+            per_agent_logs[f'{prefix}/{per_agent_loss_name}_agent_{idx}'] = (
+                loss
+            )
             if not skip_task_performance:
                 per_agent_logs[f'{prefix}/task_performance_agent_{idx}'] = (
                     normalized_performances[idx]
@@ -1559,10 +1846,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
             f'{prefix}/total_loss_epoch': resolved_total_loss,
         }
         if not skip_task_performance:
-            aggregate_logs[f'{prefix}/avg_task_performance_epoch'] = avg_performance
-            aggregate_logs[f'{prefix}/global_task_performance_epoch'] = global_task_performance
+            aggregate_logs[f'{prefix}/avg_task_performance_epoch'] = (
+                avg_performance
+            )
+            aggregate_logs[f'{prefix}/global_task_performance_epoch'] = (
+                global_task_performance
+            )
         if extra_metrics is not None:
             aggregate_logs.update(extra_metrics)
+        aggregate_logs.update(self._agent_loss_component_logs(prefix))
 
         self.log_dict(
             aggregate_logs,
@@ -1623,6 +1915,21 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         return sample_counts
 
+    @staticmethod
+    def _unpack_task_batch(
+        values: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Return ``(x, y, mask)`` from legacy or masked task batches."""
+        x, y = values[0], values[1]
+        mask = (
+            values[2]
+            if len(values) >= 3
+            and isinstance(values[2], torch.Tensor)
+            and values[2].ndim >= y.ndim - 1
+            else None
+        )
+        return x, y, mask
+
     @abstractmethod
     def on_train_epoch_end(self):
         """Perform epoch-level aggregation or updates.
@@ -1663,6 +1970,28 @@ class BaseOrchestrator(l.LightningModule, ABC):
         """
         pass
 
+    def _local_pilot_loss(self, agent, batch, idx):
+        """Same local pilot supervision in cooperative and independent training."""
+        weight = getattr(agent, 'pilot_loss_weight', 0.0)
+        if not weight:
+            return 0.0
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        key = next(
+            (k for k in (f'global_pilot_{idx}', f'pilot_{idx}') if k in batch),
+            None,
+        )
+        if key is None:
+            raise ValueError(
+                'Local pilot supervision requires per-agent pilot batches.'
+            )
+        x, y, mask = self._unpack_task_batch(batch[key])
+        private_components = agent.last_loss_components
+        prediction = agent(x)
+        loss = weight * agent.compute_loss(prediction, y, eval_mask=mask)
+        agent.last_loss_components = private_components
+        return loss
+
     def forward(
         self,
         batch: dict[int, list[torch.Tensor]],
@@ -1692,13 +2021,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
         for idx, agent in self.agents.items():
             # Handle both string and int keys in batch dictionary
             key = idx if idx in batch else int(idx)
-            x, y = batch[key]
+            x, y, mask = self._unpack_task_batch(batch[key])
 
             # Get predictions (logits) from agent
             y_hat = agent(x)
 
             # Store predictions with labels for loss computation
-            outputs[idx] = (y_hat, y)
+            outputs[idx] = (y_hat, y, mask) if mask is not None else (y_hat, y)
 
         return outputs
 
@@ -1924,7 +2253,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     y if isinstance(y, torch.Tensor) else torch.tensor(y)
                 )
                 if len(item) >= 3:
-                    sid = item[2]
+                    sid = item[-1]
+                    if isinstance(sid, torch.Tensor) and sid.ndim != 0:
+                        continue
                     sids.append(
                         sid
                         if isinstance(sid, torch.Tensor)
@@ -1935,7 +2266,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             sids_t = torch.stack(sids) if sids else None
             return xs_t, ys_t, sids_t
 
-        out: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        out: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -2052,7 +2385,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     def _compute_and_log_pair_pid(
         self,
-        encoded: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+        encoded: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ],
     ) -> dict[str, float]:
         """Run PID estimators on every selected pair; return a log dict."""
         from src.mutualinfo import batch_pid, cvxpy_pid
@@ -2094,7 +2429,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     logs[f'{prefix}/mi_y_z1'] = res.mi_y_z1
                     logs[f'{prefix}/mi_y_z2'] = res.mi_y_z2
                     logs[f'{prefix}/mi_y_z1z2'] = res.mi_y_z1z2
-                    logs[f'{prefix}/total_information'] = res.total_information()
+                    logs[f'{prefix}/total_information'] = (
+                        res.total_information()
+                    )
                 except Exception as exc:
                     warnings.warn(
                         f'CVXPY PID failed on pair {pair_tag}: {exc}',
@@ -2125,7 +2462,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     logs[f'{prefix}/mi_y_z1'] = res.mi_y_z1
                     logs[f'{prefix}/mi_y_z2'] = res.mi_y_z2
                     logs[f'{prefix}/mi_y_z1z2'] = res.mi_y_z1z2
-                    logs[f'{prefix}/total_information'] = res.total_information()
+                    logs[f'{prefix}/total_information'] = (
+                        res.total_information()
+                    )
                 except Exception as exc:
                     warnings.warn(
                         f'Batch PID failed on pair {pair_tag}: {exc}',
@@ -2159,7 +2498,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     y if isinstance(y, torch.Tensor) else torch.tensor(y)
                 )
                 if len(item) >= 3:
-                    sid = item[2]
+                    sid = item[-1]
+                    if isinstance(sid, torch.Tensor) and sid.ndim != 0:
+                        continue
                     sids.append(
                         sid
                         if isinstance(sid, torch.Tensor)
@@ -2170,7 +2511,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             sids_t = torch.stack(sids) if sids else None
             return xs_t, ys_t, sids_t
 
-        out: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        out: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
@@ -2216,6 +2559,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
         configurations without a pilot split, e.g. uniform partitioning).
         """
         if not bool(getattr(self.hparams, 'pid_logging', False)):
+            return
+        if any(
+            getattr(agent, 'task_type', 'classification') != 'classification'
+            for agent in self.agents.values()
+        ):
             return
         dm = getattr(self.trainer, 'datamodule', None)
         if dm is None:

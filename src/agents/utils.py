@@ -14,6 +14,8 @@ learning framework.
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as tv_models
 from PIL import Image
 from torchvision import transforms
 
@@ -905,3 +907,358 @@ class HeteroMLP(nn.Module):
             Output tensor of shape (batch_size, output_dim).
         """
         return self.network(x)
+
+class ResidualBasicBlock(nn.Module):
+    """Standard ResNet basic residual block.
+
+    Architecture
+    ------------
+    Main branch:
+        Conv3x3(stride) -> [BN] -> Activation ->
+        Conv3x3(stride=1) -> [BN]
+
+    Shortcut:
+        Identity when shape is unchanged.
+        Conv1x1(stride) -> [BN] when channels or spatial size change.
+
+    Output:
+        Activation(main + shortcut)
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    stride : int, optional
+        Stride of the first convolution. A value of 2 performs spatial
+        downsampling. Default: 1.
+    activation : type[nn.Module], optional
+        Activation class. Default: nn.ReLU.
+    use_batchnorm : bool, optional
+        Whether to use BatchNorm2d. Default: True.
+    dropout : float, optional
+        Dropout2d probability applied after the residual addition.
+        Default: 0.0.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        activation: type[nn.Module] = nn.ReLU,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+
+        if stride < 1:
+            raise ValueError(f"stride must be >= 1, got {stride}")
+
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(
+                f"dropout must be in [0, 1), got {dropout}"
+            )
+
+        conv_bias = not use_batchnorm
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=conv_bias,
+        )
+
+        self.bn1 = (
+            nn.BatchNorm2d(out_channels)
+            if use_batchnorm
+            else nn.Identity()
+        )
+
+        self.activation1 = activation()
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=conv_bias,
+        )
+
+        self.bn2 = (
+            nn.BatchNorm2d(out_channels)
+            if use_batchnorm
+            else nn.Identity()
+        )
+
+        if stride != 1 or in_channels != out_channels:
+            shortcut_layers = [
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=conv_bias,
+                )
+            ]
+
+            if use_batchnorm:
+                shortcut_layers.append(nn.BatchNorm2d(out_channels))
+
+            self.shortcut = nn.Sequential(*shortcut_layers)
+        else:
+            self.shortcut = nn.Identity()
+
+        self.activation2 = activation()
+
+        self.dropout = (
+            nn.Dropout2d(dropout)
+            if dropout > 0.0
+            else nn.Identity()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.shortcut(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.activation1(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out = out + identity
+        out = self.activation2(out)
+        out = self.dropout(out)
+
+        return out
+
+
+class ResNetEncoder(nn.Module):
+    """Configurable ResNet encoder for small images such as CIFAR-10.
+
+    By default this implements a ResNet18 encoder:
+
+        stem: Conv3x3(3 -> 64), stride=1
+        stage 1: 2 BasicBlocks, 64 channels
+        stage 2: 2 BasicBlocks, 128 channels, first block stride=2
+        stage 3: 2 BasicBlocks, 256 channels, first block stride=2
+        stage 4: 2 BasicBlocks, 512 channels, first block stride=2
+
+    No global average pooling or classifier is applied here.
+    PersonalizedClassifier is responsible for pooling and decoding.
+
+    Parameters
+    ----------
+    in_features : int
+        Number of input channels.
+    hidden_dims : list[int], optional
+        Number of output channels for each residual stage.
+        Default: [64, 128, 256, 512].
+    blocks_per_stage : list[int], optional
+        Number of residual BasicBlocks in each stage.
+        Default: [2, 2, 2, 2], corresponding to ResNet18.
+    stage_strides : list[int], optional
+        Stride used by the first block of each stage.
+        Default: [1, 2, 2, 2].
+    activation : type[nn.Module], optional
+        Activation class. Default: nn.ReLU.
+    use_batchnorm : bool, optional
+        Whether to use BatchNorm2d. Default: True.
+    dropout : float, optional
+        Dropout2d probability after each residual block.
+        Standard ResNet normally uses 0.0.
+    stem_kernel_size : int, optional
+        Kernel size of the initial convolution. Default: 3.
+    stem_stride : int, optional
+        Stride of the initial convolution. Default: 1.
+    stem_pool : bool, optional
+        Add ImageNet-style MaxPool after the stem. For CIFAR-10 this
+        should normally be False.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_dims: list[int] | None = None,
+        blocks_per_stage: list[int] | None = None,
+        stage_strides: list[int] | None = None,
+        activation: type[nn.Module] = nn.ReLU,
+        use_batchnorm: bool = True,
+        dropout: float = 0.0,
+        stem_kernel_size: int = 3,
+        stem_stride: int = 1,
+        stem_pool: bool = False,
+    ):
+        super().__init__()
+
+        if hidden_dims is None:
+            hidden_dims = [64, 128, 256, 512]
+
+        if blocks_per_stage is None:
+            blocks_per_stage = [2] * len(hidden_dims)
+
+        if stage_strides is None:
+            stage_strides = [1] + [2] * (len(hidden_dims) - 1)
+
+        if not hidden_dims:
+            raise ValueError("hidden_dims must contain at least one stage")
+
+        if len(blocks_per_stage) != len(hidden_dims):
+            raise ValueError(
+                "blocks_per_stage and hidden_dims must have the same "
+                f"length, got {len(blocks_per_stage)} and "
+                f"{len(hidden_dims)}"
+            )
+
+        if len(stage_strides) != len(hidden_dims):
+            raise ValueError(
+                "stage_strides and hidden_dims must have the same "
+                f"length, got {len(stage_strides)} and "
+                f"{len(hidden_dims)}"
+            )
+
+        if any(n < 1 for n in blocks_per_stage):
+            raise ValueError(
+                "Every stage must contain at least one residual block"
+            )
+
+        if any(s < 1 for s in stage_strides):
+            raise ValueError("All stage strides must be >= 1")
+
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError(
+                f"dropout must be in [0, 1), got {dropout}"
+            )
+
+        padding = stem_kernel_size // 2
+        conv_bias = not use_batchnorm
+
+        stem_layers = [
+            nn.Conv2d(
+                in_features,
+                hidden_dims[0],
+                kernel_size=stem_kernel_size,
+                stride=stem_stride,
+                padding=padding,
+                bias=conv_bias,
+            )
+        ]
+
+        if use_batchnorm:
+            stem_layers.append(nn.BatchNorm2d(hidden_dims[0]))
+
+        stem_layers.append(activation())
+
+        # Useful for ImageNet-style architectures, normally disabled on CIFAR.
+        if stem_pool:
+            stem_layers.append(
+                nn.MaxPool2d(
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                )
+            )
+
+        self.stem = nn.Sequential(*stem_layers)
+
+        stages = []
+        in_channels = hidden_dims[0]
+
+        for out_channels, num_blocks, stride in zip(
+            hidden_dims,
+            blocks_per_stage,
+            stage_strides,
+        ):
+            stage = self._make_stage(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                num_blocks=num_blocks,
+                first_stride=stride,
+                activation=activation,
+                use_batchnorm=use_batchnorm,
+                dropout=dropout,
+            )
+
+            stages.append(stage)
+            in_channels = out_channels
+
+        self.stages = nn.Sequential(*stages)
+
+        self.out_features: int = hidden_dims[-1]
+
+        self.hidden_dims = list(hidden_dims)
+        self.blocks_per_stage = list(blocks_per_stage)
+        self.stage_strides = list(stage_strides)
+
+    @staticmethod
+    def _make_stage(
+        in_channels: int,
+        out_channels: int,
+        num_blocks: int,
+        first_stride: int,
+        activation: type[nn.Module],
+        use_batchnorm: bool,
+        dropout: float,
+    ) -> nn.Sequential:
+        blocks = [
+            ResidualBasicBlock(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=first_stride,
+                activation=activation,
+                use_batchnorm=use_batchnorm,
+                dropout=dropout,
+            )
+        ]
+
+        blocks.extend(
+            ResidualBasicBlock(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                stride=1,
+                activation=activation,
+                use_batchnorm=use_batchnorm,
+                dropout=dropout,
+            )
+            for _ in range(1, num_blocks)
+        )
+
+        return nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode images and return the final spatial feature map."""
+        x = self.stem(x)
+        x = self.stages(x)
+        return x 
+
+class VGGPerceptualLoss(nn.Module):
+    """Perceptual loss via early VGG16 features (ImageNet-pretrained, frozen).
+
+    Only the first two conv blocks (through ``relu2_2``) are used — deeper
+    VGG layers have receptive fields tuned for ~224x224 inputs and extract
+    little meaningful structure at CIFAR/MNIST scale (28-32px); the early
+    layers still capture edges/texture that MSE/L1 under-weight.
+    """
+
+    def __init__(self):
+        super().__init__()
+        weights = tv_models.VGG16_Weights.IMAGENET1K_V1
+        vgg = tv_models.vgg16(weights=weights).features[:9].eval()  # through relu2_2
+        for p in vgg.parameters():
+            p.requires_grad = False
+        self.vgg = vgg
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x_hat: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if x_hat.shape[1] == 1:
+            x_hat = x_hat.repeat(1, 3, 1, 1)
+            x = x.repeat(1, 3, 1, 1)
+        x_hat_n = (x_hat - self.mean) / self.std
+        x_n = (x - self.mean) / self.std
+        return F.mse_loss(self.vgg(x_hat_n), self.vgg(x_n))

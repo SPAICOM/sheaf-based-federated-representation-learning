@@ -1,0 +1,58 @@
+_target_: src.agents.CNNVariationalAE
+
+in_features: null
+out_features: null    # injected from target_dims when input includes mask channels
+img_size: null        # injected from the datamodule (28 for MNIST, 32 for CIFAR)
+num_classes: null     # accepted for compatibility with classifier wiring
+
+latent_dim: 512
+encoder_hidden_dims: [128, 256, 512]
+
+# KL weight (beta-VAE). Sweep over beta=0/1e-5/1e-4/5e-4 showed reconstruction
+# degrades monotonically with beta up to 1e-4, but at 5e-4 the *alignment* gap
+# (original_psnr vs no_mismatch_psnr) shrinks dramatically, at a reconstruction
+# cost. sigma_vae changes the reconstruction loss scale (MSE -> log(MSE)) by
+# orders of magnitude, which silently dilutes beta's relative strength — with
+# sigma_vae on, beta needed to be rescaled ~100x (5e-4 -> 0.05) to recover the
+# same alignment-friendliness; at beta=0.05+sigma_vae, gap_lin ~0 (near-perfect
+# linear alignment) and sim_psnr through the full physical Dual-SIM is the
+# best found so far (14.47dB vs 13.81dB at beta=0), despite lower raw
+# reconstruction (~19.7dB vs ~26dB) — the physical channel result is what
+# actually matters. free_bits tested and found to make no difference either way.
+beta: 0.05
+
+free_bits: 0.5   # nats/dim; floors per-dimension KL so beta doesn't uniformly starve reconstruction
+reconstruction_l1_weight: 1.0 # MSE + l1_weight * L1 reconstruction loss (sharper than MSE alone)
+ssim_weight: 0.0              # adds ssim_weight * (1 - SSIM)
+ssim_warmup_steps: 0          # linear 0 -> ssim_weight over train loss steps
+perceptual_weight: 0.0        # >0 enables VGGPerceptualLoss from src.agents.utils
+perceptual_warmup_steps: 0    # linear 0 -> perceptual_weight over train loss steps
+
+# Set sigma_vae: false to revert to plain MSE (then beta should go back to ~5e-4, not 0.05).
+# free_bits previously tested "no difference" at beta=5e-4, but that was before
+# realising sigma_vae dilutes beta ~100x — re-enabled now that beta=0.05 is the
+# actually-operative KL strength, where free_bits' per-dimension floor might
+# finally do something.
+sigma_vae: true # calibrated decoder variance (loss ∝ log(MSE)) instead of raw MSE
+
+# InfoVAE-style latent regularisation (independent of beta/KL above) — matches
+# the AGGREGATE batch distribution to the prior instead of each individual
+# sample's posterior, which is what actually matters for pilot-based whitening.
+# Tried as a beta/KL replacement (beta=0, mmd_weight=1..10): consistently
+# WORSE than no regularisation at all on alignment gap, unlike KL — left
+# disabled here pending further tuning (kernel bandwidth, weight range).
+mmd_weight: 0.0
+
+weight_decay: 1e-2
+
+activation:
+  _target_: torch.nn.SiLU
+
+use_batchnorm: true
+
+# Adds a ResidualBlock after each encoder/decoder stage for more capacity at
+# the same depth/width budget — stays within one side of the bottleneck, never
+# bypasses it (see ConvVAE/ResidualBlock docstrings). Set false to revert.
+# The last BN in each block is zero-init'd (starts as identity) — without
+# that, this + sigma_vae reliably diverged to NaN in the first epoch.
+use_residual: true
