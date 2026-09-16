@@ -6,7 +6,7 @@ defaults:
   - _self_
 
 seed: 42
-study_name: masked-cifar10-vae
+study_name: masked-cifar10-newae
 
 graph:
   neighbors_mode: fully_connected
@@ -17,14 +17,14 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: sheaf-repr-learning__masked-cifar10-vae
+  project: sheaf-repr-learning__masked-cifar10-ae
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_${hydra:runtime.choices.dataset}_${hydra:job.num}
   save_dir: logs/
   log_model: false
 
 trainer:
-  max_epochs: 50
+  max_epochs: 100
   accelerator: auto
   devices: 1
   deterministic: true
@@ -46,78 +46,73 @@ diagnostics:
 
 dataset:
   n_agents: 2
-
-  # region_overlap is the controlled fixed-mask task:
-  # - each agent observes a cyclic vertical view;
-  # - the union covers the full image;
-  # - region_overlap_fraction controls the visible overlap between agents.
-  # For n_agents=2, overlap=0.1 implies visible_fraction=(1+0.1)/2=0.55.
-  mask_mode: region_overlap
-  region_visible_fraction: 0.55
-  region_overlap_fraction: 0.1
-  region_boundary_jitter_px: 2
-
-  # Inactive unless mask_mode is changed.
-  fixed_overlap_px: 1.0
-  random_focus_regions: [left, right]
-  random_private_visible_probability: 0.85
-  random_off_focus_visible_probability: 0.05
-  random_shared_visible_probability: 0.1
-  constant_visible_fraction: 0.5
-  # Fraction of the fixed visible budget that is shared, not image fraction.
-  constant_shared_visible_probability: 0.1
-  random_block_size: 4
+  # Fixed individual budget; shared fraction is relative to that budget.
+  mask_mode: constant_visible_shared
+  constant_visible_fraction: 0.65
+  constant_shared_visible_probability: 0.5 
+  random_focus_regions: [left, right] #full
+  random_block_size: 2
 
   # Local train/val/test datasets are disjoint before masking; only global
   # pilots are shared sample ids with agent-specific masks.
   share_private_data: false
+  private_train_fraction: 1.0
   batch_size: 256
   pilot_split: 0.05
   comm_data: shared_global_pilots
-  monitor_test_during_fit: true
+  monitor_test_during_fit: false
   num_workers: 0
 
-  # Required by the reconstruction task: _shared_eval passes own visible masks
-  # to compute_loss/task_performance; communication eval uses sender masks.
+  # Visible masks define the region-normalized local inpainting loss.
   return_mask: true
   include_mask_in_input: true
 
 model:
   # Encoder input is RGB + visible-mask channel; decoder target remains RGB.
   out_features: 3
-  latent_dim: 512
+  normalize_kl: false
+  latent_dim: 256
   encoder_hidden_dims: [128, 256, 512]
-  beta: 0.05
-  free_bits: 0.5
-  reconstruction_l1_weight: 1.0
-  ssim_weight: 0.5
-  perceptual_weight: 0.05
-  sigma_vae: true
+  beta: 0.0 # 0.001 for kl div loss term 
+  beta_warmup_steps: 100
+  missing_region_loss: false # loss on all the image
+  visible_loss_weight: 0.0
+  pilot_loss_weight: 1.0
+  free_bits: 0.0
+  reconstruction_l1_weight: 0.0
+  ssim_weight: 0.0
+  perceptual_weight: 0.01 # >0 enables VGGPerceptualLoss from src.agents.utils
+  sample_posterior: false # false for deterministic autoencoder; true for VAE
+  use_residual: true
+  sigma_vae: false
+  weight_decay: 0.0
   mmd_weight: 0.0
   use_batchnorm: true
-  use_residual: true
 
 orchestrator:
-  parseval_normalization: false
-  l2_normalization: false
-  log_latent_diagnostics: true
 
-  # Required for the live cross-agent inpainting loss to have pilot masks:
-  # _both_live_alignment_losses receives matched masks only on the all-anchor
-  # step-pilot path.
+  parseval_normalization: false
+  log_latent_diagnostics: true
+  # If false, closed-form whitening of local latents; avoid an extra learned transform.
+  learn_whitening: true
+  l2_normalization: false
+  # Same pilot pool and orthogonal map family in both experimental arms.
   anchor_selection: all
+  alignment_method: procrustes
   max_lmb: 0.5
   warmup_epochs: 10
   use_general_maps: false
   soft_maps: false
-  alignment_method: procrustes
   gamma: 0.001
   eta: 0.01
-  # Activates the post-communication reconstruction loss on
-  # missing_receiver * visible_sender.
+  # Pure alignment comparison: optional full-image cross-MSE stays disabled.
   comm_task_coeff: 0.0
+  lambda_schedule: cosine
   pid_logging: false
 
+mask_augmentation:
+  resample_each_epoch: true
+
 optimization:
-  objective_metric: validation/avg_task_performance_epoch
   run_test: true
+  objective_metric: validation/avg_loss_mse_missing

@@ -67,6 +67,51 @@ class ReconstructionDataModule:
         }
 
 
+class ZeroDecoder(nn.Module):
+    def forward(self, z):
+        return torch.zeros(z.shape[0], 1, 2, 2, device=z.device)
+
+
+class ZeroDecoderReconstructionAgent(nn.Module):
+    task_type = 'reconstruction'
+
+    def __init__(self):
+        super().__init__()
+        self.decoder = ZeroDecoder()
+
+    def encode(self, x):
+        return x.flatten(1)
+
+
+class DirectionalMaskReconstructionDataset(torch.utils.data.Dataset):
+    def __init__(self, target: torch.Tensor, mask: torch.Tensor):
+        self.x = torch.zeros_like(target)
+        self.target = target
+        self.mask = mask
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, idx):
+        return self.x, self.target, self.mask
+
+
+class DirectionalMaskReconstructionDataModule:
+    def __init__(self):
+        sender_target = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]])
+        sender_mask = torch.tensor([[[1.0, 0.0], [1.0, 0.0]]])
+        receiver_target = torch.zeros(1, 2, 2)
+        receiver_mask = torch.tensor([[[0.0, 1.0], [0.0, 1.0]]])
+        self.test_datasets = {
+            0: DirectionalMaskReconstructionDataset(
+                sender_target, sender_mask
+            ),
+            1: DirectionalMaskReconstructionDataset(
+                receiver_target, receiver_mask
+            ),
+        }
+
+
 class ConcreteOrchestrator(BaseOrchestrator):
     """Concrete implementation for testing."""
 
@@ -251,3 +296,39 @@ class TestBaseOrchestrator:
 
         assert logs['validation/avg_private_task_perf'] > 90.0
         assert logs['validation/avg_comm_task_perf'] > 90.0
+
+    def test_reconstruction_comm_performance_uses_full_image_mse(self):
+        orchestrator = ConcreteOrchestrator(
+            agents={
+                0: ZeroDecoderReconstructionAgent(),
+                1: ZeroDecoderReconstructionAgent(),
+            },
+            neighbors={0: set(), 1: {0}},
+            optimizer=MockOptimizer(),
+        )
+
+        logs = orchestrator.evaluate_communication_accuracy(
+            DirectionalMaskReconstructionDataModule(),
+            prefix='validation',
+        )
+
+        expected_psnr = 10.0 * torch.log10(torch.tensor(2.0)).item()
+        assert logs['validation/private_task_perf_agent_0'] == pytest.approx(
+            expected_psnr
+        )
+        assert logs['validation/private_mse_full_agent_0'] == pytest.approx(
+            0.5
+        )
+        assert logs['validation/private_mse_visible_agent_0'] == pytest.approx(
+            1e-10
+        )
+        assert logs['validation/private_mse_missing_agent_0'] == pytest.approx(
+            1.0
+        )
+        assert logs['validation/comm_task_perf_agent_1'] == pytest.approx(
+            expected_psnr
+        )
+        assert logs['validation/comm_mse_full_agent_1'] == pytest.approx(0.5)
+        assert logs[
+            'validation/comm_mse_tx_missing_rx_visible_agent_1'
+        ] == pytest.approx(0.5)

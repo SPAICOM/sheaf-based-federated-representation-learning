@@ -171,6 +171,7 @@ class SpatialRandomMaskGenerator:
 
     _DEFAULT_REGIONS = ('top_right', 'bottom_left', 'top_left', 'bottom_right')
     _REGIONS = {
+        'full': (0.0, 1.0, 0.0, 1.0),
         'top_left': (0.0, 0.5, 0.0, 0.5),
         'top_right': (0.0, 0.5, 0.5, 1.0),
         'bottom_left': (0.5, 1.0, 0.0, 0.5),

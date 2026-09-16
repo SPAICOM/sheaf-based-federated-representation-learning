@@ -120,6 +120,10 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
             else:
                 agent_performances[int(idx)] = agent.task_performance(y_hat, y)
 
+        if prefix == 'train':
+            for idx, agent in self.agents.items():
+                agent_losses[int(idx)] += self._local_pilot_loss(agent, batch, int(idx))
+
         total_loss, _avg_performance = self._log_shared_metrics(
             prefix=prefix,
             agent_losses=agent_losses,

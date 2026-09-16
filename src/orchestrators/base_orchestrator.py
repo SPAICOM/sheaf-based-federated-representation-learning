@@ -544,6 +544,18 @@ class BaseOrchestrator(l.LightningModule, ABC):
             self._collect_all_global_pilot_latents()
             self._log_global_pilot_diagnostics()
 
+    def _log_communication_reconstruction(
+        self, dm, sender_idx: int, receiver_idx: int, prediction: torch.Tensor
+    ) -> None:
+        """Dispatch predictions while the evaluation transport maps are active."""
+        trainer = getattr(self, '_trainer', None)
+        if trainer is None:
+            return
+        for callback in trainer.callbacks:
+            hook = getattr(callback, 'log_communication_reconstruction', None)
+            if hook is not None:
+                hook(trainer, self, dm, sender_idx, receiver_idx, prediction)
+
     def on_test_epoch_end(self) -> None:
         """Log cumulative test communication metrics."""
         self._finalize_stage_communication('test')
@@ -728,6 +740,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         self_accs: dict[int, float] = {}
         logs: dict[str, float] = {}
+        lpips_metric = None
+        if prefix == 'test' and any(
+            _is_reconstruction(agent) for agent in self.agents.values()
+        ):
+            from src.utils.reconstruction_metrics import ReconstructionLPIPS
+
+            lpips_metric = ReconstructionLPIPS(self.device)
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
@@ -744,6 +763,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
+            if lpips_metric is not None and _is_reconstruction(agent):
+                logs[f'{prefix}/private_lpips_full_agent_{idx}'] = (
+                    lpips_metric(y_hat, test_y[idx])
+                )
             if _is_reconstruction(agent):
                 logs[f'{prefix}/private_mse_full_agent_{idx}'] = (
                     _reconstruction_mse(
@@ -790,6 +813,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
             neighbor_accs: list[float] = []
             neighbor_visible_mses: list[float] = []
+            neighbor_missing_mses: list[float] = []
+            neighbor_lpips: list[float] = []
             for sender_idx in neighbors_map.get(receiver_idx, set()):
                 if sender_idx not in test_Z:
                     continue
@@ -811,6 +836,16 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     test_y[sender_idx],
                 )
                 neighbor_accs.append(acc)
+                if prefix == 'test' and _is_reconstruction(agent_receiver):
+                    self._log_communication_reconstruction(
+                        dm, sender_idx, receiver_idx, y_hat
+                    )
+                if lpips_metric is not None and _is_reconstruction(agent_receiver):
+                    neighbor_lpips.append(lpips_metric(y_hat, test_y[sender_idx]))
+                if _is_reconstruction(agent_receiver) and sender_idx in test_masks:
+                    neighbor_missing_mses.append(
+                        _missing_mse(y_hat, test_y[sender_idx], test_masks[sender_idx])
+                    )
                 if _is_reconstruction(agent_receiver):
                     neighbor_visible_mses.append(
                         _reconstruction_mse(
@@ -819,6 +854,14 @@ class BaseOrchestrator(l.LightningModule, ABC):
                         )
                     )
 
+            if neighbor_lpips:
+                logs[f'{prefix}/comm_lpips_full_agent_{receiver_idx}'] = (
+                    sum(neighbor_lpips) / len(neighbor_lpips)
+                )
+            if neighbor_missing_mses:
+                logs[f'{prefix}/comm_mse_sender_missing_agent_{receiver_idx}'] = (
+                    sum(neighbor_missing_mses) / len(neighbor_missing_mses)
+                )
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
@@ -841,6 +884,12 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 fidelity = avg_acc / self_acc if self_acc > 0.0 else 0.0
                 task_fidelities[receiver_idx] = fidelity
                 logs[f'{prefix}/task_fidelity_agent_{receiver_idx}'] = fidelity
+
+        for metric_name in ('private_lpips_full', 'comm_lpips_full'):
+            values = [value for key, value in logs.items()
+                      if key.startswith(f'{prefix}/{metric_name}_agent_')]
+            if values:
+                logs[f'{prefix}/avg_{metric_name}'] = sum(values) / len(values)
 
         if receiver_comm_accs:
             logs[f'{prefix}/avg_comm_task_perf'] = sum(
@@ -1671,6 +1720,28 @@ class BaseOrchestrator(l.LightningModule, ABC):
             shape ``(n, d_receiver)``.
         """
         pass
+
+    def _local_pilot_loss(self, agent, batch, idx):
+        """Same local pilot supervision in cooperative and independent training."""
+        weight = getattr(agent, 'pilot_loss_weight', 0.0)
+        if not weight:
+            return 0.0
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        key = next(
+            (k for k in (f'global_pilot_{idx}', f'pilot_{idx}') if k in batch),
+            None,
+        )
+        if key is None:
+            raise ValueError(
+                'Local pilot supervision requires per-agent pilot batches.'
+            )
+        x, y, mask = self._unpack_task_batch(batch[key])
+        private_components = agent.last_loss_components
+        prediction = agent(x)
+        loss = weight * agent.compute_loss(prediction, y, eval_mask=mask)
+        agent.last_loss_components = private_components
+        return loss
 
     def forward(
         self,

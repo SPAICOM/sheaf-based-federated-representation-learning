@@ -1,0 +1,259 @@
+defaults:
+  - dataset: hetero_cifar10
+  - model: cnn_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate Cifar10 15 agents"
+
+lmb_study:
+  enabled: false         # set to true to run Optuna search before the full training run
+  efficient: false      # if true, tune max_lmb on only the first two agents (cheaper)
+  n_trials: 15          # number of Optuna trials
+  n_tune_epochs: 5      # epochs per trial
+  lmb_low: 1e-4         # lower bound of the log-uniform search interval
+  lmb_high: 1
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.4          # <= 40% of the n(n-1)/2 possible edges
+  similarity: intersection    # edge weight: shared-class count ("jaccard" also ok)
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: shift_distr_new
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+optimizer_study:
+  enabled: false
+  n_trials: 15
+  n_tune_epochs: 5
+  lr_low: 1e-4
+  lr_high: 1e-1
+  weight_decay_low: 1e-6
+  weight_decay_high: 1e-2
+  objective_metric: validation/avg_task_performance_epoch
+
+
+trainer:
+  max_epochs: 150
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 15
+  classes_per_agent: 10
+  shift_strength: 0.9
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4]
+    2:
+      agents: [2]
+      target_classes: [0, 1, 2, 3, 4, 5]
+    3:
+      agents: [3]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    4:
+      agents: [4]
+      target_classes: [0, 1, 2, 7, 8, 9]
+    5:
+      agents: [5]
+      target_classes: [2, 3, 4, 5, 6]
+    6:
+      agents: [6]
+      target_classes: [1, 2, 3, 4, 5, 6]
+    7:
+      agents: [7]
+      target_classes: [3, 4, 5, 6, 7]
+    8:
+      agents: [8]
+      target_classes: [0, 2, 4, 6, 8]
+    9:
+      agents: [9]
+      target_classes: [5, 6, 7, 8, 9]
+    10:
+      agents: [10]
+      target_classes: [1, 2, 3, 4, 5]
+    11:
+      agents: [11]
+      target_classes: [0, 1, 2, 8, 9]
+    12:
+      agents: [12]
+      target_classes: [3, 4, 5, 6, 7, 8]
+    13:
+      agents: [13]
+      target_classes: [1, 4, 6, 8, 9]
+    14:
+      agents: [14]
+      target_classes: [0, 1, 2, 3, 7]
+
+model:
+  dropout: 0.1
+  agents:
+    0:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128]
+      decoder_hidden_dims: [256, 128] # removed bottleneck from last 64 layer
+      #dropout: 0.3
+      #dropout: 0.1
+      use_batchnorm: true
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128, 256]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
+      decoder_hidden_dims: [128]
+      #dropout: 0.1
+      use_batchnorm: true
+    2:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [24, 48, 96] # [16, 32, 64]  change it
+      decoder_hidden_dims: [128]
+      #dropout: 0.2
+      #dropout: 0.1
+      use_batchnorm: true
+    3:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128, 256]  # +3rd block: pools 7x7 -> 3x3
+      decoder_hidden_dims: [256, 128]
+      #dropout: 0.25
+      #dropout: 0.1
+      use_batchnorm: true
+    4:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 96, 192] # from [32, 48, 96, 192]
+      decoder_hidden_dims: [192, 96] 
+      #dropout: 0.3
+      #dropout: 0.1
+      use_batchnorm: true
+    5:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [48, 96, 192] # changed from [24, 48, 96]
+      decoder_hidden_dims: [128] # chenged form 96
+      #dropout: 0.15
+      #dropout: 0.1
+      use_batchnorm: true
+    6:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128, 192, 256] # from  [32, 64, 128, 256]
+      decoder_hidden_dims: [128, 256] # from [256]
+      #dropout: 0.4
+      #dropout: 0.1
+      use_batchnorm: true
+    7:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [48, 96, 144, 192] # from [24, 48, 96, 144]
+      decoder_hidden_dims: [192, 96] # form [64, 32]
+      #dropout: 0.1
+      #dropout: 0.1
+      use_batchnorm: true
+    8:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [48, 96, 160]
+      decoder_hidden_dims: [160, 80]
+      #dropout: 0.2
+      #dropout: 0.1
+      use_batchnorm: true
+    9:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128] #  from [32, 80]
+      decoder_hidden_dims: [128] # from [32, 80]
+      #dropout: 0.05
+      #dropout: 0.1
+      use_batchnorm: true
+    10:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [40, 80, 120]
+      decoder_hidden_dims: [120, 60]
+      #dropout: 0.2
+      #dropout: 0.1
+      use_batchnorm: true
+    11:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [48, 96, 192, 240]
+      decoder_hidden_dims: [256, 128]
+      #dropout: 0.2
+      #dropout: 0.1
+      use_batchnorm: true
+    12:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [40, 60, 80]
+      decoder_hidden_dims: [100]
+      #dropout: 0.2
+      #dropout: 0.1
+      use_batchnorm: true
+    13:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 96]
+      decoder_hidden_dims: [192, 96]
+      #dropout: 0.25
+      #dropout: 0.1
+      use_batchnorm: true
+    14:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [56, 112, 160]
+      decoder_hidden_dims: [128]
+      #dropout: 0.1
+      use_batchnorm: true
+
+orchestrator:
+  pid_logging: false
+  use_prototypes: false
+  log_latent_diagnostics: true
+  # Sheaf FRL specific
+  warmup_epochs: 0
+  use_general_maps: false
+  soft_maps: false
+  align_on_intersection: false
+  learn_whitening: true
+  # # CE Sheaf FRL specific
+  # phase_a_epochs: 1
+  # phase_c_epochs: 2
+  # # Sheaf compressed FRL
+  # compression_factor: 0.5
+  # Sheaf FMTL specific
+  gamma: 1e-4
+  eta: 0.01
+  # Post-training alignment
+  alignment_method: procrustes
+  max_lmb: 1e-1
+  learn_lmb: false
+  dual_rho: null
+  comm_task_coeff: 0
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      #dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
+      #orchestrator: sheaf_frl
+      orchestrator.max_lmb: 1e-4, 1e-3, 1e-2, 1e-1

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
 import inspect
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +31,6 @@ from lightning import Callback, Trainer, seed_everything
 from omegaconf import DictConfig, OmegaConf
 from torchvision.utils import make_grid
 
-from src.utils import remove_non_empty_dir
 from src.utils.graph_generator import generate_neighbors
 
 
@@ -114,6 +115,34 @@ def _filter_supported_init_kwargs(
 
     allowed = {name for name in signature.parameters if name != 'self'}
     return {key: value for key, value in kwargs.items() if key in allowed}
+
+
+class ReconstructionMaskEpochCallback(Callback):
+    """Resample training views jointly; validation/test use fixed pilot views."""
+
+    @staticmethod
+    def _set(dm, groups, epoch):
+        for group in groups:
+            for dataset in getattr(dm, group, {}).values():
+                dataset.mask_epoch.fill_(epoch)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._set(
+            trainer.datamodule,
+            ('train_datasets', 'pilot_datasets'),
+            trainer.current_epoch + 1,
+        )
+
+    def on_validation_start(self, trainer, pl_module):
+        self._set(trainer.datamodule, ('pilot_datasets',), 0)
+
+    def on_validation_end(self, trainer, pl_module):
+        self._set(
+            trainer.datamodule, ('pilot_datasets',), trainer.current_epoch + 1
+        )
+
+    def on_test_start(self, trainer, pl_module):
+        self._set(trainer.datamodule, ('pilot_datasets',), 0)
 
 
 class MaskedReconstructionDiagnosticsCallback(Callback):
@@ -216,6 +245,8 @@ class MaskedReconstructionDiagnosticsCallback(Callback):
                         agent(masked.unsqueeze(0).to(device)).squeeze(0).cpu()
                     )
                     rows.append(recon.clamp(0.0, 1.0))
+                    completed = target * mask + recon * (1.0 - mask)
+                    rows.append(completed.clamp(0.0, 1.0))
         agent.train(was_training)
         return rows
 
@@ -230,9 +261,10 @@ class MaskedReconstructionDiagnosticsCallback(Callback):
         if not datasets:
             return
 
-        columns = 4 if include_reconstruction else 3
+        columns = 5 if include_reconstruction else 3
         caption = (
-            'per sample: masked | mask | target | reconstruction'
+            'per sample: masked | visible mask | target | reconstruction | '
+            'completed (original visible pixels + reconstructed missing pixels)'
             if include_reconstruction
             else 'per sample: masked | mask | target'
         )
@@ -334,6 +366,44 @@ class MaskedReconstructionDiagnosticsCallback(Callback):
                 include_reconstruction=True,
             )
 
+    def log_communication_reconstruction(
+        self, trainer, pl_module, dm, sender_idx, receiver_idx, prediction
+    ) -> None:
+        """Log the exact cross-decoder predictions used by test metrics."""
+        if not self._active(trainer):
+            return
+        dataset = dm.test_datasets.get(sender_idx)
+        if dataset is None:
+            return
+        rows = []
+        for idx in range(min(self.num_samples, len(dataset), len(prediction))):
+            masked, target = dataset[idx][:2]
+            mask = dataset._mask(idx).to(dtype=masked.dtype)
+            recon = prediction[idx].detach().cpu()
+            rows.extend([
+                self._input_to_rgb(masked).clamp(0, 1),
+                self._mask_to_rgb(mask).clamp(0, 1),
+                target.clamp(0, 1),
+                recon.clamp(0, 1),
+                (target * mask + recon * (1 - mask)).clamp(0, 1),
+            ])
+        if rows:
+            self._log_image(
+                trainer,
+                f'test/communication_reconstruction_sender_{sender_idx}_receiver_{receiver_idx}',
+                make_grid(rows, nrow=5, padding=2),
+                'per sample: sender masked input | sender visible mask | target | '
+                'receiver reconstruction from sender latent | completed using '
+                'sender visible pixels (display only; metrics use raw reconstruction)',
+            )
+
+    def on_test_end(self, trainer: Trainer, pl_module) -> None:
+        """Always log the final model on fixed test views, regardless of cadence."""
+        if self._active(trainer):
+            self._log_split_examples(
+                trainer, pl_module, split='test', include_reconstruction=True
+            )
+
 
 def _parse_per_agent_cfg(cfg: DictConfig) -> dict[int, dict]:
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -398,6 +468,12 @@ def _build_orchestrator(
     neighbors: dict[int, set[int]],
     latent_dims: dict[int, int],
 ) -> Any:
+    from src.orchestrators.federated import FederatedLearning
+
+    if issubclass(get_class(cfg.orchestrator._target_), FederatedLearning):
+        # The shared reconstruction config otherwise injects Procrustes.
+        # FedAvg communicates raw latents using its synchronized model space.
+        cfg.orchestrator.alignment_method = None
     orch_cfg = _sanitize_instantiation_config(cfg.orchestrator)
     kwargs = _filter_supported_init_kwargs(
         orch_cfg,
@@ -411,6 +487,10 @@ def _build_orchestrator(
 
 def _build_callbacks(cfg: DictConfig) -> list[Callback]:
     callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
+    if OmegaConf.select(
+        cfg, 'mask_augmentation.resample_each_epoch', default=False
+    ):
+        callbacks.insert(0, ReconstructionMaskEpochCallback())
     diag_cfg = OmegaConf.select(cfg, 'diagnostics.masked_reconstruction')
     if diag_cfg is not None and diag_cfg.get('enabled', False):
         callbacks.append(
@@ -435,6 +515,9 @@ def _run_name(cfg: DictConfig, orch_name: str) -> str:
 
     mask_mode = OmegaConf.select(cfg, 'dataset.mask_mode', default='unknown')
     parts = [orch_name, f'mask_{mask_mode}']
+    variant = OmegaConf.select(cfg, 'loss_variant', default=None)
+    if variant is not None:
+        parts.insert(0, str(variant))
     if OmegaConf.select(cfg, 'orchestrator.max_lmb', default=None) is not None:
         parts.append(f'lmb_{float(cfg.orchestrator.max_lmb):.4e}')
     if (
@@ -446,6 +529,43 @@ def _run_name(cfg: DictConfig, orch_name: str) -> str:
     return '_'.join(parts)
 
 
+def _comparison_id(cfg: DictConfig) -> str:
+    """Prevent plots from pooling different objectives, budgets or map families."""
+    payload = OmegaConf.to_container(cfg, resolve=True)
+    common = {
+        key: payload.get(key)
+        for key in (
+            'model',
+            'dataset',
+            'optimizer',
+            'trainer',
+            'mask_augmentation',
+        )
+    }
+    common['dataset'] = dict(common['dataset'])
+    for key in (
+        'seed',
+        'constant_shared_visible_probability',
+        'random_shared_visible_probability',
+        'region_overlap_fraction',
+    ):
+        common['dataset'].pop(key, None)
+    common['alignment'] = {
+        key: payload['orchestrator'].get(key)
+        for key in (
+            'alignment_method',
+            'use_general_maps',
+            'anchor_selection',
+            'comm_task_coeff',
+            'max_lmb',
+            'warmup_epochs',
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(common, sort_keys=True).encode()
+    ).hexdigest()[:12]
+
+
 def _save_results(
     cfg: DictConfig,
     callback_metrics: dict[str, float],
@@ -455,6 +575,15 @@ def _save_results(
     rows = [
         {
             'agent': agent_idx,
+            'private_lpips_full': callback_metrics.get(
+                f'test/private_lpips_full_agent_{agent_idx}', float('nan')
+            ),
+            'comm_lpips_full': callback_metrics.get(
+                f'test/comm_lpips_full_agent_{agent_idx}', float('nan')
+            ),
+            'lpips_backbone': 'alex',
+            'lpips_version': '0.1',
+            'loss_variant': OmegaConf.select(cfg, 'loss_variant', default=None),
             'private_psnr_full': callback_metrics.get(
                 f'test/private_task_perf_agent_{agent_idx}', float('nan')
             ),
@@ -482,6 +611,9 @@ def _save_results(
                         float('nan'),
                     ),
                 ),
+            ),
+            'comm_mse_sender_missing': callback_metrics.get(
+                f'test/comm_mse_sender_missing_agent_{agent_idx}', float('nan')
             ),
             'task_fidelity': callback_metrics.get(
                 f'test/task_fidelity_agent_{agent_idx}', float('nan')
@@ -536,6 +668,14 @@ def _save_results(
                 default=None,
             ),
             'seed': int(cfg.seed),
+            'protocol': 'inpainting_v2',
+            'comparison_id': _comparison_id(cfg),
+            'latent_dim': int(cfg.model.latent_dim),
+            'beta': float(cfg.model.beta),
+            'comm_task_coeff': float(
+                cfg.orchestrator.get('comm_task_coeff', 0.0)
+            ),
+            'config_yaml': OmegaConf.to_yaml(cfg, resolve=True),
         }
         for agent_idx in range(n_agents)
     ]
@@ -543,14 +683,11 @@ def _save_results(
     df = pd.DataFrame(rows)
     results_dir = Path('results') / 'reconstruction'
     results_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     mask_mode = OmegaConf.select(cfg, 'dataset.mask_mode', default='unknown')
-    out_path = (
-        results_dir
-        / (
-            f'reconstruction__{orch_name}__mask_{mask_mode}'
-            f'__seed{cfg.seed}__{timestamp}.parquet'
-        )
+    out_path = results_dir / (
+        f'reconstruction__{orch_name}__mask_{mask_mode}'
+        f'__seed{cfg.seed}__{timestamp}.parquet'
     )
     df.to_parquet(out_path, index=False)
     print(f'\nResults saved -> {out_path}')
@@ -559,6 +696,8 @@ def _save_results(
             [
                 'agent',
                 'private_psnr_full',
+                'private_lpips_full',
+                'comm_lpips_full',
                 'private_mse_full',
                 'private_mse_visible',
                 'private_mse_missing',
@@ -638,16 +777,16 @@ def main(cfg: DictConfig) -> float:
     metrics = {
         key: float(value) for key, value in trainer.callback_metrics.items()
     }
-    private_psnr = metrics.get('test/avg_private_task_perf', 0.0)
-    comm_psnr = metrics.get('test/avg_comm_task_perf', 0.0)
-    denom = private_psnr + comm_psnr
-    objective = 2.0 * private_psnr * comm_psnr / denom if denom > 0.0 else 0.0
+    # Primary objective: mean private inpainting error (lower is better).
+    missing = [
+        metrics.get(f'test/private_mse_missing_agent_{i}', float('nan'))
+        for i in range(n_agents)
+    ]
+    objective = sum(missing) / n_agents
 
     out_path = _save_results(cfg, metrics, n_agents, orch_name)
     _update_logger_config(logger, {'results_file': str(out_path)})
 
-    remove_non_empty_dir('./multirun/')
-    remove_non_empty_dir('./outputs/')
     _finish_active_wandb_run()
 
     del trainer, orchestrator, datamodule, logger

@@ -1,7 +1,7 @@
 """Plot masked-reconstruction MSE metrics against mask overlap/sharedness.
 
 Reads the parquet summaries written by ``scripts/reconstruction_experiment.py``
-and produces two curves, one for private visible-region MSE and one for
+and produces two curves, one for private missing-region MSE and one for
 cross-agent communication MSE.
 """
 
@@ -61,21 +61,32 @@ def _load_results(args: argparse.Namespace) -> pd.DataFrame:
         rows.append(df)
 
     if not rows:
-        raise SystemExit(f'No reconstruction parquet files in {args.results_dir}')
+        raise SystemExit(
+            f'No reconstruction parquet files in {args.results_dir}'
+        )
 
     data = pd.concat(rows, ignore_index=True)
     data = data[data['orchestrator'].isin(ORCH_ORDER)]
+    if 'protocol' not in data:
+        raise SystemExit(
+            'No inpainting_v2 results; legacy runs use a different objective.'
+        )
+    data = data[data['protocol'] == 'inpainting_v2']
     data = data[data['mask_mode'] == args.mask_mode]
+    if args.comparison_id is not None:
+        data = data[data['comparison_id'] == args.comparison_id]
+    ids = data['comparison_id'].dropna().unique()
+    if len(ids) > 1:
+        raise SystemExit(
+            f'Multiple setups found: {list(ids)}. Select --comparison-id.'
+        )
     if args.seed is not None and 'seed' in data.columns:
         data = data[data['seed'] == args.seed]
     x_col = _x_column(args.mask_mode)
-    if (
-        args.mask_mode in {'agent_random_spatial', 'constant_visible_shared'}
-        and (
-            x_col not in data.columns
-            or data[x_col].isna().all()
-        )
-    ):
+    if args.mask_mode in {
+        'agent_random_spatial',
+        'constant_visible_shared',
+    } and (x_col not in data.columns or data[x_col].isna().all()):
         inactive_x_col = f'inactive_{x_col}'
         if inactive_x_col in data.columns:
             x_col = inactive_x_col
@@ -92,7 +103,7 @@ def _load_results(args: argparse.Namespace) -> pd.DataFrame:
     # corrected rerun replace an older parquet without deleting local results.
     data = data.sort_values('source_mtime')
     return data.drop_duplicates(
-        subset=['orchestrator', 'x_value', 'agent'],
+        subset=['orchestrator', 'x_value', 'seed', 'agent'],
         keep='last',
     )
 
@@ -132,7 +143,13 @@ def _communication_mse_column(data: pd.DataFrame) -> str:
 
 def _aggregate(data: pd.DataFrame) -> pd.DataFrame:
     comm_col = _communication_mse_column(data)
-    metrics = ['private_mse_visible', comm_col]
+    metrics = ['private_mse_missing', comm_col]
+    # Average agents within each run, then summarize independent seeds.
+    data = (
+        data.groupby(['orchestrator', 'x_value', 'seed'])[metrics]
+        .mean()
+        .reset_index()
+    )
     grouped = (
         data.groupby(['orchestrator', 'x_value'])[metrics]
         .agg(['mean', 'std'])
@@ -224,8 +241,9 @@ def main() -> None:
         type=Path,
         default=Path('results/reconstruction/plots'),
     )
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--mask-mode', default='region_overlap')
+    parser.add_argument('--comparison-id', default=None)
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--mask-mode', default='constant_visible_shared')
     parser.add_argument('--min-value', type=float, default=0.1)
     parser.add_argument('--max-value', type=float, default=0.9)
     parser.add_argument(
@@ -263,8 +281,8 @@ def main() -> None:
         plt.rcParams['text.usetex'] = False
         private_path = _plot_metric(
             summary,
-            'private_mse_visible',
-            'Private visible MSE',
+            'private_mse_missing',
+            'Private missing MSE',
             xlabel,
             args.out_dir / f'private_mse_vs_{prefix}.png',
         )

@@ -249,6 +249,12 @@ class CNNVariationalAE(BaseAgent):
         free_bits: float = 0.0,
         reconstruction_l1_weight: float = 0.0,
         sigma_vae: bool = False,
+        sample_posterior: bool = True,
+        missing_region_loss: bool = False,
+        visible_loss_weight: float = 0.25,
+        normalize_kl: bool = False,
+        beta_warmup_steps: int = 0,
+        pilot_loss_weight: float = 0.0,
         mmd_weight: float = 0.0,
         ssim_weight: float = 0.0,
         ssim_warmup_steps: int = 0,
@@ -264,7 +270,9 @@ class CNNVariationalAE(BaseAgent):
         super().__init__()
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [64, 128, 256]
-        output_features = int(in_features if out_features is None else out_features)
+        output_features = int(
+            in_features if out_features is None else out_features
+        )
 
         self._encoder = CNNVAEEncoder(
             in_features=in_features,
@@ -296,6 +304,12 @@ class CNNVariationalAE(BaseAgent):
         self.free_bits = float(free_bits)
         self.reconstruction_l1_weight = float(reconstruction_l1_weight)
         self.sigma_vae = bool(sigma_vae)
+        self.sample_posterior = bool(sample_posterior)
+        self.missing_region_loss = bool(missing_region_loss)
+        self.visible_loss_weight = float(visible_loss_weight)
+        self.normalize_kl = bool(normalize_kl)
+        self.beta_warmup_steps = int(beta_warmup_steps)
+        self.pilot_loss_weight = float(pilot_loss_weight)
         self.mmd_weight = float(mmd_weight)
         self.ssim_weight = float(ssim_weight)
         self.ssim_warmup_steps = int(ssim_warmup_steps)
@@ -335,7 +349,15 @@ class CNNVariationalAE(BaseAgent):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mu = self.encode(x)
-        z = self.reparameterize(mu, self._last_logvar) if self.training else mu
+        return self.decode_posterior(mu)
+
+    def decode_posterior(self, mu: torch.Tensor) -> torch.Tensor:
+        """Sample for local training; keep encode() deterministic for messages."""
+        z = (
+            self.reparameterize(mu, self._last_logvar)
+            if self.training and self.sample_posterior
+            else mu
+        )
         return self._decoder(z)
 
     def kl_penalty(self) -> torch.Tensor:
@@ -346,7 +368,8 @@ class CNNVariationalAE(BaseAgent):
         kl_per_dim = (-0.5 * (1 + logvar - mu.pow(2) - logvar.exp())).mean(
             dim=0
         )
-        return torch.clamp(kl_per_dim, min=self.free_bits).sum()
+        kl = torch.clamp(kl_per_dim, min=self.free_bits)
+        return kl.mean() if self.normalize_kl else kl.sum()
 
     def weight_decay_penalty(self) -> torch.Tensor:
         if self.weight_decay <= 0.0:
@@ -380,12 +403,38 @@ class CNNVariationalAE(BaseAgent):
         if self.training and torch.is_grad_enabled():
             self._loss_step += 1
 
+    def reconstruction_mse(self, y_hat, target, eval_mask=None):
+        """Region-normalized inpainting loss, or legacy full-image MSE."""
+        if not self.missing_region_loss:
+            return F.mse_loss(y_hat, target)
+        if eval_mask is None:
+            raise ValueError(
+                'Inpainting loss requires the visible input mask.'
+            )
+        missing, visible = self.region_mses(y_hat, target, eval_mask)
+        return missing + self.visible_loss_weight * visible
+
+    @staticmethod
+    def region_mses(y_hat, target, eval_mask):
+        """Missing and visible errors, averaged per sample with empty regions zero."""
+        mask = eval_mask.to(y_hat)
+        if mask.ndim == y_hat.ndim - 1:
+            mask = mask.unsqueeze(1)
+        mask = mask.expand_as(y_hat)
+        error = (y_hat - target).square()
+        axes = tuple(range(1, error.ndim))
+
+        def regional(weights):
+            return (
+                (error * weights).sum(axes) / weights.sum(axes).clamp_min(1)
+            ).mean()
+
+        return regional(1 - mask), regional(mask)
+
     def compute_loss(self, y_hat, y, eval_mask=None) -> torch.Tensor:
         """
-        Reconstruction task loss over the full image.
-
-        ``eval_mask`` is accepted for orchestrator compatibility but does not
-        restrict the reconstruction loss.
+        Reconstruction plus posterior regularization. Regional MSE is opt-in;
+        auxiliary L1/SSIM/perceptual losses, when enabled, use the full image.
         """
         target = (
             y
@@ -401,7 +450,10 @@ class CNNVariationalAE(BaseAgent):
         target = target.to(y_hat.device)
         mse = F.mse_loss(y_hat, target)
 
-        mse_term = 0.5 * torch.log(mse + 1e-8) if self.sigma_vae else mse
+        task_mse = self.reconstruction_mse(y_hat, target, eval_mask)
+        mse_term = (
+            0.5 * torch.log(task_mse + 1e-8) if self.sigma_vae else task_mse
+        )
         recon_loss = mse_term
 
         l1 = y_hat.new_zeros(())
@@ -436,7 +488,8 @@ class CNNVariationalAE(BaseAgent):
         )
         kl = self.kl_penalty()
         weight_decay = self.weight_decay_penalty()
-        loss = recon_loss + self.beta * kl + mmd + weight_decay
+        beta = self._warmup_weight(self.beta, self.beta_warmup_steps)
+        loss = recon_loss + beta * kl + mmd + weight_decay
 
         self.last_loss_components = {
             'mse': mse.detach(),
@@ -444,7 +497,8 @@ class CNNVariationalAE(BaseAgent):
             'l1': l1.detach(),
             'reconstruction': recon_loss.detach(),
             'kl': kl.detach(),
-            'kl_weighted': (self.beta * kl).detach(),
+            'kl_weighted': (beta * kl).detach(),
+            'beta': y_hat.new_tensor(beta),
             'ssim_loss': ssim_loss.detach(),
             'ssim_weight': y_hat.new_tensor(ssim_weight),
             'perceptual': perceptual.detach(),
@@ -453,6 +507,13 @@ class CNNVariationalAE(BaseAgent):
             'weight_decay': weight_decay.detach(),
             'total': loss.detach(),
         }
+        if eval_mask is not None:
+            missing, visible = self.region_mses(
+                y_hat.detach(), target, eval_mask
+            )
+            self.last_loss_components.update(
+                mse_missing=missing, mse_visible=visible
+            )
         self._advance_loss_step()
         return loss
 

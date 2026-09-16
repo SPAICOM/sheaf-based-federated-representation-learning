@@ -1451,9 +1451,8 @@ class SheafFRL(BaseOrchestrator):
                     Z_j_to_i = self._recolour_node(node_i, Z_j_to_i)
                     logits_ji = agent_i.decoder(Z_j_to_i.to(dtype=Z_i.dtype))
                     if _task_type(agent_i) == 'reconstruction':
-                        after_comm_task_loss += agent_i.compute_loss(
-                            logits_ji,
-                            y_j_shared.to(self.device),
+                        after_comm_task_loss += torch.nn.functional.mse_loss(
+                            logits_ji, y_j_shared.to(self.device)
                         )
                     else:
                         after_comm_task_loss += agent_i.compute_loss(
@@ -1466,9 +1465,8 @@ class SheafFRL(BaseOrchestrator):
                     Z_i_to_j = self._recolour_node(node_j, Z_i_to_j)
                     logits_ij = agent_j.decoder(Z_i_to_j.to(dtype=Z_j.dtype))
                     if _task_type(agent_j) == 'reconstruction':
-                        after_comm_task_loss += agent_j.compute_loss(
-                            logits_ij,
-                            y_i_shared.to(self.device),
+                        after_comm_task_loss += torch.nn.functional.mse_loss(
+                            logits_ij, y_i_shared.to(self.device)
                         )
                     else:
                         after_comm_task_loss += agent_j.compute_loss(
@@ -1508,15 +1506,27 @@ class SheafFRL(BaseOrchestrator):
                 else None
             )
             latent_task = agent.encode(x_task)
-            y_hat = agent.decoder(latent_task)
+            y_hat = (
+                agent.decode_posterior(latent_task)
+                if hasattr(agent, 'decode_posterior')
+                else agent.decoder(latent_task)
+            )
             outputs[idx_str] = (y_hat.detach(), y_task)
-            agent_losses[idx] = agent.compute_loss(y_hat, y_task)
+            if hasattr(agent, 'reconstruction_mse'):
+                agent_losses[idx] = agent.compute_loss(
+                    y_hat, y_task, eval_mask=mask_task
+                )
+            else:
+                agent_losses[idx] = agent.compute_loss(y_hat, y_task)
             agent_performances[idx] = agent.task_performance(y_hat, y_task)
 
             if prefix == 'train':
                 self._task_latent_buffer.setdefault(idx, []).append(
                     latent_task.detach().cpu()
                 )
+
+            if prefix == 'train':
+                agent_losses[idx] += self._local_pilot_loss(agent, batch, idx)
 
             # ── Pilot extraction ─────────────────────────────────────────────
             if pilots_available:

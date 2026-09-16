@@ -36,6 +36,20 @@ class TestCNNVariationalAE:
     def test_forward_shape(self):
         assert self._make()(self._x()).shape == (4, 3, 16, 16)
 
+    def test_mask_conditioned_input_can_decode_rgb_target(self):
+        agent = CNNVariationalAE(
+            in_features=4,
+            out_features=3,
+            img_size=16,
+            latent_dim=8,
+        )
+        x = torch.rand(4, 4, 16, 16)
+        target = torch.rand(4, 3, 16, 16)
+        y_hat = agent(x)
+
+        assert y_hat.shape == target.shape
+        assert agent.compute_loss(y_hat, target).ndim == 0
+
     def test_non_power_of_two_image_size(self):
         agent = CNNVariationalAE(
             in_features=1,
@@ -60,7 +74,9 @@ class TestCNNVariationalAE:
         x = self._x()
         loss = agent.compute_loss(agent(x), x)
 
-        assert torch.isclose(agent.last_loss_components['total'], loss.detach())
+        assert torch.isclose(
+            agent.last_loss_components['total'], loss.detach()
+        )
         assert 'mse' in agent.last_loss_components
         assert 'kl_weighted' in agent.last_loss_components
         assert 'ssim_loss' in agent.last_loss_components
@@ -101,6 +117,34 @@ class TestCNNVariationalAE:
         agent.encode(x)
         loss = agent.compute_loss(x, torch.randint(0, 10, (4,)))
         assert torch.isclose(loss, x.new_zeros(()), atol=1e-5)
+
+    def test_eval_mask_does_not_mask_reconstruction_terms(self, monkeypatch):
+        class FakePerceptualLoss(nn.Module):
+            def forward(
+                self, y_hat: torch.Tensor, target: torch.Tensor
+            ) -> torch.Tensor:
+                return (y_hat - target).abs().mean()
+
+        monkeypatch.setattr(
+            vae_module, 'VGGPerceptualLoss', FakePerceptualLoss
+        )
+        agent = self._make(
+            beta=0.0,
+            weight_decay=0.0,
+            reconstruction_l1_weight=1.0,
+            ssim_weight=1.0,
+            perceptual_weight=1.0,
+        )
+        target = self._x()
+        y_hat = target.clone()
+        y_hat[:, :, :, 8:] = 1.0 - y_hat[:, :, :, 8:]
+        mask = torch.zeros(4, 1, 16, 16)
+        mask[:, :, :, :8] = 1.0
+
+        agent.encode(target)
+        loss = agent.compute_loss(y_hat, target, eval_mask=mask)
+
+        assert loss > target.new_zeros(())
 
     def test_reconstruction_warmup_uses_training_loss_steps(self, monkeypatch):
         class FakePerceptualLoss(nn.Module):

@@ -79,6 +79,7 @@ class MaskedCIFARDataset(Dataset):
         self.sample_ids = sample_ids
         self.return_mask = bool(return_mask)
         self.include_mask_in_input = bool(include_mask_in_input)
+        self.mask_epoch = torch.zeros((), dtype=torch.long).share_memory_()
         self.to_tensor = transforms.ToTensor()
 
         valid_modes = {
@@ -144,6 +145,7 @@ class MaskedCIFARDataset(Dataset):
         sample_id = (
             self.sample_ids[idx] if self.sample_ids is not None else idx
         )
+        sample_id = int(sample_id) + 10_000_019 * int(self.mask_epoch.item())
         if self.mask_mode == 'fixed_overlap':
             return self.mask_generator.get_mask(self.agent_idx)
         if self.mask_mode == 'region_overlap':
@@ -191,6 +193,7 @@ class MaskedCIFARDataModule(l.LightningDataModule):
         constant_shared_visible_probability: float = 0.1,
         random_block_size: int = 4,
         share_private_data: bool = False,
+        private_train_fraction: float = 1.0,
         batch_size: int = 64,
         num_workers: int = 4,
         mode: str = 'min_size',
@@ -240,6 +243,9 @@ class MaskedCIFARDataModule(l.LightningDataModule):
         )
         self.random_block_size = int(random_block_size)
         self.share_private_data = bool(share_private_data)
+        self.private_train_fraction = float(private_train_fraction)
+        if not 0 < self.private_train_fraction <= 1:
+            raise ValueError("private_train_fraction must be in (0, 1].")
         self.batch_size = int(batch_size)
         self.num_workers = int(num_workers)
         self.mode = mode
@@ -345,7 +351,9 @@ class MaskedCIFARDataModule(l.LightningDataModule):
         )
 
         pilot = all_data.select(split_indices['pilot'])
-        train = all_data.select(split_indices['train'])
+        train_ids = split_indices['train']
+        budget = max(self.n_agents, int(len(train_ids) * self.private_train_fraction))
+        train = all_data.select(train_ids[:budget])
         val = all_data.select(split_indices['val'])
         test = all_data.select(split_indices['test'])
 
