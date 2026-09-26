@@ -201,6 +201,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Claude
+.claude
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -217,6 +220,7 @@ lightning_logs/
 
 # Private files and old code/data
 trash/
+paper/
 tmp/
 data/*
 *.ipynb
@@ -224,6 +228,7 @@ data/*
 # Others
 img/
 review/
+doc/
 
 *.img
 *.jpeg
