@@ -282,10 +282,16 @@ class CESheafFRL(SheafFRL):
             Z_j_frozen = Z_j_frozen.to(self.device)
 
             # node_i live, pulled toward node_j's last-known (frozen) state.
-            diff_i = torch.matmul(Z_i_live, V) - Z_j_frozen
-            sheaf_penalty += self._edge_penalty_term(edge_key, diff_i)
+            Z_i_live_mapped = torch.matmul(Z_i_live, V)
+            diff_i = Z_i_live_mapped - Z_j_frozen
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, diff_i, sides=(Z_i_live_mapped, Z_j_frozen)
+            )
             # node_j live, pulled toward node_i's last-known (frozen) state.
-            diff_j = torch.matmul(Z_i_frozen, V) - Z_j_live
-            sheaf_penalty += self._edge_penalty_term(edge_key, diff_j)
+            Z_i_frozen_mapped = torch.matmul(Z_i_frozen, V)
+            diff_j = Z_i_frozen_mapped - Z_j_live
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, diff_j, sides=(Z_i_frozen_mapped, Z_j_live)
+            )
 
         return sheaf_penalty, after_comm

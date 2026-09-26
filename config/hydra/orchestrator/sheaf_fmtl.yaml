@@ -1,5 +1,9 @@
 _target_: src.orchestrators.sheaf_fmtl.SheafFMTL
 
+# Post-hoc map fit scoping; see non_cooperative.yaml.
+# none | union | intersection
+align_class_filter: none
+
 gamma: 0.01
 max_lmb: 1e-02
 lambda_schedule: null

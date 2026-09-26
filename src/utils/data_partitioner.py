@@ -1161,3 +1161,168 @@ def partition_grouped_non_iid(
     if return_agent_classes:
         return agent_indices, agent_classes_map
     return agent_indices
+
+
+def _largest_remainder_counts(
+    proportions: torch.Tensor,
+    num_samples: int,
+) -> torch.Tensor:
+    """Integer per-class counts matching ``proportions`` and summing to exactly n.
+
+    Plain rounding does not preserve the total; the largest-remainder
+    (Hamilton) apportionment does, and keeps every count within one of its
+    ideal share, so the realised class marginal matches the requested
+    distribution as closely as integers allow.
+    """
+    ideal = proportions * float(num_samples)
+    counts = torch.floor(ideal).long()
+    deficit = int(num_samples) - int(counts.sum().item())
+    if deficit > 0:
+        order = torch.argsort(ideal - counts.float(), descending=True)
+        counts[order[:deficit]] += 1
+    return counts
+
+
+def sample_shifted_subsets(
+    labels: list[int],
+    n_agents: int,
+    groups: dict[int, list[int]],
+    group_target_classes: dict[int, list[int]] | None = None,
+    *,
+    num_samples: int,
+    shift_strength: float = 0.0,
+    pool_indices: list[int] | None = None,
+    seed: int = 42,
+    return_agent_classes: bool = False,
+) -> dict[int, list[int]] | tuple[dict[int, list[int]], dict[int, list[int]]]:
+    """Draw one equally sized, label-shifted subset per agent — with overlap.
+
+    Unlike the ``partition_*`` family, this is **not** a partition: every agent
+    draws independently from the same pool, so two agents may hold the same
+    sample.  Each agent's subset follows its group's label distribution
+
+        P_i(y) = s · Unif{C_i} + (1 - s) · Unif{Y}
+
+    exactly (stratified: per-class quotas via largest remainder, then a uniform
+    draw without replacement inside each class), and every agent receives
+    exactly ``num_samples`` rows regardless of ``shift_strength``.
+
+    Dropping disjointness is what makes both of those possible at once.  Under
+    a partition the agents compete for the scarce classes, so the realised
+    marginal is p_i(k) ∝ P_i(k) / Σ_j P_j(k) rather than P_i(k), and the
+    per-agent size is dictated by how contested that agent's target classes
+    are.  Sampling independently removes the coupling: the feasibility
+    condition drops from an aggregate one to the per-agent
+
+        num_samples · max_k P_i(k) ≤ N_k          (checked below)
+
+    which, with ``φ = (1 - s) + s·K/|C_i|``, reads ``num_samples ≤ |pool| / φ``
+    for a class-balanced pool — typically an order of magnitude of headroom.
+
+    Parameters
+    ----------
+    labels : list[int]
+        Integer class labels for the *whole* dataset, one per sample.
+    n_agents : int
+        Number of agents; ``groups`` must cover 0..n_agents-1.
+    groups : dict[int, list[int]]
+        Group id -> member agent ids.
+    group_target_classes : dict[int, list[int]] or None, optional
+        Group id -> target classes ``C_i``. Groups without an entry stay
+        uniform regardless of ``shift_strength``.
+    num_samples : int
+        Rows drawn per agent (identical for every agent).
+    shift_strength : float, optional
+        ``s`` in [0, 1]. 0 -> uniform, 1 -> support restricted to ``C_i``.
+    pool_indices : list[int] or None, optional
+        Restrict the draw to these dataset indices (e.g. the global train
+        pool). Returned indices are indices into ``labels``. Default: all.
+    seed : int, optional
+        Seed for the per-class draws.
+    return_agent_classes : bool, optional
+        Also return the agent -> visible-classes mapping.
+
+    Raises
+    ------
+    ValueError
+        If any agent's per-class quota exceeds that class's supply; the
+        message reports the offending class and the factor by which
+        ``num_samples`` must shrink.
+    """
+    if n_agents < 1:
+        raise ValueError('n_agents must be at least 1')
+    if not groups:
+        raise ValueError('groups must be non-empty')
+    if not 0.0 <= shift_strength <= 1.0:
+        raise ValueError('shift_strength must be in [0, 1]')
+    if num_samples < 1:
+        raise ValueError('num_samples must be at least 1')
+
+    all_agent_ids = sorted(
+        {a for agent_list in groups.values() for a in agent_list}
+    )
+    if all_agent_ids != list(range(n_agents)):
+        raise ValueError(
+            'groups must cover exactly the agents 0..n_agents-1 with no '
+            f'overlap; got {all_agent_ids}'
+        )
+
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    if pool_indices is None:
+        pool = torch.arange(labels_tensor.numel(), dtype=torch.long)
+    else:
+        pool = torch.tensor(sorted(pool_indices), dtype=torch.long)
+    if pool.numel() == 0:
+        raise ValueError('pool_indices selects an empty pool')
+
+    pool_labels = labels_tensor[pool]
+    unique_classes = sorted(torch.unique(pool_labels).tolist())
+    class_pools = {
+        c: pool[pool_labels == c] for c in unique_classes
+    }
+
+    resolved_targets = group_target_classes or {}
+    agent_to_group = {
+        i: g for g, agent_list in groups.items() for i in agent_list
+    }
+    generator = torch.Generator().manual_seed(seed)
+
+    agent_indices: dict[int, list[int]] = {}
+    agent_classes_map: dict[int, list[int]] = {}
+    for agent_id in range(n_agents):
+        targets = resolved_targets.get(agent_to_group[agent_id])
+        distribution = _group_class_distribution(
+            unique_classes, targets, shift_strength
+        )
+        counts = _largest_remainder_counts(distribution, num_samples)
+
+        rows: list[torch.Tensor] = []
+        for position, class_label in enumerate(unique_classes):
+            requested = int(counts[position].item())
+            if requested == 0:
+                continue
+            available = class_pools[class_label]
+            if requested > len(available):
+                raise ValueError(
+                    f'agent {agent_id} needs {requested} samples of class '
+                    f'{class_label} but the pool holds {len(available)}. '
+                    f'Reduce num_samples below '
+                    f'{int(num_samples * len(available) / requested)}, lower '
+                    'shift_strength, or widen the target class set.'
+                )
+            selection = torch.randperm(len(available), generator=generator)[
+                :requested
+            ]
+            rows.append(available[selection])
+
+        drawn = torch.cat(rows) if rows else torch.empty(0, dtype=torch.long)
+        agent_indices[agent_id] = sorted(drawn.tolist())
+        agent_classes_map[agent_id] = [
+            c
+            for position, c in enumerate(unique_classes)
+            if int(counts[position].item()) > 0
+        ]
+
+    if return_agent_classes:
+        return agent_indices, agent_classes_map
+    return agent_indices

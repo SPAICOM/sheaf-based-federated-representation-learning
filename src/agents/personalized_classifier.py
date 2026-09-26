@@ -72,8 +72,14 @@ class PersonalizedClassifier(BaseAgent):
         weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
+        pilot_loss_weight: float = 0.0,
     ):
         super().__init__()
+        # >0 makes the shared pilots part of this agent's SUPERVISED task, not
+        # just an alignment substrate: they are encoded+decoded and their loss
+        # is added to the private task loss (see
+        # BaseOrchestrator._local_pilot_loss).
+        self.pilot_loss_weight = float(pilot_loss_weight)
 
         if sparsity_type not in _SPARSITY_TYPES:
             raise ValueError(

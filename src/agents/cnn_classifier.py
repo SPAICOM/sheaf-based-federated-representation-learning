@@ -50,6 +50,7 @@ class CNNClassifier(PersonalizedClassifier):
         use_batchnorm: bool = False,
         weight_decay: float = 0.0,
         l1_reg: float = 0.0,
+        pilot_loss_weight: float = 0.0,
     ):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
@@ -72,4 +73,5 @@ class CNNClassifier(PersonalizedClassifier):
             use_batchnorm=use_batchnorm,
             weight_decay=weight_decay,
             l1_reg=l1_reg,
+            pilot_loss_weight=pilot_loss_weight,
         )

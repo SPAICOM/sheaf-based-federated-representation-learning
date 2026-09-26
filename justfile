@@ -102,7 +102,32 @@ multiagent-hetero *args="":
 
 # Run multi-agent experiment with hetero config (default)
 multiagent-shift-hetero *args="":
-    uv run scripts/multi_agent_experiment.py --config-name multiagent_mnist_shift_distr{{args}}
+    uv run scripts/multi_agent_experiment.py --config-name multiagent_mnist_shift_overlap {{args}}
+
+# Previous dispatcher: disjoint grouped_non_iid partition (kept for reproducing old runs)
+multiagent-shift-hetero-disjoint *args="":
+    uv run scripts/multi_agent_experiment.py --config-name multiagent_mnist_shift_distr {{args}}
+
+# ── Pilot-budget sweep (config: multiagent_mnist_shift_overlap) ────────────────
+# How many shared pilots does alignment actually need? Under overlapping_shift
+# each agent draws its training rows independently of the pilot carve, so the
+# agents' data is IDENTICAL at every point on the curve — the only thing that
+# varies is |pilots|.
+#
+# shift_strength is pinned (the config's own sweeper would otherwise cross it
+# with 5 shift values); pilot_num_samples is absolute, so the x-axis does not
+# move with test_split. Budgets stay in [256, 3072]: below ~256 the per-step
+# penalty falls under ~1.5x the latent dim (d~107) once the edge class filter
+# applies, and above 3072 the pilot set stops being smaller than one agent's
+# 3,600 training rows. pilot_batch_size self-clamps to the pool.
+#
+# Pilot-budget sweep: 5 pilot counts x {sheaf_frl, non_cooperative} = 10 jobs
+pilot-sweep *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=multiagent_mnist_shift_overlap --multirun \
+        'orchestrator=sheaf_frl,non_cooperative' \
+        'dataset.pilot_num_samples=256,512,1024,2048,3072' \
+        'dataset.shift_strength=0.9' \
+        logger.project=pilot_sweep {{args}}
 
 # Run multi-agent experiment with homo config
 multiagent-homo *args="":
@@ -173,3 +198,63 @@ comm-ablation-all:
     just comm-ablation-ce
     just comm-ablation-baselines
     just comm-ablation-table
+
+# ── 5-agent ring (config: 5agents_shift_overlap) ──────────────────────────────
+# Five agents built from the 2-agent toy's TWO architectures (d=128 / d=224),
+# differing only in which classes they over-represent. Target classes slide
+# around a cycle, so adjacent agents share 3 of 5 classes and opposite ones
+# share 1 — a spread of overlap strengths inside one graph.
+#
+# lambda: the 2-agent optimum was max_lmb=1e-2 with a cosine ramp, at degree 1.
+# The penalty is SUMMED over edges, so it must be divided by mean degree.
+# max_edge_frac 0.5 gives 5/10 edges => degree 2.0 => 5e-3 (the config default).
+# If you change max_edge_frac, RESCALE max_lmb by the new mean degree.
+RING_LMB := "5e-3"
+
+# Single run (override orchestrator=non_cooperative for the baseline)
+ring *args="":
+    uv run scripts/multi_agent_experiment.py --config-name 5agents_shift_overlap {{args}}
+
+# Distribution-shift sweep: paired baseline + sheaf at each shift level
+ring-shift *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=5agents_shift_overlap --multirun \
+        'orchestrator=non_cooperative,sheaf_frl' \
+        'dataset.shift_strength=0.3,0.5,0.7,0.9' \
+        logger.project=ring_shift {{args}}
+
+# (a) PILOT ablation — how do the two methods scale with the number of pilots
+# the alignment maps are fit on? pilot_batch_size self-clamps to the pool, and
+# pilot_num_samples is absolute so the agents' training rows never move.
+ring-pilots *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=5agents_shift_overlap --multirun \
+        'orchestrator=non_cooperative,sheaf_frl' \
+        'dataset.pilot_num_samples=128,256,512,1024,2048' \
+        'dataset.shift_strength=0.7' \
+        logger.project=ring_pilots {{args}}
+
+# (b) COMMUNICATION ablation — how often must we talk during an epoch?
+# CESheafFRL's comm_percentage is the share of epochs that are collaborative;
+# non_cooperative (one post-hoc exchange) and sheaf_frl (every step) bracket it.
+ring-comm *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=5agents_shift_overlap --multirun \
+        'orchestrator=ce_sheaf_frl' \
+        'orchestrator.comm_percentage=2,10,30,60,90' \
+        'orchestrator.lambda_schedule=cosine' \
+        'orchestrator.max_lmb={{RING_LMB}}' \
+        'dataset.shift_strength=0.7' \
+        logger.project=ring_comm {{args}}
+
+# (c) TOPOLOGY ablation — graph DENSITY. NOTE: class_overlap_neighbors always
+# keeps a maximum-weight spanning tree, so the edge count never drops below
+# n-1 = 4 however small max_edge_frac is. With 5 agents: 0.4->4, 0.5->5,
+# 0.7->7, 1.0->10 edges, i.e. mean degree 1.6/2.0/2.8/4.0 — so max_lmb must be
+# rescaled per point, which a single multirun cannot do. Run the points you
+# want individually with the matching lambda, e.g.:
+#   just ring-density 0.4 6.25e-3
+#   just ring-density 1.0 2.5e-3
+ring-density frac lmb *args="":
+    uv run scripts/multi_agent_experiment.py --config-name=5agents_shift_overlap --multirun \
+        'orchestrator=non_cooperative,sheaf_frl' \
+        graph.max_edge_frac={{frac}} orchestrator.max_lmb={{lmb}} \
+        'dataset.shift_strength=0.7' \
+        logger.project=ring_topology {{args}}

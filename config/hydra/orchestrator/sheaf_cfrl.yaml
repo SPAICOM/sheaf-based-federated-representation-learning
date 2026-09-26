@@ -13,6 +13,59 @@ dual_lr: 0.01        # per-step dual-ascent rate on the normalised violation
 dual_lmb_max: 100.0  # safety cap per multiplier (guards genuinely infeasible edges)
 anchor_strategy: pilots
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
+
+# ── Closed-form (ZCA) whitening — only read when learn_whitening: False ───────
+zca_refit_mode: exact      # where the epoch-end fit gets its latents:
+                           #   exact  — re-encode the agent's train split now
+                           #            (eval mode, no grad, augmentation off):
+                           #            the statistics of the encoder the next
+                           #            epoch actually uses, on the same clean
+                           #            distribution the operator is applied to
+                           #   buffer — reuse the per-step train-mode latents
+                           #            collected during the epoch (no extra
+                           #            forward pass, but a moving encoder,
+                           #            augmented inputs, min_size truncation)
+zca_refit_source: train    # where the closed-form whitening statistics come from:
+                           #   train        — the agent's private training split only
+                           #   pilots       — the shared pilot split only
+                           #   train+pilots — both: the pilots become part of this agent's
+                           #                  own data. Pair with model.pilot_loss_weight > 0
+                           #                  so the pilots are also SUPERVISED, and with the
+                           #                  baseline's orchestrator.whitening_source=train+pilots.
+zca_fit_max_samples: 8192  # per-agent rows re-encoded per refit (exact mode);
+                           # redrawn every epoch, so a run still covers the
+                           # whole split
+zca_ema_momentum: 0.0      # EMA retention on (E[z], E[z z^T]) across refits.
+                           # OFF by default: it smooths the frame the maps are
+                           # fit in, but the lag costs more than the jitter it
+                           # removes while the encoder is still moving —
+                           # measured whiteness ||cov-I||/sqrt(d) on train went
+                           # 0.076 (0.0) -> 0.365 (0.5) -> 0.888 (0.9), the last
+                           # no better than not whitening at all
+whitening_eps_rel: 1e-4    # eigenvalue floor as a fraction of lambda_max —
+                           # scale-free, caps the whitened condition number at
+                           # 1/eps_rel
+whitening_eps_abs: 0.0     # extra absolute floor; set 1e-2 with
+                           # whitening_eps_rel: 0.0 to restore the old
+                           # absolute-ridge behaviour exactly
+
+# ── Sheaf-penalty normalisation ───────────────────────────────────────────────
+#   dim    — divide by the constant 2*d_e (the whitened-unaligned baseline).
+#            Correct only while the latents really are white, and because the
+#            denominator does not depend on the representation the penalty stays
+#            homogeneous of degree 2 in the encoder output: with a FROZEN
+#            whitening operator (learn_whitening: false) gradient descent can
+#            lower it just by shrinking the latents, and since whitening
+#            equalises every direction to unit variance that pressure is the
+#            same on a lambda~1 direction as on a lambda~1e-4 one. Deleting the
+#            weak ones is nearly free for the task loss -> the latent space
+#            collapses bottom-up (measured: effective rank 36 -> 2.3).
+#   energy — divide by the CURRENT whitened energy of the two sides. Exactly
+#            scale-invariant, so the shrink gradient is 0 instead of +2.0 and
+#            every per-direction gradient turns negative. Agrees with 'dim'
+#            whenever the latents are genuinely white, so lambda keeps its
+#            meaning; they diverge exactly when whitening has stopped working.
+penalty_norm: energy
 sparse_communication: False
 sparse_epsilon: 1e-2
 log_latent_diagnostics: True
@@ -42,6 +95,22 @@ neighbors: {}
 filter_unseen_classes: False
 comm_task_coeff: 0.0  # weight for the after-communication task loss (mu; 0 = disabled)
 align_on_intersection: False  # if True, filter pilots to intersection of target classes per edge (default: union)
+
+# Which pilot rows an edge's alignment map is fit on (and therefore which rows
+# the per-step penalty consumes):
+#   none         — every matched pilot. This is what the post-hoc /
+#                  non-cooperative baseline does, so the map fit becomes
+#                  IDENTICAL to it and the only remaining difference between
+#                  the two orchestrators is the sheaf penalty during training.
+#   union        — rows whose class is in either endpoint's target_classes
+#   intersection — rows whose class is in both
+# The misalignment/MRR eval always scores on ALL matched pilots, so anything
+# but 'none' fits the map without ever seeing classes it is then scored on.
+# Under split_strategy: overlapping_shift that is plainly wrong: target_classes
+# marks the OVER-REPRESENTED classes, not the support, so every agent holds
+# rows of every class. Measured cost of 'union' there: 770 of 1120 pilots used
+# and mean edge residual 0.6155 vs 0.5056 achievable (22% worse).
+edge_class_filter: none
 
 # ── Semantic compression (Section 9) ──────────────────────────────────────────
 # Each edge owns two fat semi-orthogonal maps projecting both stalks into a shared

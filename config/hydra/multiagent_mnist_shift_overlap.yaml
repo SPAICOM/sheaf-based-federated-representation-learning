@@ -1,28 +1,3 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Distribution-shift study (wandb project: shift_distr).
-#
-# The values below reproduce the runs of 2026-07-21 (code at commit afcf5152)
-# that the shift-strength figure is drawn from — every knob those runs logged
-# is pinned here, including the ones whose code defaults have since changed
-# (penalty_norm, edge_class_filter, anchor_selection; see the orchestrator
-# block). SheafFRL itself was rewritten after those runs (learnable-whitening
-# fix, anchor selection, communication accounting), so the numbers are NOT
-# expected to match that sweep exactly — this config pins the *experiment*, not
-# the code vintage. For the original numbers, run this config at afcf5152.
-#
-# Another seed: `seed=123` on the command line is enough (dataset.seed is
-# ${seed}, so the data split follows the training seed).
-#
-# NOTE — the four orchestrators were NOT swept with one config back then:
-#   NonCooperativeLearning, SheafFRL   lmb_study off, max_lmb 0.1  (pinned below)
-#   SheafFMTL, ComFed                  lmb_study ON: max_lmb was tuned per run
-# To re-run those two as they were, disable lmb_study (as pinned) and pass the
-# tuned value explicitly, e.g. `orchestrator.max_lmb=0.03512344297785497`:
-#   shift        0.5             0.6             0.7             0.8             0.9
-#   SheafFMTL    0.0289565476    0.0004826519    0.0351234430    0.0255017938    0.0008452505
-#   ComFed       0.0006339059    0.0008642071    0.0135530367    0.0002976806    0.0151240496
-# ─────────────────────────────────────────────────────────────────────────────
-
 defaults:
   - dataset: hetero_mnist
   - model: cnn_classifier
@@ -31,12 +6,13 @@ defaults:
   - _self_
 
 seed: 42
-study_name: "HeteroRate MNIST 15 agents"
+study_name: "Shift sweep MNIST 15 agents (overlapping draws)"
 
+# Disabled: validation is now 5% of an agent's 3,600 rows (~180 samples),
+# too small to tune lambda against. Either raise dataset.val_split, or set
+# orchestrator.learn_lmb=true to get per-edge lambda by dual ascent instead.
 lmb_study:
-  enabled: false        # pinned OFF: the reference runs used a fixed max_lmb
-                        # (an Optuna search re-tunes it per run, which is what
-                        # makes SheafFMTL/ComFed above irreproducible)
+  enabled: false         # set to true to run Optuna search before the full training run
   efficient: true       # if true, tune max_lmb on only the first two agents (cheaper)
   n_trials: 15          # number of Optuna trials
   n_tune_epochs: 5     # epochs per trial
@@ -50,7 +26,7 @@ graph:
 
 logger:
   _target_: lightning.pytorch.loggers.WandbLogger
-  project: shift_distr
+  project: shift_overlap
   group: ${study_name}
   name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
   save_dir: logs/
@@ -75,17 +51,77 @@ callbacks:
     logging_interval: step
 
 dataset:
-  split_strategy: grouped_non_iid
+  # ── Split-first, overlapping agent draws (see HeteroClassificationDataModule
+  #    ._setup_overlapping_shift) ───────────────────────────────────────────────
+  #   D --test_split--> TEST pool  --> agent i draws n_test ~ P_i
+  #     --remainder---> TRAIN pool --> pilots (uniform, pilot_split)
+  #                                --> agent i draws agent_train_samples ~ P_i
+  #   P_i(y) = s*Unif{C_i} + (1-s)*Unif{Y},  s = shift_strength
+  #
+  # Agents draw INDEPENDENTLY, so their subsets overlap each other and may
+  # contain pilot rows; only TRAIN/TEST stay disjoint (the invariant the
+  # communication-accuracy eval needs: maps fit on pilots, scored on test).
+  # What this buys over grouped_non_iid:
+  #   * every agent holds exactly agent_train_samples rows at any shift_strength
+  #   * the realised label marginal equals P_i EXACTLY, instead of the
+  #     contention-normalised P_i(k)/sum_j P_j(k) a disjoint partition yields
+  #     (under which agent 0 asks 17% of class 4 at s=0.7 and receives 14.5%)
+  #   * pilot_split and agent size decouple, so a pilot sweep leaves every
+  #     agent's training rows untouched — a controlled ablation
+  split_strategy: overlapping_shift
   n_agents: 15
-  classes_per_agent: 10
   shift_strength: 0.7
   monitor_test_during_fit: true
   batch_size: 64
-  num_workers: 2         # as logged by the reference runs
+  num_workers: 0
   mode: min_size
-  pilot_split: 0.1
-  pilot_batch_size: 64
+
+  # Global split. val_split is carved from each agent's own draw (stratified),
+  # so it follows that agent's shifted distribution.
+  test_split: 0.2
+  val_split: 0.05
+
+  # Pilots: fraction of the TRAIN pool, NOT of the whole corpus — under
+  # overlapping_shift the carve happens after the train/test split, so
+  # 70k MNIST -> 56k train -> 0.02 * 56,000 = 1,120 pilots. Deliberately
+  # smaller than one agent's training set (1,120 vs 3,600).
+  pilot_split: 0.02
+  # Absolute pilot count. When set it WINS over pilot_split
+  # (hetero_datamodule.py::_setup_overlapping_shift), which is how
+  # `just pilot-sweep` varies the budget: dataset.pilot_num_samples=256,512,...
+  # Absolute counts keep the sweep's x-axis fixed regardless of test_split.
+  # null here = use pilot_split.
+  pilot_num_samples: null
   comm_data: shared_global_pilots
+  # Pilots stay eligible for the agent draws, so a fraction n/|TRAIN| = 6.4% of
+  # pilots also sits in any given agent's training set (per edge, both sides:
+  # 0.4%). Harmless for the map fit and for comm accuracy (scored on test), but
+  # it does make MRR — computed on pilots — partly a train-set metric.
+  # Set true to exclude pilots from the agent pool: contamination drops to 0 at
+  # any agent size, agent-to-agent overlap is unaffected, and the only cost is a
+  # (1 - pilot_split) factor in the feasibility bound. Worth enabling if you
+  # raise agent_train_samples much above 3,600.
+  pilot_exclusive: false
+  # Per-step penalty rows = pilot_batch_size x (class-filter keep rate). Keep
+  # matched rows >~ 1.5x the latent dim; 64 was too small once the edge filter
+  # applied. Independent of pilot_split — sweep the two separately.
+  pilot_batch_size: 384
+
+  # Per-agent draw size. Absolute, NOT a share of the pool, so it is invariant
+  # to pilot_split and to shift_strength. Feasibility: n * max_k P_i(k) <= N_k,
+  # i.e. n <= |TRAIN|/phi with phi = (1-s) + s*K/|C_i|; worst case here
+  # (s=0.9, |C_i|=5) gives phi=1.9 -> n <= 29,473, so 3,600 has ~8x headroom.
+  # The sampler raises with the exact bound if this is ever violated.
+  #
+  # Feasibility is not the binding concern here — OVERLAP is. Agent-to-agent
+  # sharing grows linearly as n/|TRAIN|: 6.3% mean / 9.9% max at 3,600, 14% /
+  # 22% at 8,000, 35% / 55% at 20,000. Past ~15% mean the "private local data"
+  # framing weakens and alignment gets artificially easy, so keep n <~ 8,000.
+  # 3,600 also matches the ~3,360 the old disjoint partition produced, which
+  # keeps these runs comparable to the grouped_non_iid ones.
+  agent_train_samples: 8000
+  # agent_test_samples: null   # default: mirrors the global train/test ratio
+  #                            #          -> round(3600 * 0.2/0.8) = 900
   groups:
     0:
       agents: [0]
@@ -143,7 +179,7 @@ model:
       use_batchnorm: true
     1:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [32, 64, 128, 224]  # deepened to 4 blocks: 28->14->7->3->1 (was [32,64,128], dup of 0/7)
+      encoder_hidden_dims: [32, 64, 128, 224]
       decoder_hidden_dims: [120]
       dropout: 0.1
       use_batchnorm: true
@@ -155,7 +191,7 @@ model:
       use_batchnorm: true
     3:
       _target_: src.agents.CNNClassifier
-      encoder_hidden_dims: [64, 128, 128]  # +3rd block: pools 7x7 -> 3x3
+      encoder_hidden_dims: [64, 128, 128]
       decoder_hidden_dims: [256, 128]
       dropout: 0.25
       use_batchnorm: true
@@ -234,18 +270,15 @@ orchestrator:
   use_general_maps: false
   soft_maps: false
   align_on_intersection: false
-  learn_whitening: true
-  # Pinned to the pre-rewrite SheafFRL behaviour of the reference runs; the
-  # current code defaults (energy / none) are deliberately overridden here.
-  penalty_norm: dim            # code default: energy
-  edge_class_filter: union     # code default: none (union == the old
-                               # align_on_intersection: false behaviour)
-  anchor_selection: all        # the old code always fit on every matched pilot
-  anchor_strategy: pilots
-  num_anchors: 32              # inert under anchor_selection: all
-  local_steps: 1
-  update_v_every_n_epochs: 1
-  filter_unseen_classes: false
+  # false -> closed-form ZCA, refit at every epoch end from each agent's own
+  # training latents (eval mode, no grad, augmentation off), EMA-smoothed
+  # across refits, with a scale-free relative ridge. The knobs behind it
+  # (zca_refit_mode / zca_fit_max_samples / zca_ema_momentum /
+  # whitening_eps_rel / whitening_eps_abs) keep their defaults from
+  # config/hydra/orchestrator/sheaf_frl.yaml; agents hold 3,600 rows here,
+  # well under zca_fit_max_samples, so every refit sees the WHOLE split.
+  # true -> learnable SWBN instead, estimated on pilot batches only.
+  learn_whitening: false
   # # CE Sheaf FRL specific
   # phase_a_epochs: 1
   # phase_c_epochs: 2
@@ -256,7 +289,7 @@ orchestrator:
   eta: 0.01
   # Post-training alignment
   alignment_method: procrustes
-  max_lmb: 0.1           # fixed lambda of the reference SheafFRL runs
+  max_lmb: 1e-2
   learn_lmb: false
   dual_rho: null
   comm_task_coeff: 0
@@ -269,5 +302,5 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      dataset.shift_strength: 0.5, 0.6, 0.7, 0.8, 0.9
-      orchestrator: sheaf_frl # non_cooperative, sheaf_fmtl, comfed
+      dataset.shift_strength: 0.5, 0.9
+      orchestrator: sheaf_frl  # add comfed / ce_sheaf_frl as needed

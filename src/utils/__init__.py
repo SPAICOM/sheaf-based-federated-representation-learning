@@ -24,6 +24,7 @@ from .data_partitioner import (
     partition_non_iid,
     partition_non_iid_fair,
     partition_non_iid_with_margin,
+    sample_shifted_subsets,
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
@@ -47,6 +48,7 @@ __all__ = [
     'generate_neighbors',
     'partition_by_agent_classes',
     'partition_grouped_non_iid',
+    'sample_shifted_subsets',
     'partition_non_iid',
     'partition_non_iid_fair',
     'partition_non_iid_with_margin',

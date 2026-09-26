@@ -2,6 +2,14 @@ _target_: src.orchestrators.NonCooperativeLearning
 
 # Post-hoc alignment for the communication-accuracy evaluation.
 alignment_method: general  # 'general' | 'procrustes' | 'relative'
+# Restrict the post-hoc map fit to an edge's relevant classes, mirroring
+# SheafFRL's own edge_class_filter so the two are compared like for like:
+#   none         — fit on every matched pilot (classical post-hoc recipe)
+#   union        — only pilots whose class either endpoint is expert in
+#   intersection — only pilots whose class BOTH endpoints are expert in
+# Leaving this at 'none' while SheafFRL filters (or vice versa) means the two
+# methods fit their maps on different rows, which is not a fair comparison.
+align_class_filter: none
 # Edge anchor extraction, applied before fitting — same names/semantics as
 # SheafFRL's anchor_selection, so this baseline can be swept over the same
 # anchor budget/strategy as a SheafFRL run (one-shot here: post-hoc alignment
@@ -12,6 +20,14 @@ alignment_method: general  # 'general' | 'procrustes' | 'relative'
 #   proto_kmeans — unsupervised k-means (K=num_anchors) prototypes
 anchor_selection: all
 num_anchors: 128
+# Where each agent's whitening operator is estimated:
+#   train  — the full local training split (classical post-hoc recipe)
+#   pilots — the pilot split, i.e. exactly the rows SheafFRL/CESheafFRL's SWBN
+#            layers see. Use this when comparing against learn_whitening=true
+#            runs, or the comparison confounds the alignment map with where the
+#            normalisation statistics came from. (learn_whitening=false runs fit
+#            their ZCA on TRAINING latents, so 'train' is their matched setting.)
+whitening_source: train
 protos_per_class: 1
 anchor_parseval_normalize: null  # Parseval-prewhiten each side's anchor frame.
                                  # null = auto (True for 'relative', False for

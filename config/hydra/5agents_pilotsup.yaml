@@ -1,0 +1,131 @@
+# ── Five-agent ring, LOW class overlap, PILOTS TREATED AS TRAINING DATA ───────
+# Identical to 5agents_lowoverlap.yaml except:
+#   * model.agents.*.pilot_loss_weight = 1.0 — every agent encodes AND decodes the
+#     shared pilots and adds their task loss to its private loss, so the pilots are
+#     supervised data, not just an alignment substrate.
+#   * pair with orchestrator.zca_refit_source=train+pilots (SheafFRL) and
+#     orchestrator.whitening_source=train+pilots (non-cooperative) so the whitening
+#     statistics are estimated over private train + shared pilots on BOTH sides.
+# NOTE the pilots are the SAME rows for every agent (comm_data: shared_global_pilots),
+# so this also gives every agent a slice of identical input distribution — which is a
+# real advantage handed to BOTH methods, and is why the baseline must get it too.
+# Same two architectures as the 2-agent toy (d=128 / d=224). Unlike
+# 5agents_shift_overlap.yaml, whose adjacent agents shared 3 of 5 classes, here
+# each agent holds a 3-class window and adjacent agents share EXACTLY ONE class,
+# non-adjacent share none:
+#   0:[0,1,2]  1:[2,3,4]  2:[4,5,6]  3:[6,7,8]  4:[8,9,0]
+# That reproduces the 2-agent toy's difficulty (its pair shared 1 of 5 classes
+# and yielded +3.65), which the higher-overlap ring did not: there every edge
+# was easy and the sheaf gain stayed within +-0.4pt of zero at every shift.
+# Feasibility: phi = (1-s) + s*K/|C_i| = 0.1 + 0.9*10/3 = 3.1 at s=0.9, so
+# n <= |TRAIN|/phi ~ 17.7k; agent_train_samples 8000 has headroom.
+#
+# lambda: the toy optimum was max_lmb=1e-2 at degree 1 with a cosine ramp. The
+# penalty is SUMMED over edges, so it must be divided by mean degree here
+# (max_edge_frac 0.5 -> ~5 of 10 edges -> degree ~2): 1e-2 / 2 = 5e-3.
+# Verify the realised edge count in the run log and rescale if it differs.
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "5-agent pilots-as-training"
+
+lmb_study:
+  enabled: false
+  efficient: true
+  n_trials: 15
+  n_tune_epochs: 5
+  lmb_low: 1e-4
+  lmb_high: 1e-1
+
+graph:
+  neighbors_mode: "class_overlap"
+  max_edge_frac: 0.5          # ~5 of the 10 possible edges -> mean degree ~2
+  similarity: intersection
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: 5agents_pilotsup
+  group: ${study_name}
+  name: ${hydra:runtime.choices.orchestrator}_trial_${hydra:job.num}
+  save_dir: logs/
+  log_model: false
+
+optimizer:
+  lr: 1e-2
+
+trainer:
+  max_epochs: 60
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: overlapping_shift
+  n_agents: 5
+  shift_strength: 0.9         # the divergent end
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  test_split: 0.2
+  val_split: 0.05
+  pilot_split: 0.02
+  pilot_num_samples: null
+  pilot_exclusive: false
+  comm_data: shared_global_pilots
+  pilot_batch_size: 384
+  agent_train_samples: 8000
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2]}
+    1: {agents: [1], target_classes: [2, 3, 4]}
+    2: {agents: [2], target_classes: [4, 5, 6]}
+    3: {agents: [3], target_classes: [6, 7, 8]}
+    4: {agents: [4], target_classes: [8, 9, 0]}
+
+model:
+  agents:
+    0: {_target_: src.agents.CNNClassifier, encoder_hidden_dims: [32, 64, 128],      decoder_hidden_dims: [256, 128, 64], dropout: 0.3, use_batchnorm: true, pilot_loss_weight: 1.0}
+    1: {_target_: src.agents.CNNClassifier, encoder_hidden_dims: [32, 64, 128, 224], decoder_hidden_dims: [120],          dropout: 0.1, use_batchnorm: true, pilot_loss_weight: 1.0}
+    2: {_target_: src.agents.CNNClassifier, encoder_hidden_dims: [32, 64, 128],      decoder_hidden_dims: [256, 128, 64], dropout: 0.3, use_batchnorm: true, pilot_loss_weight: 1.0}
+    3: {_target_: src.agents.CNNClassifier, encoder_hidden_dims: [32, 64, 128, 224], decoder_hidden_dims: [120],          dropout: 0.1, use_batchnorm: true, pilot_loss_weight: 1.0}
+    4: {_target_: src.agents.CNNClassifier, encoder_hidden_dims: [32, 64, 128],      decoder_hidden_dims: [256, 128, 64], dropout: 0.3, use_batchnorm: true, pilot_loss_weight: 1.0}
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  warmup_epochs: 0
+  use_general_maps: false
+  soft_maps: false
+  learn_whitening: false
+  gamma: 1e-3
+  eta: 0.01
+  alignment_method: procrustes
+  lambda_schedule: cosine     # the toy's winning shape
+  max_lmb: 5e-3               # 1e-2 (toy optimum, degree 1) / mean degree ~2
+  learn_lmb: false
+  dual_rho: null
+  comm_task_coeff: 0
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      orchestrator: non_cooperative, sheaf_frl

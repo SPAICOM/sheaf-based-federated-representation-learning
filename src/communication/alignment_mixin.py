@@ -22,6 +22,10 @@ from src.communication.whitening import (
 from src.utils.anchors import select_paired_anchors
 
 VALID_ALIGNMENT_METHODS = ('general', 'procrustes', 'relative')
+# Where the per-agent whitening operator is estimated from. 'train' is the
+# classical post-hoc recipe; 'pilots' matches the SheafFRL/CESheafFRL SWBN
+# layers, which only ever see pilot rows.
+VALID_WHITENING_SOURCES = ('train', 'pilots', 'train+pilots')
 
 
 class PostTrainingAlignmentMixin:
@@ -52,7 +56,10 @@ class PostTrainingAlignmentMixin:
         """Fit per-agent whitening operators and pairwise alignment maps.
 
         Steps:
-          1. Encode each agent's full training set, fit a whitening operator.
+          1. Encode each agent's whitening source split — the full training
+             set by default, or the pilot split when ``whitening_source ==
+             'pilots'`` (matching where SheafFRL's SWBN statistics come
+             from) — and fit a whitening operator on it.
           2. Encode each agent's pilot set, whiten with training operator.
           3. For every *undirected* edge, find common pilot samples, reduce
              them to this edge's anchors via ``select_paired_anchors``
@@ -112,18 +119,45 @@ class PostTrainingAlignmentMixin:
                 ys.append(y if isinstance(y, torch.Tensor) else torch.tensor(y))
             return torch.stack(xs), torch.stack(ys)
 
-        # Step 1 — fit whitening on training latents.
+        # Step 1 — fit whitening on the configured source split.
+        # 'train' (the default) is the classical post-hoc recipe: the operator
+        # is estimated on the full local training distribution.  'pilots'
+        # estimates it on exactly the rows SheafFRL/CESheafFRL's SWBN layers
+        # see during training, so both families' whitening comes from the same
+        # distribution and a comparison isolates the alignment map instead of
+        # confounding it with the normalisation.
+        source = str(getattr(self.hparams, 'whitening_source', 'train'))
+        if source not in VALID_WHITENING_SOURCES:
+            raise ValueError(
+                f'whitening_source must be one of {VALID_WHITENING_SOURCES}, '
+                f'got {source!r}'
+            )
+        if source == 'pilots':
+            whitening_datasets = pilot_datasets
+        elif source == 'train+pilots':
+            # Match SheafFRL's zca_refit_source='train+pilots' so the two
+            # estimate their operators from the same rows.
+            from torch.utils.data import ConcatDataset as _Concat
+            whitening_datasets = {}
+            for _i in set(train_datasets) | set(pilot_datasets):
+                _p = [d for d in (train_datasets.get(_i), pilot_datasets.get(_i))
+                      if d is not None and len(d)]
+                if _p:
+                    whitening_datasets[_i] = _p[0] if len(_p) == 1 else _Concat(_p)
+        else:
+            whitening_datasets = train_datasets
+
         self._train_whitening_ops: dict[int, WhiteningOp] = {}
         for idx_str, agent in self.agents.items():
             if not hasattr(agent, 'encode'):
                 continue
             idx = int(idx_str)
-            train_ds = train_datasets.get(idx)
-            if train_ds is None or len(train_ds) == 0:
+            whiten_ds = whitening_datasets.get(idx)
+            if whiten_ds is None or len(whiten_ds) == 0:
                 continue
 
             loader = torch.utils.data.DataLoader(
-                train_ds,
+                whiten_ds,
                 batch_size=256,
                 shuffle=False,
                 num_workers=0,
@@ -218,9 +252,24 @@ class PostTrainingAlignmentMixin:
         # the endpoints' class overlap (the region both agents trained on), so
         # this baseline is scoped exactly like the misalignment / MRR eval and
         # the comparison with SheafFRL is like-for-like.
-        scope_intersection = getattr(
-            self, '_eval_on_class_intersection', False
+        # 'none' (default) fits on every matched pilot; 'union'/'intersection'
+        # restrict the fit to the edge's relevant classes exactly as SheafFRL's
+        # _apply_edge_class_filter does, so the two can be compared like for
+        # like. Legacy `eval_on_class_intersection=True` still selects
+        # 'intersection'.
+        align_filter = str(
+            getattr(self.hparams, 'align_class_filter', 'none')
         )
+        if align_filter == 'none' and getattr(
+            self, '_eval_on_class_intersection', False
+        ):
+            align_filter = 'intersection'
+        if align_filter not in ('none', 'union', 'intersection'):
+            raise ValueError(
+                f'align_class_filter must be none|union|intersection, '
+                f'got {align_filter!r}'
+            )
+        scope_intersection = align_filter != 'none'
         agent_tc = (
             self._resolve_agent_target_classes()
             if scope_intersection
@@ -263,8 +312,9 @@ class PostTrainingAlignmentMixin:
                     labels_i = pilot_y[sender_idx][
                         torch.as_tensor(idx_i, dtype=torch.long)
                     ]
-                    mask = self._class_intersection_mask(
-                        agent_tc, sender_idx, receiver_idx, labels_i
+                    mask = self._class_edge_mask(
+                        agent_tc, sender_idx, receiver_idx, labels_i,
+                        mode=align_filter,
                     )
                     if mask is not None:
                         keep = mask.nonzero(as_tuple=True)[0].tolist()

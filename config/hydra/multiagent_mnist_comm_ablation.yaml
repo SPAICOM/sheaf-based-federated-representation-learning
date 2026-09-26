@@ -74,7 +74,7 @@ dataset:
   num_workers: 0
   mode: min_size
   pilot_split: 0.1
-  pilot_batch_size: 64
+  pilot_batch_size: 164
   comm_data: shared_global_pilots
   groups:
     0:

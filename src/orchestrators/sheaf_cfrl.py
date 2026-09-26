@@ -363,7 +363,9 @@ class SheafCFRL(CESheafFRL):
             P_a = torch.matmul(Z_a, V_a.t())  # (n, c)
             P_b = torch.matmul(Z_b, V_b.t())  # (n, c)
             diff = P_a - P_b
-            sheaf_penalty += self._edge_penalty_term(edge_key, diff)
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, diff, sides=(P_a, P_b)
+            )
 
             # ── After-communication task loss (project → lift across the edge) ─
             if comm_weight > 0.0:
@@ -463,15 +465,19 @@ class SheafCFRL(CESheafFRL):
             Z_b_frozen = Z_b_frozen.to(self.device)
 
             # node a live, pulled toward b's last-known (frozen) state.
-            d_a = torch.matmul(Z_a_live, V_a.t()) - torch.matmul(
-                Z_b_frozen, V_b.t()
+            P_a_live = torch.matmul(Z_a_live, V_a.t())
+            P_b_frozen = torch.matmul(Z_b_frozen, V_b.t())
+            d_a = P_a_live - P_b_frozen
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, d_a, sides=(P_a_live, P_b_frozen)
             )
-            sheaf_penalty += self._edge_penalty_term(edge_key, d_a)
             # node b live, pulled toward a's last-known (frozen) state.
-            d_b = torch.matmul(Z_a_frozen, V_a.t()) - torch.matmul(
-                Z_b_live, V_b.t()
+            P_a_frozen = torch.matmul(Z_a_frozen, V_a.t())
+            P_b_live = torch.matmul(Z_b_live, V_b.t())
+            d_b = P_a_frozen - P_b_live
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, d_b, sides=(P_a_frozen, P_b_live)
             )
-            sheaf_penalty += self._edge_penalty_term(edge_key, d_b)
 
         return sheaf_penalty, after_comm
 

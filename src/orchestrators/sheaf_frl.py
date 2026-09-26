@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.utils.data import ConcatDataset, Subset
 
 from src.communication.whitening import (
     SWBNColouringLayer,
@@ -20,8 +21,9 @@ from src.communication.whitening import (
     WhiteningOp,
     color,
     fit_alignment,
-    fit_whitening,
+    latent_moments,
     whiten,
+    whitening_from_moments,
 )
 from src.mutualinfo._common import kmeans_cluster
 from src.orchestrators.base_orchestrator import BaseOrchestrator
@@ -87,10 +89,18 @@ class SheafFRL(BaseOrchestrator):
       prototypes, and the per-step penalty averages the current pilot
       batch's rows under the window's assignment.
 
-    The per-step SWBN whitening statistics are updated exactly once per node
-    per step, on the rotating pilot batch (:meth:`_shared_eval`); every other
-    whitening application this step (anchor re-encoding, refresh, test) uses
-    the frozen statistics (:meth:`_apply_frozen_whitening`).  With
+    Whitening comes in two flavours, both of them purely local — no agent
+    ever exchanges statistics to normalise its own latents.  With
+    ``learn_whitening=True`` the per-step SWBN statistics are updated exactly
+    once per node per step, on the rotating pilot batch (:meth:`_shared_eval`);
+    every other whitening application this step (anchor re-encoding, refresh,
+    test) uses the frozen statistics (:meth:`_apply_frozen_whitening`).  With
+    ``learn_whitening=False`` the closed-form operator is instead refit at
+    *every* epoch end (:meth:`_refit_zca_operators`) from the agent's own
+    training latents, re-encoded there with the end-of-epoch weights; because
+    that refit is free of communication it is deliberately not tied to the map
+    refresh cadence, so :class:`CESheafFRL`'s local epochs get fresh whitening
+    too.  With
     ``anchor_selection='all'`` each training step additionally records the
     batch latents exchanged per edge, since the penalty consumes fresh rows
     every step; the budgeted strategies keep the once-per-window accounting.
@@ -129,7 +139,16 @@ class SheafFRL(BaseOrchestrator):
         soft_maps: bool = False,
         comm_task_coeff: float = 0.0,
         align_on_intersection: bool = False,
+        edge_class_filter: str = 'union',
         learn_whitening: bool = True,
+        zca_refit_mode: str = 'exact',
+        zca_refit_source: str = 'train',
+        zca_fit_max_samples: int = 8192,
+        zca_ema_momentum: float = 0.0,
+        whitening_eps_rel: float = 1e-4,
+        whitening_eps_abs: float = 0.0,
+        whitening_shrinkage: float = 0.0,
+        penalty_norm: str = 'dim',
         learn_lmb: bool = False,
         dual_rho: float = 0.1,
         dual_lr: float = 0.01,
@@ -175,6 +194,51 @@ class SheafFRL(BaseOrchestrator):
             )
         if protos_per_class < 1:
             raise ValueError('protos_per_class must be at least 1')
+        zca_refit_mode = str(zca_refit_mode)
+        zca_refit_source = str(zca_refit_source)
+        _valid_zca_sources = ('train', 'pilots', 'train+pilots')
+        if zca_refit_source not in _valid_zca_sources:
+            raise ValueError(
+                f'Unknown zca_refit_source: {zca_refit_source}. '
+                f'Valid options: {list(_valid_zca_sources)}'
+            )
+        _valid_zca_modes = ('exact', 'buffer')
+        if zca_refit_mode not in _valid_zca_modes:
+            raise ValueError(
+                f'Unknown zca_refit_mode: {zca_refit_mode}. '
+                f'Valid options: {list(_valid_zca_modes)}'
+            )
+        if int(zca_fit_max_samples) < 2:
+            raise ValueError('zca_fit_max_samples must be at least 2')
+        if not 0.0 <= float(whitening_shrinkage) < 1.0:
+            raise ValueError(
+                'whitening_shrinkage is a Ledoit-Wolf shrinkage intensity '
+                f'towards (tr cov / d) I and must lie in [0, 1); got '
+                f'{whitening_shrinkage}. 0.0 disables it.'
+            )
+        edge_class_filter = str(edge_class_filter)
+        _valid_filters = ('none', 'union', 'intersection')
+        if edge_class_filter not in _valid_filters:
+            raise ValueError(
+                f'Unknown edge_class_filter: {edge_class_filter}. '
+                f'Valid options: {list(_valid_filters)}'
+            )
+        if align_on_intersection and edge_class_filter == 'union':
+            # Backwards compatibility: the old boolean only chose between the
+            # two filtered modes, it could never disable filtering.
+            edge_class_filter = 'intersection'
+        penalty_norm = str(penalty_norm)
+        _valid_penalty_norms = ('dim', 'energy')
+        if penalty_norm not in _valid_penalty_norms:
+            raise ValueError(
+                f'Unknown penalty_norm: {penalty_norm}. '
+                f'Valid options: {list(_valid_penalty_norms)}'
+            )
+        if not 0.0 <= float(zca_ema_momentum) < 1.0:
+            raise ValueError(
+                'zca_ema_momentum is an EMA retention factor and must lie in '
+                f'[0, 1); got {zca_ema_momentum}. 0.0 disables the smoothing.'
+            )
         if learn_lmb:
             if lambda_schedule:
                 raise ValueError(
@@ -212,6 +276,16 @@ class SheafFRL(BaseOrchestrator):
             sparse_epsilon=float(sparse_epsilon),
         )
         self._whitening_ops: dict[int, WhiteningOp] = {}
+        # Running sufficient statistics behind the closed-form operators:
+        # agent -> (E[z], E[z z^T], effective sample count), float64.  The EMA
+        # is kept on the *moments*, not on a fitted W: averaging two whitening
+        # matrices whose eigenbases reordered or flipped sign between refits
+        # would be meaningless, while a covariance is basis-free.
+        self._zca_moments: dict[
+            int, tuple[torch.Tensor, torch.Tensor, float]
+        ] = {}
+        # (agent, call-site) pairs already warned about running unwhitened.
+        self._warned_identity_whitening: set[tuple[int, str]] = set()
         # anchor_selection='proto_kmeans' state: per-edge sample-id -> cluster-id
         # assignment, refit at every map refresh (whenever the matched pool
         # has at least K rows) and reused for the steps of that window.
@@ -317,7 +391,10 @@ class SheafFRL(BaseOrchestrator):
         )
 
     def _edge_penalty_term(
-        self, edge_key: str, diff: torch.Tensor
+        self,
+        edge_key: str,
+        diff: torch.Tensor,
+        sides: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One edge's contribution to the sheaf penalty, per the active λ mode.
 
@@ -326,12 +403,42 @@ class SheafFRL(BaseOrchestrator):
         maps, ``c_ij`` for compressed edge stalks (i.e. the alignment map's
         row dimension: each row of ``diff`` lives in this space).
 
-        The raw penalty ``mean_rows ‖diff‖²`` is always normalised by
-        ``2·d_e``, its whitened-unaligned baseline (whitened uncorrelated
-        latents give ``E‖diff‖² ≈ 2·d_e``; perfect alignment 0), so the
-        returned term ``P̂_e`` is dimension-free and always falls roughly
-        within ``[0, 1]`` — comparable across edges of different latent
-        sizes (and across configs sweeping the bottleneck dimension).
+        The raw penalty is ``mean_rows ‖diff‖²``.  How it is normalised is
+        set by ``penalty_norm``:
+
+        ``'dim'`` divides by the constant ``2·d_e``, the whitened-unaligned
+        baseline (whitened uncorrelated latents give ``E‖diff‖² ≈ 2·d_e``).
+        That constant is only the right denominator if the latents really
+        are white, and — because it does not depend on the representation —
+        it leaves the penalty homogeneous of degree 2 in the encoder output.
+        With a *frozen* whitening operator (closed-form ZCA, refit once per
+        epoch under ``no_grad``) nothing else divides the scale back out, so
+        gradient descent can always lower the penalty by shrinking the
+        latents.  Worse, whitening equalises every direction to unit
+        variance, so that shrink pressure is near-identical on a direction
+        carrying ``λ≈1`` and one carrying ``λ≈1e-4``; deleting the weak ones
+        costs the task loss almost nothing, and the representation collapses
+        bottom-up.  (SWBN is immune: it recomputes mean/var in-graph each
+        step, so shrinking a direction shrinks its own normaliser.)
+
+        ``'energy'`` divides instead by the *current* whitened energy of the
+        two sides, ``mean_rows‖a‖² + mean_rows‖b‖²``, which requires
+        ``sides``.  Numerator and denominator are both degree 2, so the term
+        is exactly scale-invariant and the shrink gradient vanishes —
+        measured ``d(penalty)/d(scale) = 0`` versus ``+2.0`` for ``'dim'``,
+        with every per-direction gradient turning negative (shrinking now
+        *costs*).  It is also the quantity ``'dim'`` was approximating: for
+        genuinely white latents ``mean_rows‖a‖² ≈ mean_rows‖b‖² ≈ d_e``, so
+        the two agree and λ keeps its meaning — they differ exactly when the
+        whitening has stopped whitening, which is when the constant
+        denominator silently deflates the number.
+
+        Either way ``P̂_e`` is dimension-free and falls roughly within
+        ``[0, 1]`` — comparable across edges of different latent sizes (and
+        across configs sweeping the bottleneck dimension).
+
+        ``sides`` holds the two tensors whose difference is ``diff``; it is
+        required by ``'energy'`` and ignored by ``'dim'``.
 
         Fixed/scheduled mode: returns ``P̂_e``; the global coefficient is
         applied once by ``_shared_eval``.
@@ -342,7 +449,17 @@ class SheafFRL(BaseOrchestrator):
         residual, so their recordings are averaged.
         """
         penalty = (diff**2).sum(dim=1).mean()
-        normed = penalty / (2.0 * diff.shape[1])
+        if str(self.hparams.penalty_norm) == 'energy' and sides is not None:
+            a, b = sides
+            # NOT detached: detaching the denominator would restore the
+            # degree-2 homogeneity of the numerator and with it the shrink
+            # gradient this normalisation exists to remove.
+            energy = a.pow(2).sum(dim=1).mean() + b.pow(2).sum(dim=1).mean()
+            normed = penalty / energy.clamp(min=1e-12)
+        else:
+            if str(self.hparams.penalty_norm) == 'energy':
+                self._warn_missing_penalty_sides()
+            normed = penalty / (2.0 * diff.shape[1])
         if not self._dual_lmb_enabled():
             return normed
         resid = normed.detach()
@@ -356,6 +473,20 @@ class SheafFRL(BaseOrchestrator):
         # check at loss.backward() (same trap as SWBNWhiteningLayer's W).
         lam = self.dual_lambdas[self._dual_edge_index[edge_key]].clone()
         return lam * normed
+
+    def _warn_missing_penalty_sides(self) -> None:
+        """Warn once when 'energy' normalisation silently falls back to 'dim'."""
+        if getattr(self, '_warned_penalty_sides', False):
+            return
+        self._warned_penalty_sides = True
+        warnings.warn(
+            "penalty_norm='energy' but a caller did not pass `sides`; that "
+            'edge term falls back to the constant 2·d_e denominator and '
+            'keeps the shrink gradient. Pass `sides` from every '
+            '_edge_penalty_term call site.',
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     @torch.no_grad()
     def _dual_ascent_step(self) -> None:
@@ -415,7 +546,10 @@ class SheafFRL(BaseOrchestrator):
         if self._use_learnable_whitening():
             return self.whitening_layers[str(idx)](A)
         op = self._whitening_ops.get(idx)
-        return whiten(A, op) if op is not None else A
+        if op is None:
+            self._warn_identity_whitening(idx, '_whiten_node_pilots')
+            return A
+        return whiten(A, op)
 
     def _apply_frozen_whitening(
         self, idx: int, Z: torch.Tensor
@@ -430,14 +564,49 @@ class SheafFRL(BaseOrchestrator):
         if self._use_learnable_whitening():
             return self._whiten_pilots_frozen(idx, Z)
         op = self._whitening_ops.get(idx)
-        return whiten(Z, op) if op is not None else Z
+        if op is None:
+            self._warn_identity_whitening(idx, '_apply_frozen_whitening')
+            return Z
+        return whiten(Z, op)
 
     def _recolour_node(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
         """Re-colour ``Z`` into node ``idx``'s native space (inverse of whitening)."""
         if self._use_learnable_whitening():
             return self._colouring_layers[str(idx)](Z)
         op = self._whitening_ops.get(idx)
-        return color(Z, op) if op is not None else Z
+        if op is None:
+            self._warn_identity_whitening(idx, '_recolour_node')
+            return Z
+        return color(Z, op)
+
+    def _warn_identity_whitening(self, idx: int, where: str) -> None:
+        """Warn once when a whitening call runs unwhitened for lack of an operator.
+
+        The first epochs legitimately precede the first closed-form fit (and
+        any configured warmup skips the penalty anyway), so the warning only
+        fires once a refresh should already have happened.  Past that point a
+        missing operator is not a benign default: the penalty, the map fit and
+        the cross-agent evaluation would all silently run in raw, unnormalised
+        latent coordinates.
+        """
+        first_ready = int(self.hparams.warmup_epochs) + int(
+            self.hparams.update_v_every_n_epochs
+        )
+        if int(self.current_epoch) < first_ready:
+            return
+        key = (int(idx), where)
+        if key in self._warned_identity_whitening:
+            return
+        self._warned_identity_whitening.add(key)
+        warnings.warn(
+            f'{where}: no whitening operator for agent {idx} at epoch '
+            f'{int(self.current_epoch)}; falling back to the identity, so '
+            'this call runs in raw latent coordinates. The sheaf penalty and '
+            'any map fit in this frame are unnormalised — check that the '
+            'epoch-end refit is reaching this agent.',
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
     def _resolve_key(self, batch: dict, idx: int) -> int | str:
         str_key = str(idx)
@@ -595,20 +764,41 @@ class SheafFRL(BaseOrchestrator):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Filter pilot rows to the union of target classes for edge (node_i, node_j).
+        """Restrict an edge's pilot rows by class, per ``edge_class_filter``.
+
+        ``'union'`` (the default) keeps rows whose class lies in either
+        endpoint's target classes, ``'intersection'`` only those in both, and
+        ``'none'`` disables the filter entirely.
+
+        ``'none'`` is what makes the map fit **identical to the
+        post-hoc/non-cooperative baseline**, which fits on every matched pilot
+        (``PostTrainingAlignmentMixin._fit_alignment_maps`` filters only when
+        ``eval_on_class_intersection`` is set, and that defaults to False).
+        It also matters because the misalignment/MRR evaluation scores on *all*
+        matched pilots: with a filter on, the map is fit without ever seeing
+        classes it is then scored on.  Under ``split_strategy:
+        overlapping_shift`` that is simply wrong — ``target_classes`` there
+        marks the *over-represented* classes, not the agent's support
+        (``P_i(y) = s·Unif{C_i} + (1-s)·Unif{Y}`` gives every agent rows of
+        every class), so filtering discarded ~31% of the pilots (770 of 1120)
+        for no reason and cost ~22% of the achievable alignment.
 
         labels_i / labels_j are the actual class labels aligned with A_i / A_j
         (may differ from keys when keys are sample identifiers).
         Returns filtered (A_i, keys_i, labels_i, A_j, keys_j, labels_j).
-        No-op when _agent_target_classes is None.
+        No-op when the filter is ``'none'`` or _agent_target_classes is None.
         """
+        if str(getattr(self.hparams, 'edge_class_filter', 'union')) == 'none':
+            return A_i, keys_i, labels_i, A_j, keys_j, labels_j
         if getattr(self, '_agent_target_classes', None) is None:
             return A_i, keys_i, labels_i, A_j, keys_j, labels_j
         tc_i = self._agent_target_classes.get(node_i)
         tc_j = self._agent_target_classes.get(node_j)
         if tc_i is None or tc_j is None:
             return A_i, keys_i, labels_i, A_j, keys_j, labels_j
-        if getattr(self.hparams, 'align_on_intersection', False):
+        if str(getattr(self.hparams, 'edge_class_filter', 'union')) == (
+            'intersection'
+        ):
             target = tc_i & tc_j
         else:
             target = tc_i | tc_j
@@ -1226,6 +1416,8 @@ class SheafFRL(BaseOrchestrator):
         super().on_train_start()
         self._step_pilot_latents.clear()
         self._whitening_ops.clear()
+        self._zca_moments.clear()
+        self._warned_identity_whitening.clear()
         self._task_latent_buffer: dict[int, list[torch.Tensor]] = {}
         self._agent_target_classes: dict[int, set[int]] | None = (
             self._build_agent_target_classes()
@@ -1283,19 +1475,30 @@ class SheafFRL(BaseOrchestrator):
                 add_dataloader_idx=False,
             )
 
+        # Whitening is a purely LOCAL statistic: each agent estimates it from
+        # its own training latents and nothing is exchanged to do so.  It is
+        # therefore refreshed at *every* epoch end, independently of the map
+        # refresh cadence below — including CESheafFRL's local (non-collaborative)
+        # epochs, where the encoder keeps drifting and a whitening operator
+        # frozen since the last collaborative epoch would normalise the current
+        # latents with stale statistics.  (With learnable SWBN whitening phi_i
+        # instead lives in the persistent layers, updated online every step, so
+        # this closed-form fit is only needed for learn_whitening=False.)
+        #
+        # The refit runs *before* the anchor caches are rebuilt, so on a
+        # refresh epoch the maps are fit in the frame the next epoch will
+        # actually use.  Note the asymmetry it leaves on a local epoch: the
+        # own side is re-whitened with fresh statistics while the frozen
+        # neighbour anchors keep the statistics they were exchanged under, and
+        # V_e is still the map fit for that older frame.  Updating the own side
+        # is free; correcting the other two would cost communication.
+        if not self._use_learnable_whitening():
+            self._refit_zca_operators()
+
         # Whether to refresh the fixed anchor caches + alignment maps this
         # epoch.  Hook: SheafFRL refreshes every `update_v_every_n_epochs`
         # after warmup; CESheafFRL refreshes only on collaborative epochs.
         if self._should_update_maps_at_epoch_end():
-            # With learnable SWBN whitening, phi_i lives in the persistent
-            # layers (updated online every step); this closed-form ZCA fit is
-            # only needed for learn_whitening=False.
-            if not self._use_learnable_whitening():
-                for idx, chunks in self._task_latent_buffer.items():
-                    if chunks:
-                        self._whitening_ops[idx] = fit_whitening(
-                            torch.cat(chunks, dim=0).float()
-                        )
             edge_metrics = self._rebuild_edge_anchor_caches()
             if edge_metrics:
                 self.log_dict(
@@ -1310,6 +1513,192 @@ class SheafFRL(BaseOrchestrator):
         self._task_latent_buffer = {}
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
+
+    # ── Closed-form (ZCA) whitening refit ─────────────────────────────────────
+
+    def _attached_datamodule(self):
+        """The datamodule, or None when this module has no Trainer attached.
+
+        ``LightningModule.trainer`` *raises* when detached rather than
+        returning None, and these helpers are reachable from a bare
+        ``_shared_eval`` call (unit tests, ad-hoc scripts).
+        """
+        try:
+            trainer = self.trainer
+        except RuntimeError:
+            return None
+        return getattr(trainer, 'datamodule', None)
+
+    def _zca_refit_mode(self) -> str:
+        """Effective refit source, falling back when there is no train split."""
+        mode = str(self.hparams.zca_refit_mode)
+        if mode != 'exact':
+            return mode
+        dm = self._attached_datamodule()
+        if getattr(dm, 'train_datasets', None):
+            return 'exact'
+        # Nothing to re-encode: the per-step buffer is the only source of
+        # statistics this datamodule can offer.
+        return 'buffer'
+
+    def _needs_task_latent_buffer(self) -> bool:
+        """Whether the per-step task latents are worth accumulating at all.
+
+        Only the ``'buffer'`` refit source consumes them; under SWBN or the
+        exact refit the buffer would be an O(n·d) CPU allocation per epoch
+        that is thrown away untouched.
+        """
+        return (
+            not self._use_learnable_whitening()
+            and self._zca_refit_mode() == 'buffer'
+        )
+
+    def _zca_fit_latents(
+        self, idx: int, agent: nn.Module
+    ) -> torch.Tensor | None:
+        """Latents to fit agent ``idx``'s closed-form whitening on.
+
+        ``zca_refit_mode='exact'`` (the default) re-encodes the agent's own
+        training split *now*, at the end of the epoch: eval mode, no grad,
+        augmentation disabled.  Those are the statistics of the encoder the
+        next epoch will actually use, measured on the same clean distribution
+        the operator is later applied to (pilots, test).
+
+        ``'buffer'`` instead reuses the task latents collected during the
+        epoch.  It costs no extra forward pass, but they came from a *moving*
+        encoder in train mode (BatchNorm batch statistics, dropout active) on
+        augmented inputs, and the combined loader's ``min_size`` mode truncates
+        every agent to the shortest one's number of batches — so it is neither
+        the whole training split nor the end-of-epoch encoder.
+        """
+        if self._zca_refit_mode() == 'buffer':
+            chunks = self._task_latent_buffer.get(idx) or []
+            return torch.cat(chunks, dim=0).float() if chunks else None
+
+        dm = self._attached_datamodule()
+        source = str(getattr(self.hparams, 'zca_refit_source', 'train'))
+        parts = []
+        if source in ('train', 'train+pilots'):
+            tds = getattr(dm, 'train_datasets', None) if dm is not None else None
+            if tds and tds.get(idx) is not None and len(tds[idx]):
+                parts.append(tds[idx])
+        if source in ('pilots', 'train+pilots'):
+            # The SHARED pilots: every agent sees the same rows, so including
+            # them estimates all agents' operators partly on an identical input
+            # distribution — and matches where the penalty is evaluated.
+            pds = getattr(dm, 'pilot_datasets', None) if dm is not None else None
+            if pds and pds.get(idx) is not None and len(pds[idx]):
+                parts.append(pds[idx])
+        if not parts:
+            return None
+        ds = parts[0] if len(parts) == 1 else ConcatDataset(parts)
+
+        # Augmentation is a train-time input perturbation; the operator is
+        # applied to clean pilot/test latents, so it is switched off here.
+        saved_transform = getattr(ds, 'transform', None)
+        if saved_transform is not None:
+            ds.transform = None
+        try:
+            cap = int(self.hparams.zca_fit_max_samples)
+            fit_ds = ds
+            if 0 < cap < len(ds):
+                # Fresh draw per epoch: over a run the estimator still sees the
+                # whole split, while any single refit stays O(cap) forwards.
+                gen = torch.Generator().manual_seed(
+                    100003 * int(self.current_epoch) + int(idx)
+                )
+                rows = torch.randperm(len(ds), generator=gen)[:cap].tolist()
+                fit_ds = Subset(ds, rows)
+            return self._encode_dataset(agent, fit_ds)
+        finally:
+            if saved_transform is not None:
+                ds.transform = saved_transform
+
+    @torch.no_grad()
+    def _refit_zca_operators(self) -> None:
+        """Refit every agent's closed-form whitening for the coming epoch.
+
+        Statistics can be accumulated as an EMA over refits
+        (``zca_ema_momentum``), smoothing the frame the sheaf penalty lives in
+        so it does not jump between refreshes while the alignment maps are
+        being fit in it.  It runs on the raw moments ``E[z]`` and ``E[z z^T]``,
+        so the smoothed covariance is the *pooled* one over the window — it
+        accounts for the drift of the mean across epochs rather than averaging
+        per-epoch spreads about different centres.
+
+        It defaults to **off** (0.0): measured on a 6-epoch MNIST run, the lag
+        it introduces costs far more than the jitter it removes, because the
+        encoder moves faster than the window.  Whitening quality
+        ``‖cov − I‖_F/√d`` on the train split went 0.076 (off) → 0.365
+        (momentum 0.5) → 0.888 (0.9) — the last being no better than not
+        whitening at all.  Raise it only if the map refits visibly chase the
+        frame, and watch ``train/whitening_cov_identity_dist`` when doing so.
+        """
+        momentum = float(self.hparams.zca_ema_momentum)
+        eps_rel = float(self.hparams.whitening_eps_rel)
+        eps_abs = float(self.hparams.whitening_eps_abs)
+        shrinkage = float(self.hparams.whitening_shrinkage)
+        clamped: list[float] = []
+        conds: list[float] = []
+
+        for idx_str, agent in self.agents.items():
+            idx = int(idx_str)
+            if not hasattr(agent, 'encode'):
+                continue
+            Z = self._zca_fit_latents(idx, agent)
+            if Z is None or Z.shape[0] < 2:
+                continue
+
+            mean, cov, n = latent_moments(Z)
+            second = cov + torch.outer(mean, mean)  # E[z z^T]
+            n_eff = float(n)
+
+            prev = self._zca_moments.get(idx)
+            if prev is not None and momentum > 0.0:
+                p_mean, p_second, p_n = prev
+                mean = momentum * p_mean + (1.0 - momentum) * mean
+                second = momentum * p_second + (1.0 - momentum) * second
+                # Effective sample size of the EMA window; only used to locate
+                # the structurally unobserved directions, which the window has
+                # more of a chance to span than any single refit does.
+                n_eff = float(n) + momentum * p_n
+            self._zca_moments[idx] = (mean, second, n_eff)
+
+            op = whitening_from_moments(
+                mean,
+                second - torch.outer(mean, mean),
+                int(n_eff),
+                eps_rel=eps_rel,
+                eps_abs=eps_abs,
+                shrinkage=shrinkage,
+            )
+            self._whitening_ops[idx] = op
+            clamped.append(op.clamped_fraction)
+            conds.append(op.cond)
+            if bool(getattr(self.hparams, 'log_latent_diagnostics', False)):
+                self.log(
+                    f'train/zca_clamped_frac_agent_{idx}',
+                    op.clamped_fraction,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    add_dataloader_idx=False,
+                )
+
+        if clamped:
+            # A clamped fraction near 1 means the ridge, not the data, is
+            # setting the scale of almost every direction — the latents are
+            # then barely whitened at all (see `whitening_from_moments`).
+            self.log_dict(
+                {
+                    'train/zca_clamped_frac': sum(clamped) / len(clamped),
+                    'train/zca_cond': sum(conds) / len(conds),
+                },
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                add_dataloader_idx=False,
+            )
 
     # ── Epoch/communication hooks (overridden by CESheafFRL) ──────────────────
 
@@ -1464,8 +1853,11 @@ class SheafFRL(BaseOrchestrator):
                     prefix='train',
                     mode='penalty',
                 )
-            diff = torch.matmul(Z_i, V) - Z_j
-            sheaf_penalty += self._edge_penalty_term(edge_key, diff)
+            Z_i_mapped = torch.matmul(Z_i, V)
+            diff = Z_i_mapped - Z_j
+            sheaf_penalty += self._edge_penalty_term(
+                edge_key, diff, sides=(Z_i_mapped, Z_j)
+            )
 
             # ── After-communication task loss ─────────────────────────────────
             # • j→i: align Z_j into node_i's space, decode with agent_i's decoder,
@@ -1566,7 +1958,7 @@ class SheafFRL(BaseOrchestrator):
                 agent_losses[idx] = agent.compute_loss(y_hat, y_task)
             agent_performances[idx] = agent.task_performance(y_hat, y_task)
 
-            if prefix == 'train':
+            if prefix == 'train' and self._needs_task_latent_buffer():
                 self._task_latent_buffer.setdefault(idx, []).append(
                     latent_task.detach().cpu()
                 )
@@ -1577,9 +1969,12 @@ class SheafFRL(BaseOrchestrator):
             # ── Pilot extraction ─────────────────────────────────────────────
             if pilots_available:
                 try:
-                    x_pilot, y_pilot, sample_ids = self._extract_pilot_batch(
-                        batch, idx
-                    )
+                    (
+                        x_pilot,
+                        y_pilot,
+                        sample_ids,
+                        _pilot_mask,
+                    ) = self._extract_pilot_batch(batch, idx)
                 except ValueError:
                     pilots_available = False
                 else:

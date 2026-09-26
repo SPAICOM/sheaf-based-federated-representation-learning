@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 
 # ── Whitening / colouring ─────────────────────────────────────────────────────
 
+#: Absolute floor below which an eigenvalue is treated as numerically zero;
+#: guards 1/sqrt(lambda) against a fully collapsed latent space.
+_MIN_EIG = 1e-12
+
 
 @dataclass
 class WhiteningOp:
@@ -35,53 +39,217 @@ class WhiteningOp:
     mean: torch.Tensor  # (d,)
     W: torch.Tensor  # (d, d)  right-multiply whitening
     C: torch.Tensor  # (d, d)  right-multiply colouring  (W^{-1} row-wise)
+    # Diagnostics from the fit (see `whitening_from_moments`): fraction of the
+    # d directions whose eigenvalue was raised by the ridge, and the condition
+    # number of the ridged spectrum.  A `clamped_fraction` near 1 means the
+    # ridge — not the data — is setting the scale of almost every direction,
+    # i.e. the latents are barely whitened at all.
+    clamped_fraction: float = 0.0
+    cond: float = 1.0
 
 
-def fit_whitening(Z: torch.Tensor, eps: float = 1e-2) -> WhiteningOp:
-    """Fit whitening/colouring operators from latent matrix Z (n, d).
+def latent_moments(
+    Z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Mean and sample covariance of a latent matrix Z (n, d), in float64.
 
-    Uses the SVD of the centred data matrix rather than the eigendecomposition
-    of the sample covariance.  This avoids squaring the condition number and
-    handles rank-deficient cases (n < d) without convergence failures.
+    Split out of :func:`fit_whitening` so the sufficient statistics can be
+    smoothed across refits (an EMA of the covariance keeps the whitened frame
+    from jumping between epochs) before the operators are built by
+    :func:`whitening_from_moments`.
 
-    ``full_matrices`` is enabled only when n < d so the full set of d right
-    singular vectors is recovered for the null-space directions; when n >= d
-    the economy SVD is used to avoid an n×n U matrix.
+    Accumulation is done in float64: the covariance squares the dynamic range
+    of the latents, and a float32 sum over tens of thousands of rows loses the
+    small eigenvalues that whitening then has to invert.
     """
-    Z = Z.float()
+    Z = Z.double()
     # Sanitize non-finite values that can arise from training instability so
-    # that SVD (both GPU and CPU fallback) never receives a corrupt matrix.
+    # that the eigendecomposition never receives a corrupt matrix.
     if not torch.isfinite(Z).all():
         warnings.warn(
-            f"fit_whitening: input Z contains non-finite values "
-            f"({(~torch.isfinite(Z)).sum().item()} entries). "
-            "Replacing with 0.0 — check for training instability.",
+            f'latent_moments: input Z contains non-finite values '
+            f'({(~torch.isfinite(Z)).sum().item()} entries). '
+            'Replacing with 0.0 — check for training instability.',
             RuntimeWarning,
             stacklevel=2,
         )
         Z = torch.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    n = Z.shape[0]
     mean = Z.mean(0)
     Z_c = Z - mean
-    n, d = Z_c.shape
+    cov = (Z_c.T @ Z_c) / max(n - 1, 1)
+    return mean, cov, int(n)
 
+
+def whitening_from_moments(
+    mean: torch.Tensor,
+    cov: torch.Tensor,
+    n: int,
+    eps_rel: float = 1e-4,
+    eps_abs: float = 0.0,
+    eps_null: float = 1e-2,
+    shrinkage: float = 0.0,
+) -> WhiteningOp:
+    """Build whitening/colouring operators from (mean, covariance).
+
+    The ridge is **relative** to the spectrum: an observed eigenvalue is
+    floored at ``eps_rel * lambda_max`` rather than at an absolute constant.
+    An absolute floor is scale-dependent, and latent scales vary by orders of
+    magnitude across architectures — with the old absolute ``eps=1e-2`` on a
+    trained MNIST CNN (``lambda_max ~ 0.5``, median ``~7e-4``) 86% of the 64
+    directions were pinned to the ridge, so they were multiplied by a constant
+    ``1/sqrt(eps)`` instead of their own ``1/sqrt(lambda)`` and the "whitened"
+    covariance was nowhere near the identity.  A relative floor caps the
+    condition number of the whitened spectrum at ``1/eps_rel`` regardless of
+    how the latents happen to be scaled.
+
+    The structurally unobserved directions (when ``n - 1 < d``) keep their
+    own **absolute** floor ``eps_null``: they carry no data at all, so giving
+    them the (much smaller) relative floor would amplify pure noise by
+    ``1/sqrt(eps_rel * lambda_max)`` on every sample seen after the fit.
+
+    ``shrinkage`` optionally applies Ledoit-Wolf-style shrinkage towards a
+    scaled identity, ``cov <- (1 - g) cov + g (tr cov / d) I``, before the
+    decomposition.  Unlike a floor this conditions the whole spectrum
+    smoothly and is scale-equivariant; 0.0 (the default) disables it.
+
+    The spectrum is extracted with the SVD of ``cov`` rather than
+    ``linalg.eigh``: for a symmetric (PSD) matrix the singular values are the
+    eigenvalues and the left singular vectors equal the eigenvectors up to
+    column signs — which cancel in ``W @ C.T`` — so it yields the identical
+    operator.  The divide-and-conquer eigensolver fails to converge on
+    ill-conditioned or heavily clustered spectra (``linalg.eigh: ... the
+    input matrix is ill-conditioned or has too many repeated eigenvalues``),
+    whereas the SVD never does on finite input; latent covariances are
+    typically near-degenerate, so this removes an entire class of crashes.
+    A non-finite ``cov`` (e.g. from latent blow-up) degrades to identity
+    whitening instead of raising.
+
+    Parameters
+    ----------
+    mean, cov : torch.Tensor
+        Latent mean (d,) and sample covariance (d, d), e.g. from
+        :func:`latent_moments`.
+    n : int
+        Number of samples the moments were estimated from — only used to
+        locate the structurally unobserved directions (``n - 1 < d``).
+    eps_rel : float
+        Relative eigenvalue floor for observed directions, as a fraction of
+        ``lambda_max``.
+    eps_abs : float
+        Additional absolute floor for observed directions; the effective floor
+        is ``max(eps_rel * lambda_max, eps_abs)``.  ``eps_rel=0.0,
+        eps_abs=1e-2`` reproduces the pre-change behaviour exactly.
+    eps_null : float
+        Absolute eigenvalue floor for the unobserved directions.
+    shrinkage : float
+        Shrinkage intensity in [0, 1) towards ``(tr cov / d) I``.
+    """
+    cov = cov.double()
+    mean = mean.double()
+    d = cov.shape[0]
+    device = cov.device
+
+    if not 0.0 <= float(shrinkage) < 1.0:
+        raise ValueError(f'shrinkage must lie in [0, 1), got {shrinkage}')
+    for name, value in (
+        ('eps_rel', eps_rel),
+        ('eps_abs', eps_abs),
+        ('eps_null', eps_null),
+    ):
+        if float(value) < 0.0:
+            raise ValueError(f'{name} must be non-negative, got {value}')
+
+    # Symmetrise (guards against asymmetry accumulated by an EMA in float32)
+    # and optionally shrink towards a scaled identity.
+    cov = 0.5 * (cov + cov.T)
+    if shrinkage > 0.0:
+        target = (torch.diagonal(cov).sum() / d) * torch.eye(
+            d, dtype=cov.dtype, device=device
+        )
+        cov = (1.0 - shrinkage) * cov + shrinkage * target
+
+    # Guard a non-finite covariance (latent blow-up, EMA corruption): SVD on
+    # NaN/Inf itself fails, and there is nothing sensible to whiten with.
+    if not torch.isfinite(cov).all():
+        warnings.warn(
+            f'whitening_from_moments: covariance contains non-finite values '
+            f'({(~torch.isfinite(cov)).sum().item()} entries); '
+            'falling back to identity whitening — check for training '
+            'instability.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return WhiteningOp(
+            mean=mean.float(),
+            W=torch.eye(d, dtype=torch.float32, device=device),
+            C=torch.eye(d, dtype=torch.float32, device=device),
+            clamped_fraction=1.0,
+            cond=1.0,
+        )
     try:
-        _, S, Vt = torch.linalg.svd(Z_c, full_matrices=(n < d))
+        _, S, Vh = torch.linalg.svd(cov)
     except RuntimeError:
-        _, S, Vt = torch.linalg.svd(Z_c.cpu(), full_matrices=(n < d))
-        S = S.to(Z_c.device)
-        Vt = Vt.to(Z_c.device)
-    r = S.shape[0]  # min(n, d)
+        _, S, Vh = torch.linalg.svd(cov.cpu())
+        S = S.to(device)
+        Vh = Vh.to(device)
+    # SVD returns singular values in descending order (== the eigenvalues of
+    # this PSD covariance), so index i < rank picks out the directions the
+    # data actually spans.
+    eigenvalues = S.clamp(min=0.0)
+    V = Vh.T  # (d, d) — eigenvectors as columns
 
-    # Eigenvalues of the sample covariance for the r principal directions;
-    # null-space directions (when n < d) get the ridge value eps.
-    eigenvalues = torch.full((d,), eps, dtype=Z_c.dtype, device=Z_c.device)
-    eigenvalues[:r] = (S.pow(2) / max(n - 1, 1)).clamp(min=eps)
+    # Per-direction ridge: relative for observed directions, absolute for the
+    # structurally unobserved tail (n - 1 < d).
+    rank = max(min(int(n) - 1, d), 0)
+    obs_floor = max(
+        float(eps_rel) * float(eigenvalues[0]), float(eps_abs), _MIN_EIG
+    )
+    floor = torch.full(
+        (d,), float(eps_null), dtype=eigenvalues.dtype, device=device
+    )
+    floor[:rank] = obs_floor
+    clamped = eigenvalues < floor
+    eigenvalues = torch.maximum(eigenvalues, floor)
 
-    V = Vt.T  # (d, d) — right singular vectors as columns
-    W = V * eigenvalues.pow(-0.5)  # right-multiply whitening: z_white = (z - mean) @ W
-    C = V * eigenvalues.pow(0.5)   # right-multiply colouring:  z = z_white @ C.T + mean
+    W = V * eigenvalues.pow(-0.5)  # z_white = (z - mean) @ W
+    C = V * eigenvalues.pow(0.5)  # z = z_white @ C.T + mean
 
-    return WhiteningOp(mean=mean, W=W, C=C)
+    return WhiteningOp(
+        mean=mean.float(),
+        W=W.float(),
+        C=C.float(),
+        clamped_fraction=float(clamped.float().mean()),
+        cond=float(eigenvalues[0] / eigenvalues[-1].clamp(min=_MIN_EIG)),
+    )
+
+
+def fit_whitening(
+    Z: torch.Tensor,
+    eps_rel: float = 1e-4,
+    eps_abs: float = 0.0,
+    eps_null: float = 1e-2,
+    shrinkage: float = 0.0,
+) -> WhiteningOp:
+    """Fit whitening/colouring operators from latent matrix Z (n, d).
+
+    Thin wrapper over :func:`latent_moments` + :func:`whitening_from_moments`;
+    see the latter for how the ridge (``eps_rel`` / ``eps_abs`` / ``eps_null``
+    / ``shrinkage``) is applied.  Both stages run in float64, so routing through the covariance
+    (rather than an SVD of the centred data matrix) does not cost accuracy
+    even though it squares the condition number: the relative ridge caps that
+    at ``1/eps_rel``, many orders below float64 resolution.
+    """
+    mean, cov, n = latent_moments(Z)
+    return whitening_from_moments(
+        mean,
+        cov,
+        n,
+        eps_rel=eps_rel,
+        eps_abs=eps_abs,
+        eps_null=eps_null,
+        shrinkage=shrinkage,
+    )
 
 
 def whiten(Z: torch.Tensor, op: WhiteningOp) -> torch.Tensor:
@@ -117,9 +285,9 @@ class SWBNWhiteningLayer(nn.Module):
     Convention (row vectors, batch dimension first).  For input ``Z`` of shape
     ``(K, d)``::
 
-        Z_s = (Z - mu) / sqrt(v + eps)      # standardise (batch stats in train)
-        Z_w = Z_s @ W.T                     # whiten   (W symmetric -> ZCA)
-        out = Z_w * gamma + beta            # affine rescale
+        Z_s = (Z - mu) / sqrt(v + eps)  # standardise (batch stats in train)
+        Z_w = Z_s @ W.T  # whiten   (W symmetric -> ZCA)
+        out = Z_w * gamma + beta  # affine rescale
 
     During training ``mu`` / ``v`` are the per-feature batch statistics (and the
     running buffers are updated from them); at inference the frozen running
@@ -164,14 +332,18 @@ class SWBNWhiteningLayer(nn.Module):
         enters the task backward graph.
         """
         n = Z_s.shape[0]
-        Sigma = (Z_s.T @ Z_s) / max(n, 1)  # sample correlation, entries in [-1, 1]
+        Sigma = (Z_s.T @ Z_s) / max(
+            n, 1
+        )  # sample correlation, entries in [-1, 1]
         eye = torch.eye(self.d, device=Z_s.device, dtype=Z_s.dtype)
         WSWt = self.W @ Sigma @ self.W.T
         residual = WSWt - eye
         if self.criterion == 'kl':
             dW = residual @ self.W
         else:  # 'fro'
-            dW = (residual @ self.W @ Sigma) / residual.norm().clamp(min=self.eps)
+            dW = (residual @ self.W @ Sigma) / residual.norm().clamp(
+                min=self.eps
+            )
         W_new = self.W - self.alpha * dW
         # Enforce symmetry (a ZCA whitening matrix is symmetric) and *reassign*
         # the buffer rather than copy_ in place: the previous W tensor may be
@@ -194,9 +366,9 @@ class SWBNWhiteningLayer(nn.Module):
         # subsequent colouring solve.  Mirrors the guard in `fit_whitening`.
         if not torch.isfinite(Z).all():
             warnings.warn(
-                f"SWBNWhiteningLayer: input contains "
-                f"{(~torch.isfinite(Z)).sum().item()} non-finite entries; "
-                "replacing with 0.0 — check for training instability.",
+                f'SWBNWhiteningLayer: input contains '
+                f'{(~torch.isfinite(Z)).sum().item()} non-finite entries; '
+                'replacing with 0.0 — check for training instability.',
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -256,9 +428,9 @@ class SWBNColouringLayer(nn.Module):
             # silently emit NaN.  Degrade gracefully to identity de-whitening for
             # this call rather than crashing/poisoning the step.
             warnings.warn(
-                "SWBNColouringLayer: whitening matrix W is non-finite; "
-                "skipping de-whitening (identity fallback) — check training "
-                "stability.",
+                'SWBNColouringLayer: whitening matrix W is non-finite; '
+                'skipping de-whitening (identity fallback) — check training '
+                'stability.',
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -268,7 +440,9 @@ class SWBNColouringLayer(nn.Module):
             except RuntimeError:
                 # Near-singular W (should not happen near identity): ridge, then
                 # fall back to a pseudo-inverse if even the ridged solve fails.
-                ridge = wl.eps * torch.eye(wl.d, device=W.device, dtype=W.dtype)
+                ridge = wl.eps * torch.eye(
+                    wl.d, device=W.device, dtype=W.dtype
+                )
                 try:
                     Z = torch.linalg.solve(W.T + ridge, Z.T).T
                 except RuntimeError:

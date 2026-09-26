@@ -144,18 +144,28 @@ class BaseOrchestrator(l.LightningModule, ABC):
             return cached
         return self._build_agent_target_classes()
 
-    def _class_intersection_mask(
+    def _class_edge_mask(
         self,
         agent_target_classes: dict[int, set[int]] | None,
         i: int,
         j: int,
         labels: torch.Tensor,
+        mode: str = 'intersection',
     ) -> torch.Tensor | None:
-        """Boolean mask over ``labels`` for classes in ``tc_i ∩ tc_j``.
+        """Boolean mask over ``labels`` for an edge's relevant classes.
+
+        ``mode='intersection'`` keeps ``tc_i ∩ tc_j`` (the classes BOTH agents
+        are expert in); ``'union'`` keeps ``tc_i ∪ tc_j`` (either is expert),
+        which is what SheafFRL's own ``_apply_edge_class_filter`` uses by
+        default.  Matching the two matters: fitting the post-hoc baseline's
+        maps on every pilot while SheafFRL fits on the edge's filtered subset
+        is not a like-for-like comparison, and filtering both is the fair way
+        to ask whether restricting alignment to classes the endpoints actually
+        know is what helps.
 
         Returns ``None`` (meaning "no filtering applicable — keep all rows")
-        when target classes are unknown or the intersection is empty, so callers
-        can treat ``None`` as a graceful no-op.
+        when target classes are unknown or the selected set is empty, so
+        callers can treat ``None`` as a graceful no-op.
         """
         if agent_target_classes is None:
             return None
@@ -163,11 +173,17 @@ class BaseOrchestrator(l.LightningModule, ABC):
         cj = agent_target_classes.get(int(j))
         if not ci or not cj:
             return None
-        inter = ci & cj
-        if not inter:
+        keep = (ci | cj) if str(mode) == 'union' else (ci & cj)
+        if not keep:
             return None
         return torch.isin(
-            labels, torch.tensor(sorted(inter), dtype=labels.dtype)
+            labels, torch.tensor(sorted(keep), dtype=labels.dtype)
+        )
+
+    def _class_intersection_mask(self, agent_target_classes, i, j, labels):
+        """Backwards-compatible alias for :meth:`_class_edge_mask` (intersection)."""
+        return self._class_edge_mask(
+            agent_target_classes, i, j, labels, mode='intersection'
         )
 
     def _empty_communication_state(self) -> dict[str, float]:
@@ -1522,6 +1538,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
         }
 
         per_receiver: dict[int, list[float]] = {}
+
+        per_receiver_energy: dict[int, list[float]] = {}
         per_edge_mrr: list[float] = []
         logs: dict[str, float] = {}
         for sender_idx, receiver_set in neighbors_map.items():
@@ -1591,13 +1609,37 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 d_e = diff.shape[1]
                 if d_e == 0:
                     continue
-                normed = float(
-                    ((diff**2).sum(dim=1).mean() / (2.0 * d_e)).item()
-                )
+                raw = (diff**2).sum(dim=1).mean()
+                # Reported under the FIXED 2*d_e reference: comparable across
+                # every orchestrator and every historical run, and the only
+                # option for baselines that have no penalty at all.
+                normed = float((raw / (2.0 * d_e)).item())
                 logs[
                     f'{prefix}/misalignment_loss_edge_{sender_idx}_{receiver_idx}'
                 ] = normed
                 per_receiver.setdefault(receiver_idx, []).append(normed)
+
+                # Same residual under the normalisation the penalty is ACTUALLY
+                # minimised with (SheafFRL's `penalty_norm`).  With
+                # penalty_norm='energy' the training objective divides by the
+                # current whitened energy rather than the constant 2*d_e, so the
+                # two diverge exactly when the whitened latents are not unit
+                # variance — and then the reported number is NOT the quantity
+                # being optimised.  Logging both keeps the headline metric
+                # comparable while making the optimised one visible.
+                energy = float(
+                    (Z_i_to_j.pow(2).sum(dim=1).mean()
+                     + Z_j_w.pow(2).sum(dim=1).mean()).item()
+                )
+                if energy > 1e-12:
+                    normed_e = float(raw.item()) / energy
+                    logs[
+                        f'{prefix}/misalignment_energy_edge_'
+                        f'{sender_idx}_{receiver_idx}'
+                    ] = normed_e
+                    per_receiver_energy.setdefault(
+                        receiver_idx, []
+                    ).append(normed_e)
 
                 # Instance-identity retrieval MRR on the pilot samples common to
                 # both agents (matched by id): rank every receiver row by cosine
@@ -1627,12 +1669,61 @@ class BaseOrchestrator(l.LightningModule, ABC):
         all_vals = [v for vs in per_receiver.values() for v in vs]
         if all_vals:
             logs[f'{prefix}/misalignment_loss'] = sum(all_vals) / len(all_vals)
+        all_e = [v for vs in per_receiver_energy.values() for v in vs]
+        if all_e:
+            # The residual under the normalisation actually being minimised —
+            # compare THIS against the training penalty, not the line above.
+            logs[f'{prefix}/misalignment_energy'] = sum(all_e) / len(all_e)
         if per_edge_mrr:
             logs['pilots/mean_reciprocal_rank'] = sum(per_edge_mrr) / len(
                 per_edge_mrr
             )
 
         return logs
+
+    @torch.no_grad()
+    def _encode_dataset(
+        self,
+        agent: nn.Module,
+        dataset,
+        batch_size: int = 256,
+    ) -> torch.Tensor | None:
+        """Encode a whole dataset in eval mode, without grad, to CPU latents.
+
+        The statistics that matter downstream (whitening, alignment maps) are
+        those of the *deployed* encoder — frozen BatchNorm, no dropout — not of
+        the train-mode forward passes that happened while the weights were
+        still moving.  Returns ``None`` for an empty/absent dataset.
+        """
+        if dataset is None or len(dataset) == 0:
+            return None
+
+        def _collate_x(batch):
+            xs = []
+            for item in batch:
+                x = item[0]
+                if isinstance(x, _PILImage.Image):
+                    x = _pil_to_tensor(x)
+                xs.append(x)
+            return torch.stack(xs)
+
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=int(batch_size),
+            shuffle=False,
+            num_workers=0,
+            collate_fn=_collate_x,
+        )
+        was_training = agent.training
+        agent.eval()
+        try:
+            Zs = [
+                agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                for x_batch in loader
+            ]
+        finally:
+            agent.train(was_training)
+        return torch.cat(Zs, dim=0) if Zs else None
 
     @torch.no_grad()
     def evaluate_whitening_quality(
@@ -1977,8 +2068,16 @@ class BaseOrchestrator(l.LightningModule, ABC):
             return 0.0
         if isinstance(batch, tuple):
             batch = batch[0]
+        # 'global_pilot' is the key produced by comm_data: shared_global_pilots
+        # (one shared split for every agent); the per-agent keys come from
+        # private_pilots. Without the shared key this raised for every
+        # shared-pilot config, so the supervision was unreachable there.
         key = next(
-            (k for k in (f'global_pilot_{idx}', f'pilot_{idx}') if k in batch),
+            (
+                k
+                for k in (f'global_pilot_{idx}', f'pilot_{idx}', 'global_pilot')
+                if k in batch
+            ),
             None,
         )
         if key is None:
@@ -1986,10 +2085,21 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 'Local pilot supervision requires per-agent pilot batches.'
             )
         x, y, mask = self._unpack_task_batch(batch[key])
-        private_components = agent.last_loss_components
+        # `last_loss_components` only exists on agents that decompose their loss
+        # (the VAEs); classifiers do not have it, and touching it unconditionally
+        # raised AttributeError for every classifier run. Likewise `eval_mask` is
+        # only in the reconstruction agents' compute_loss signature.
+        has_components = hasattr(agent, 'last_loss_components')
+        private_components = (
+            agent.last_loss_components if has_components else None
+        )
         prediction = agent(x)
-        loss = weight * agent.compute_loss(prediction, y, eval_mask=mask)
-        agent.last_loss_components = private_components
+        if 'eval_mask' in inspect.signature(agent.compute_loss).parameters:
+            loss = weight * agent.compute_loss(prediction, y, eval_mask=mask)
+        else:
+            loss = weight * agent.compute_loss(prediction, y)
+        if has_components:
+            agent.last_loss_components = private_components
         return loss
 
     def forward(
