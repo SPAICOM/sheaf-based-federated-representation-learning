@@ -103,6 +103,9 @@ class SheafCFRL(CESheafFRL):
         # SheafFRL.__init__ calls self._build_restriction_maps(...) (overridden
         # below) which only stashes the graph; the real maps are built here once
         # the compression hyperparameters are available.
+        # Its compressed edge stalks are what the evaluation measures, so the
+        # SheafFRL post-hoc (full-dim Procrustes) evaluation is opt-in here.
+        kwargs.setdefault('eval_alignment', 'learned')
         super().__init__(**kwargs)
         self._compression_factor = float(compression_factor)
         self._compression_inner_steps = (

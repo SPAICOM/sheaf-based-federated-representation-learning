@@ -1,0 +1,25 @@
+# Grayscale vs harsh blur (as grayblur_harsh) with class sets that overlap less:
+# agent 0 trains only on classes 0-5, agent 1 only on 4-9 (shift 1), so they share
+# classes 4 (deer) and 5 (dog). Pilots = images both agents hold = deer/dog only.
+# Test stays the full 10-class split: private and comm are capped at 0.6.
+defaults:
+  - cifar10_2agents_grayblur_harsh
+  - _self_
+
+study_name: "CIFAR-10 2 agents grayscale vs blur, classes 0-5 vs 4-9"
+logger:
+  project: cifar10_2agents_grayblur_6v6
+
+trainer:
+  max_epochs: 100
+
+dataset:
+  shift_strength: 1.0
+  pilot_num_samples: 2048
+  groups:
+    0:
+      agents: [0]
+      target_classes: [0, 1, 2, 3, 4, 5]
+    1:
+      agents: [1]
+      target_classes: [4, 5, 6, 7, 8, 9]

@@ -45,9 +45,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
+from matplotlib.lines import Line2D
 from plot_hetero_bottleneck_metrics import (
     discover_runs_remote as discover_bottleneck_runs_remote,
 )
@@ -57,12 +60,13 @@ from plot_multiagent_metrics import (
     _MPLSTYLE,
     ORCH_LABELS,
     _agent_metric_long_df,
+    _center_and_bounds,
     _ordered_orchs,
     _plot_metric_on_ax,
     _savefig,
     _style_maps,
-    discover_runs_remote,
     drop_excluded_orchs,
+    read_run_meta_remote,
 )
 
 # Font/marker overrides on top of plt.mplstyle: four panels side by side are
@@ -104,6 +108,128 @@ def _add_group_gap(fig: plt.Figure, axes, split: int, gap: float) -> None:
         )
 
 
+def discover_shift_runs_by_seed(
+    api: Any,
+    entity: str,
+    project: str,
+    seeds: list[int] | None = None,
+    orchs: set[str] | None = None,
+) -> dict[tuple[str, float, int], dict[str, Any]]:
+    """Return ``{(orch, shift, seed): meta}`` for one wandb project.
+
+    Unlike ``plot_multiagent_metrics.discover_runs_remote``, which keeps one
+    run per ``(orch, shift)``, the seed is part of the key — that is what the
+    error bars are computed over. Within a key (a re-run of the same cell) the
+    most recent run wins. Runs with no ``test/avg_comm_task_perf`` in their
+    summary are dropped: the project also holds aborted one-minute runs that
+    would otherwise shadow a real one.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    remote = list(api.runs(f'{entity}/{project}', filters={'state': 'finished'}))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        metas = list(pool.map(read_run_meta_remote, remote))
+
+    best: dict[tuple[str, float, int], dict[str, Any]] = {}
+    for meta in metas:
+        if meta is None:
+            continue
+        if 'test/avg_comm_task_perf' not in meta['summary']:
+            continue
+        orch = meta['orch']
+        if orchs is not None and orch not in orchs:
+            continue
+        seed = meta['raw_config'].get('seed')
+        if seed is None or (seeds is not None and int(seed) not in seeds):
+            continue
+        key = (orch, float(meta['shift']), int(seed))
+        if key not in best or meta['mtime'] > best[key]['mtime']:
+            best[key] = meta
+    return best
+
+
+def seed_metric_df(
+    runs: dict[tuple[str, float, int], dict[str, Any]],
+    pattern: Any,
+    value_col: str,
+    estimator: str,
+) -> pd.DataFrame:
+    """One row per ``(orchestrator, shift, seed)``, agents already aggregated.
+
+    Each row is that run's across-agent statistic — the plain mean, or the
+    degree-weighted mean for the communication metric, exactly as the
+    single-seed panels compute it — so the only spread left for the plot to
+    show is the spread across seeds.
+    """
+    rows = []
+    for seed in sorted({sd for _, _, sd in runs}):
+        per_seed = {
+            (orch, shift): meta
+            for (orch, shift, sd), meta in runs.items()
+            if sd == seed
+        }
+        long_df = _agent_metric_long_df(per_seed, pattern, value_col)
+        if long_df.empty:
+            continue
+        for (orch, shift), group in long_df.groupby(['_orch', 'shift']):
+            center, _, _ = _center_and_bounds(
+                group[value_col].to_numpy(),
+                estimator,
+                None,
+                weights=group['weight'].to_numpy(),
+            )
+            rows.append(
+                {
+                    'orchestrator': ORCH_LABELS.get(orch, orch),
+                    '_orch': orch,
+                    'shift': shift,
+                    'seed': seed,
+                    value_col: center,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _plot_seed_metric_on_ax(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    orchs: list[str],
+    colors: dict,
+    markers: dict,
+    value_col: str,
+    ylabel: str,
+    xlabel: str,
+) -> None:
+    """Mean across seeds with seaborn's default error bars, one line per orch.
+
+    ``errorbar`` is deliberately not passed, so the band is seaborn's default
+    (a 95% bootstrap confidence interval of the mean over the seeds present
+    for that orchestrator).
+    """
+    present = [o for o in orchs if o in set(df['_orch'])]
+    labels = [ORCH_LABELS.get(o, o) for o in present]
+    sns.lineplot(
+        data=df[df['_orch'].isin(present)],
+        x='shift',
+        y=value_col,
+        hue='orchestrator',
+        style='orchestrator',
+        hue_order=labels,
+        style_order=labels,
+        palette={ORCH_LABELS.get(o, o): colors[o] for o in present},
+        markers={ORCH_LABELS.get(o, o): markers[o] for o in present},
+        dashes=False,
+        estimator='mean',
+        legend=False,
+        ax=ax,
+        linewidth=plt.rcParams['lines.linewidth'],
+        markersize=plt.rcParams['lines.markersize'],
+    )
+    ax.set_xticks(sorted(df['shift'].unique()))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+
 def plot_row(
     panels: list[tuple],
     orchs: list[str],
@@ -114,29 +240,40 @@ def plot_row(
 ) -> None:
     """Draw ``panels`` in one row, tag them (a), (b), …, and place the legend.
 
-    ``panels`` holds ``(df, value_col, ylabel, estimator, x_kwargs)`` tuples;
-    ``legend`` is one of :data:`_LEGEND_VARIANTS`. The legend lists the
-    union of the orchestrators drawn in any panel, in ``orchs`` order.
+    ``panels`` holds one dict per panel: ``seeded`` panels are drawn as a
+    mean over seeds with seaborn's default error band, the others as a single
+    curve. ``legend`` is one of :data:`_LEGEND_VARIANTS`; it always lists
+    every orchestrator in ``orchs``, since no single panel carries them all.
     """
     with plt.style.context(str(_MPLSTYLE)), plt.rc_context(_RC):
         w, h = _PANEL_SIZE
         fig, axes = plt.subplots(1, len(panels), figsize=(len(panels) * w, h))
-        for i, (ax, (df, value_col, ylabel, estimator, x_kwargs)) in enumerate(
-            zip(axes, panels)
-        ):
-            _plot_metric_on_ax(
-                ax,
-                df,
-                orchs,
-                colors,
-                markers,
-                value_col,
-                ylabel,
-                adjusted=False,
-                show_error=False,
-                estimator=estimator,
-                **x_kwargs,
-            )
+        for i, (ax, panel) in enumerate(zip(axes, panels)):
+            if panel['seeded']:
+                _plot_seed_metric_on_ax(
+                    ax,
+                    panel['df'],
+                    orchs,
+                    colors,
+                    markers,
+                    panel['value_col'],
+                    panel['ylabel'],
+                    panel['x_kwargs']['xlabel'],
+                )
+            else:
+                _plot_metric_on_ax(
+                    ax,
+                    panel['df'],
+                    orchs,
+                    colors,
+                    markers,
+                    panel['value_col'],
+                    panel['ylabel'],
+                    adjusted=False,
+                    show_error=False,
+                    estimator=panel['estimator'],
+                    **panel['x_kwargs'],
+                )
             ax.annotate(
                 f'({chr(ord("a") + i)})',
                 xy=(0.5, 0.0),
@@ -148,16 +285,22 @@ def plot_row(
                 fontsize=plt.rcParams['axes.labelsize'],
             )
         sns.despine(fig=fig)
-        # The shift sweep lacks FedProto/FedMuscle, so no single panel
-        # carries every orchestrator.
-        by_label = {}
-        for ax in axes:
-            for handle, label in zip(*ax.get_legend_handles_labels()):
-                by_label.setdefault(label, handle)
-        labels = [
-            ORCH_LABELS.get(o, o) for o in orchs if ORCH_LABELS.get(o, o) in by_label
+        # Built from the style maps rather than scraped off an axis: the
+        # seeded panels draw through seaborn with legend=False, and no single
+        # panel carries every orchestrator anyway.
+        labels = [ORCH_LABELS.get(o, o) for o in orchs]
+        handles = [
+            Line2D(
+                [],
+                [],
+                color=colors[o],
+                marker=markers[o],
+                linestyle='-',
+                linewidth=plt.rcParams['lines.linewidth'],
+                markersize=plt.rcParams['lines.markersize'],
+            )
+            for o in orchs
         ]
-        handles = [by_label[label] for label in labels]
 
         if legend == 'c':
             # Private accuracy saturates near 1 from d=64 on: extend the axis
@@ -256,6 +399,17 @@ def main() -> None:
         help='Output file stem; "_legend_<variant>.png/.pdf" is appended.',
     )
     parser.add_argument(
+        '--seeds',
+        nargs='+',
+        type=int,
+        default=[1, 2, 3],
+        help='Seeds averaged in the shift panels (error bars are computed '
+        'over them). Seed 42 is excluded by default: for every method but '
+        'SheafFRL its only runs are the July 2026 ones, made with the code '
+        'as it was before the SheafFRL/alignment rewrite, so pooling it with '
+        'the current seeds would mix two code vintages.',
+    )
+    parser.add_argument(
         '--legend',
         nargs='+',
         choices=_LEGEND_VARIANTS,
@@ -284,31 +438,37 @@ def main() -> None:
     b_runs = drop_excluded_orchs(
         {(o, d): m for (o, d), m in b_runs.items() if d >= 16}
     )
-    print(f'Scanning {entity}/{args.shift_project!r} …')
+    seeds = sorted(set(args.seeds))
+    print(f'Scanning {entity}/{args.shift_project!r} (seeds {seeds}) …')
     s_runs = drop_excluded_orchs(
-        discover_runs_remote(api, entity, args.shift_project, None)
+        discover_shift_runs_by_seed(api, entity, args.shift_project, seeds)
     )
     if args.shift_extra_project.lower() != 'none':
         extra_entity, _, extra_project = args.shift_extra_project.rpartition('/')
         extra_entity = extra_entity or entity
+        keep = set(args.shift_extra_orchs) or None
         print(f'Scanning {extra_entity}/{extra_project!r} (extra) …')
         extra = drop_excluded_orchs(
-            discover_runs_remote(api, extra_entity, extra_project, None)
+            discover_shift_runs_by_seed(
+                api, extra_entity, extra_project, seeds, orchs=keep
+            )
         )
-        keep = set(args.shift_extra_orchs)
         added = 0
         for key, meta in extra.items():
-            if keep and key[0] not in keep:
-                continue
             if key in s_runs:  # the main project wins on overlap
                 continue
             s_runs[key] = meta
             added += 1
-        print(f'  merged {added} extra runs ({sorted(keep) or "all orchs"})')
+        print(f'  merged {added} extra runs ({sorted(keep) if keep else "all orchs"})')
+    per_cell = {}
+    for orch, shift, seed in s_runs:
+        per_cell.setdefault(orch, set()).add(seed)
+    for orch in sorted(per_cell):
+        print(f'  {orch}: seeds {sorted(per_cell[orch])}')
     if not b_runs or not s_runs:
         raise SystemExit('No completed runs found for one of the two sweeps.')
 
-    orchs = _ordered_orchs({o for o, _ in b_runs} | {o for o, _ in s_runs})
+    orchs = _ordered_orchs({o for o, _ in b_runs} | {o for o, _, _ in s_runs})
     colors, markers, _ = _style_maps(orchs)
     print(f'Orchestrators: {orchs}')
 
@@ -318,8 +478,12 @@ def main() -> None:
     b_priv = _agent_metric_long_df(
         b_runs, _AGENT_PRIV_RE, 'private_task_perf', x_col='bottleneck_dim'
     )
-    s_comm = _agent_metric_long_df(s_runs, _AGENT_COMM_RE, 'comm_task_perf')
-    s_priv = _agent_metric_long_df(s_runs, _AGENT_PRIV_RE, 'private_task_perf')
+    s_comm = seed_metric_df(
+        s_runs, _AGENT_COMM_RE, 'comm_task_perf', 'weighted_mean'
+    )
+    s_priv = seed_metric_df(
+        s_runs, _AGENT_PRIV_RE, 'private_task_perf', 'mean'
+    )
 
     bottleneck_x = {
         'x_col': 'bottleneck_dim',
@@ -330,11 +494,23 @@ def main() -> None:
     shift_x = {'x_col': 'shift', 'xlabel': 'Distribution shift strength'}
     # (df, value_col, ylabel, estimator, x kwargs) — estimators match the
     # source scripts' defaults (degree-weighted comm mean on the graph sweep).
+    def panel(df, value_col, ylabel, estimator, x_kwargs, seeded):
+        return {
+            'df': df,
+            'value_col': value_col,
+            'ylabel': ylabel,
+            'estimator': estimator,
+            'x_kwargs': x_kwargs,
+            'seeded': seeded,
+        }
+
+    # Only the shift sweep has been repeated over seeds, so only (a)/(b) get
+    # error bars; the bottleneck panels stay single-curve.
     panels = [
-        (s_priv, 'private_task_perf', 'Avg. private accuracy', 'mean', shift_x),
-        (s_comm, 'comm_task_perf', 'Avg. communication accuracy', 'weighted_mean', shift_x),
-        (b_priv, 'private_task_perf', 'Avg. private accuracy', 'mean', bottleneck_x),
-        (b_comm, 'comm_task_perf', 'Avg. communication accuracy', 'mean', bottleneck_x),
+        panel(s_priv, 'private_task_perf', 'Avg. private accuracy', 'mean', shift_x, True),
+        panel(s_comm, 'comm_task_perf', 'Avg. communication accuracy', 'weighted_mean', shift_x, True),
+        panel(b_priv, 'private_task_perf', 'Avg. private accuracy', 'mean', bottleneck_x, False),
+        panel(b_comm, 'comm_task_perf', 'Avg. communication accuracy', 'mean', bottleneck_x, False),
     ]
 
     sns.set_theme(style='whitegrid', context='paper', font_scale=1.4)

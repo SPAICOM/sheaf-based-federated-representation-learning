@@ -1,0 +1,13 @@
+# (i, harsh) Setup (i) with a stronger blur (9x9 Gaussian, sigma 2) and label shift 0.8.
+defaults:
+  - cifar10_2agents_grayblur
+  - _self_
+
+study_name: "CIFAR-10 2 agents grayscale vs blur (harsh)"
+logger:
+  project: cifar10_2agents_grayblur_harsh
+
+dataset:
+  shift_strength: 0.8
+  agent_input_noise:
+    1: {type: blur, kernel_size: 9, sigma: 2.0}

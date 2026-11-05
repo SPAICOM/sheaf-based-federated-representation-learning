@@ -12,6 +12,7 @@ multiple federated learning agents:
 - DFedU: decentralized federated multitask learning with Laplacian updates
 - SheafFMTL: sheaf multitask learning in parameter space
 - SheafFRL: sheaf-based FRL with latent alignment
+- DiSheafFRL: SheafFRL with a directed, decoder-confidence-gated sheaf penalty
 - ComFed: per-agent projection matrices aligning class prototypes in a shared latent space
 - SheafAlign: learnable edge projection matrices aligning class-conditional means
 - NonCooperativeLearning: independent local training baseline
@@ -39,6 +40,7 @@ from .sheaf_align import SheafAlign
 from .sheaf_cfrl import SheafCFRL
 from .sheaf_fmtl import SheafFMTL
 from .sheaf_frl import SheafFRL
+from .di_sheaf_frl import DiSheafFRL
 
 __all__ = [
     'ComFed',
@@ -57,5 +59,6 @@ __all__ = [
     'SheafCFRL',
     'SheafFMTL',
     'SheafFRL',
+    'DiSheafFRL',
     'CommEfficientFRL',
 ]

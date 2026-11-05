@@ -9,12 +9,19 @@ neighboring agents accurately.
 """
 
 import warnings
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.utils.data import ConcatDataset, Subset
 
+from src.communication.alignment_mixin import (
+    VALID_ALIGNMENT_METHODS,
+    VALID_WHITENING_SOURCES,
+    PostTrainingAlignmentMixin,
+    _check_posthoc_shrinkage,
+)
 from src.communication.whitening import (
     SWBNColouringLayer,
     SWBNWhiteningLayer,
@@ -22,6 +29,7 @@ from src.communication.whitening import (
     color,
     fit_alignment,
     latent_moments,
+    ledoit_wolf_shrinkage,
     whiten,
     whitening_from_moments,
 )
@@ -141,18 +149,32 @@ class SheafFRL(BaseOrchestrator):
         align_on_intersection: bool = False,
         edge_class_filter: str = 'union',
         learn_whitening: bool = True,
+        whitening: bool = True,
+        posthoc_whitening: bool = True,
         zca_refit_mode: str = 'exact',
         zca_refit_source: str = 'train',
         zca_fit_max_samples: int = 8192,
         zca_ema_momentum: float = 0.0,
         whitening_eps_rel: float = 1e-4,
         whitening_eps_abs: float = 0.0,
-        whitening_shrinkage: float = 0.0,
+        whitening_shrinkage: float | str = 0.0,
         penalty_norm: str = 'dim',
         learn_lmb: bool = False,
         dual_rho: float = 0.1,
         dual_lr: float = 0.01,
         dual_lmb_max: float = 100.0,
+        eval_alignment: str = 'posthoc',
+        alignment_method: str = 'procrustes',
+        whitening_source: str = 'pilots',
+        posthoc_whitening_shrinkage: float | str = 'auto',
+        pilot_bn_mode: str = 'running',
+        swbn_fit_source: str = 'pilots',
+        swbn_momentum: float = 0.95,
+        penalty_lr: float | None = None,
+        vicreg_vc: bool = False,
+        vicreg_var_coeff: float = 1.0,
+        vicreg_cov_coeff: float = 0.04,
+        vicreg_gamma: float = 1.0,
         **kwargs,
     ):
         super().__init__(
@@ -162,6 +184,40 @@ class SheafFRL(BaseOrchestrator):
             log_latent_diagnostics=log_latent_diagnostics,
             **kwargs,
         )
+        if str(eval_alignment) not in ('posthoc', 'learned'):
+            raise ValueError(
+                f"eval_alignment must be 'posthoc' or 'learned', got {eval_alignment!r}"
+            )
+        if str(alignment_method) not in VALID_ALIGNMENT_METHODS:
+            raise ValueError(
+                f'alignment_method must be one of {VALID_ALIGNMENT_METHODS}, '
+                f'got {alignment_method!r}'
+            )
+        _check_posthoc_shrinkage(posthoc_whitening_shrinkage)
+        if pilot_bn_mode not in ('running', 'frozen_batch', 'update'):
+            raise ValueError(
+                "pilot_bn_mode must be 'running', 'frozen_batch' or 'update', "
+                f'got {pilot_bn_mode!r}'
+            )
+        if str(whitening_source) not in VALID_WHITENING_SOURCES:
+            raise ValueError(
+                f'whitening_source must be one of {VALID_WHITENING_SOURCES}, '
+                f'got {whitening_source!r}'
+            )
+        if swbn_fit_source not in ('pilots', 'train'):
+            raise ValueError(
+                f"swbn_fit_source must be 'pilots' or 'train', got {swbn_fit_source!r}"
+            )
+        if not 0.0 <= float(swbn_momentum) < 1.0:
+            raise ValueError(
+                f'swbn_momentum is an EMA retention factor in [0, 1); got {swbn_momentum}'
+            )
+        if penalty_lr is not None and float(penalty_lr) <= 0.0:
+            raise ValueError(f'penalty_lr must be > 0 or None; got {penalty_lr}')
+        if float(vicreg_var_coeff) < 0 or float(vicreg_cov_coeff) < 0:
+            raise ValueError('vicreg_var_coeff and vicreg_cov_coeff must be >= 0')
+        if float(vicreg_gamma) <= 0:
+            raise ValueError(f'vicreg_gamma must be > 0; got {vicreg_gamma}')
 
         anchor_strategy = str(anchor_strategy)
         update_v_every_n_epochs = int(update_v_every_n_epochs)
@@ -210,10 +266,10 @@ class SheafFRL(BaseOrchestrator):
             )
         if int(zca_fit_max_samples) < 2:
             raise ValueError('zca_fit_max_samples must be at least 2')
-        if not 0.0 <= float(whitening_shrinkage) < 1.0:
+        if str(whitening_shrinkage) != 'auto' and not 0.0 <= float(whitening_shrinkage) < 1.0:
             raise ValueError(
                 'whitening_shrinkage is a Ledoit-Wolf shrinkage intensity '
-                f'towards (tr cov / d) I and must lie in [0, 1); got '
+                f"towards (tr cov / d) I: 'auto' or a float in [0, 1); got "
                 f'{whitening_shrinkage}. 0.0 disables it.'
             )
         edge_class_filter = str(edge_class_filter)
@@ -293,6 +349,9 @@ class SheafFRL(BaseOrchestrator):
         # Current step's whitened pilot-batch latents per node (grad intact):
         # (Z_whitened, y, sample_ids), consumed by the step-batch penalty path
         # (_edge_step_anchors) and cleared after every loss computation.
+        # Current step's RAW pilot-batch latents per node (grad intact), for
+        # the VICReg variance/covariance terms (vicreg_vc); cleared every step.
+        self._step_raw_pilot_latents: dict[int, torch.Tensor] = {}
         self._step_pilot_latents: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = {}
@@ -331,9 +390,11 @@ class SheafFRL(BaseOrchestrator):
         # `self.whitening_layers`.
         self.whitening_layers = nn.ModuleDict()
         self._colouring_layers: dict[str, SWBNColouringLayer] = {}
-        if bool(learn_whitening):
+        # whitening=False: no SWBN layers and no ZCA refit, so every whitening
+        # call is the identity and the penalty / maps act on the raw latents.
+        if bool(learn_whitening) and bool(whitening):
             for idx, d in latent_dims_int.items():
-                wl = SWBNWhiteningLayer(d)
+                wl = SWBNWhiteningLayer(d, momentum=float(swbn_momentum))
                 self.whitening_layers[str(idx)] = wl
                 self._colouring_layers[str(idx)] = SWBNColouringLayer(wl)
 
@@ -534,6 +595,68 @@ class SheafFRL(BaseOrchestrator):
         finally:
             layer.train(was_training)
 
+    @staticmethod
+    def _vicreg_variance(Z: torch.Tensor, gamma: float, eps: float = 1e-4) -> torch.Tensor:
+        """VICReg variance hinge: mean_j max(0, gamma - sqrt(Var(z_j) + eps))."""
+        std = torch.sqrt(Z.var(dim=0) + eps)
+        return torch.relu(gamma - std).mean()
+
+    @staticmethod
+    def _vicreg_covariance(Z: torch.Tensor) -> torch.Tensor:
+        """VICReg covariance term: sum of squared off-diagonal covariances / d."""
+        n, d = Z.shape
+        Zc = Z - Z.mean(dim=0)
+        C = (Zc.T @ Zc) / max(n - 1, 1)
+        off = C - torch.diag(torch.diagonal(C))
+        return off.pow(2).sum() / d
+
+    def _vicreg_vc_terms(self, prefix: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """VICReg variance + covariance regularisers on every agent's raw pilot latents.
+
+        With the sheaf penalty as VICReg's invariance term (each agent's
+        latent is one "view" of the shared pilot, related through the edge
+        map), these are the two anti-collapse terms VICReg applies to each
+        view (Bardes, Ponce & LeCun, ICLR 2022):
+            vicreg_var_coeff * sum_i v(Z_i) + vicreg_cov_coeff * sum_i c(Z_i).
+        They act on the raw encoder output, not the whitened latents (which
+        are standardised by construction), and are scaled by lambda together
+        with the sheaf penalty. Default weights keep VICReg's ratios
+        (invariance : variance : covariance = 25 : 25 : 1).
+        """
+        gamma = float(self.hparams.vicreg_gamma)
+        var_terms, cov_terms, logs = [], [], {}
+        for idx, Z in self._step_raw_pilot_latents.items():
+            Z = Z.float()
+            if Z.shape[0] < 2:
+                continue
+            v = self._vicreg_variance(Z, gamma)
+            c = self._vicreg_covariance(Z)
+            var_terms.append(v)
+            cov_terms.append(c)
+            logs[f'{prefix}/vicreg_var_agent_{idx}'] = v.detach()
+            logs[f'{prefix}/vicreg_cov_agent_{idx}'] = c.detach()
+        if not var_terms:
+            return torch.zeros((), device=self.device), logs
+        total = (
+            float(self.hparams.vicreg_var_coeff) * torch.stack(var_terms).sum()
+            + float(self.hparams.vicreg_cov_coeff) * torch.stack(cov_terms).sum()
+        )
+        logs[f'{prefix}/vicreg_vc'] = total.detach()
+        return total, logs
+
+    def _penalty_lr_ratio(self) -> float:
+        """penalty_lr / optimizer lr (1.0 when penalty_lr is unset)."""
+        penalty_lr = getattr(self.hparams, 'penalty_lr', None)
+        if penalty_lr is None:
+            return 1.0
+        return float(penalty_lr) / float(self.hparams.optimizer['lr'])
+
+    def _swbn_fits_on_train(self) -> bool:
+        """True when SWBN statistics are collected on the local training batches."""
+        return self._use_learnable_whitening() and (
+            str(getattr(self.hparams, 'swbn_fit_source', 'pilots')) == 'train'
+        )
+
     def _whiten_node_pilots(self, idx: int, A: torch.Tensor) -> torch.Tensor:
         """Whiten node ``idx``'s pilot latents **once per step**, updating SWBN.
 
@@ -544,6 +667,10 @@ class SheafFRL(BaseOrchestrator):
         statistics are never re-estimated from the (small, fixed) anchor sets.
         """
         if self._use_learnable_whitening():
+            if self._swbn_fits_on_train():
+                # Statistics come from the task batches (see _shared_eval);
+                # pilots only apply them.
+                return self._whiten_pilots_frozen(idx, A)
             return self.whitening_layers[str(idx)](A)
         op = self._whitening_ops.get(idx)
         if op is None:
@@ -589,6 +716,8 @@ class SheafFRL(BaseOrchestrator):
         the cross-agent evaluation would all silently run in raw, unnormalised
         latent coordinates.
         """
+        if not self.hparams.whitening:
+            return
         first_ready = int(self.hparams.warmup_epochs) + int(
             self.hparams.update_v_every_n_epochs
         )
@@ -1126,9 +1255,9 @@ class SheafFRL(BaseOrchestrator):
             if rows is not None:
                 pos = pos[rows]
             x = self._fetch_pilot_rows(node_idx, pos)
-        Z = self._apply_frozen_whitening(
-            node_idx, agent.encode(x.to(self.device))
-        )
+        with self._pilot_bn_context(agent):
+            latents = agent.encode(x.to(self.device))
+        Z = self._apply_frozen_whitening(node_idx, latents)
         y = cache[f'y_{side}']
         if rows is not None:
             y = y[rows]
@@ -1492,7 +1621,7 @@ class SheafFRL(BaseOrchestrator):
         # neighbour anchors keep the statistics they were exchanged under, and
         # V_e is still the map fit for that older frame.  Updating the own side
         # is free; correcting the other two would cost communication.
-        if not self._use_learnable_whitening():
+        if not self._use_learnable_whitening() and self.hparams.whitening:
             self._refit_zca_operators()
 
         # Whether to refresh the fixed anchor caches + alignment maps this
@@ -1637,7 +1766,9 @@ class SheafFRL(BaseOrchestrator):
         momentum = float(self.hparams.zca_ema_momentum)
         eps_rel = float(self.hparams.whitening_eps_rel)
         eps_abs = float(self.hparams.whitening_eps_abs)
-        shrinkage = float(self.hparams.whitening_shrinkage)
+        # 'auto' = Ledoit-Wolf intensity estimated per agent on each refit's
+        # latents (same estimator as the post-hoc eval's whitening).
+        shrink_cfg = self.hparams.whitening_shrinkage
         clamped: list[float] = []
         conds: list[float] = []
 
@@ -1651,6 +1782,11 @@ class SheafFRL(BaseOrchestrator):
 
             mean, cov, n = latent_moments(Z)
             second = cov + torch.outer(mean, mean)  # E[z z^T]
+            shrinkage = (
+                min(ledoit_wolf_shrinkage(Z), 0.999)
+                if str(shrink_cfg) == 'auto'
+                else float(shrink_cfg)
+            )
             n_eff = float(n)
 
             prev = self._zca_moments.get(idx)
@@ -1944,10 +2080,19 @@ class SheafFRL(BaseOrchestrator):
                 else None
             )
             latent_task = agent.encode(x_task)
+            decoder_in = latent_task
+            if prefix == 'train' and self._swbn_fits_on_train():
+                # swbn_fit_source='train': the training batch goes through the
+                # SWBN layer (this is where its running stats and W are
+                # updated) and is coloured back with the frozen running stats
+                # before the decoder. At eval the pair is the identity.
+                decoder_in = self._colouring_layers[idx_str](
+                    self.whitening_layers[idx_str](latent_task)
+                ).to(latent_task.dtype)
             y_hat = (
-                agent.decode_posterior(latent_task)
+                agent.decode_posterior(decoder_in)
                 if hasattr(agent, 'decode_posterior')
-                else agent.decoder(latent_task)
+                else agent.decoder(decoder_in)
             )
             outputs[idx_str] = (y_hat.detach(), y_task)
             if hasattr(agent, 'reconstruction_mse'):
@@ -1978,7 +2123,8 @@ class SheafFRL(BaseOrchestrator):
                 except ValueError:
                     pilots_available = False
                 else:
-                    pilot_latents = agent.encode(x_pilot)
+                    with self._pilot_bn_context(agent):
+                        pilot_latents = agent.encode(x_pilot)
                     # Whiten every node's pilots ONCE per step — this is the
                     # single place SWBN's online W / running-stat update
                     # happens (on the rotating pilot batch); every other
@@ -1986,6 +2132,8 @@ class SheafFRL(BaseOrchestrator):
                     # whitened latents feed the step-batch penalty path
                     # (_edge_step_anchors) for the non-'random' strategies.
                     Z_pilot_w = self._whiten_node_pilots(idx, pilot_latents)
+                    if getattr(self.hparams, 'vicreg_vc', False):
+                        self._step_raw_pilot_latents[idx] = pilot_latents
                     if sample_ids is not None:
                         self._step_pilot_latents[idx] = (
                             Z_pilot_w,
@@ -2017,9 +2165,18 @@ class SheafFRL(BaseOrchestrator):
             comm_weight=comm_weight,
             skip=in_warmup,
         )
+        vicreg_logs: dict[str, torch.Tensor] = {}
+        vc_term = 0.0
+        if (
+            getattr(self.hparams, 'vicreg_vc', False)
+            and not in_warmup
+            and self._step_raw_pilot_latents
+        ):
+            vc_term, vicreg_logs = self._vicreg_vc_terms(prefix)
         # Step-scoped state: drop our references so the autograd graph the
         # penalty holds internally is the only thing keeping them alive.
         self._step_pilot_latents.clear()
+        self._step_raw_pilot_latents.clear()
 
         # λ handling — fixed/scheduled: one global coefficient applied here;
         # dual (learn_lmb): every edge term already carries its own λ_e, and
@@ -2032,9 +2189,21 @@ class SheafFRL(BaseOrchestrator):
         else:
             lmb_coeff = self._effective_lambda_reg()
 
+        penalty_term = lmb_coeff * (sheaf_penalty + vc_term)
+        lr_ratio = self._penalty_lr_ratio()
+        if prefix == 'train' and lr_ratio != 1.0 and torch.is_tensor(penalty_term):
+            # Same value, gradient scaled by penalty_lr / lr: the optimizer
+            # then steps the penalty's gradient with lr penalty_lr and the
+            # task gradient with lr, on the same momentum buffer and cosine
+            # schedule. Under SGD this is the same as a second optimizer for
+            # the penalty term, and also the same as multiplying lambda by
+            # the ratio. Gradient clipping still acts on the sum.
+            penalty_term = (
+                lr_ratio * penalty_term + (1.0 - lr_ratio) * penalty_term.detach()
+            )
         total_loss = (
             total_task_loss
-            + lmb_coeff * sheaf_penalty
+            + penalty_term
             + comm_weight * after_comm_task_loss
         )
 
@@ -2046,6 +2215,7 @@ class SheafFRL(BaseOrchestrator):
             # evaluator (see evaluate_communication_accuracy below), so it is
             # directly comparable with the post-training-alignment baselines.
             f'{prefix}/sheaf_penalty': sheaf_penalty,
+            **vicreg_logs,
         }
         if comm_weight > 0.0:
             extra[f'{prefix}/after_comm_task_loss'] = after_comm_task_loss
@@ -2248,11 +2418,95 @@ class SheafFRL(BaseOrchestrator):
         ``{prefix}/sheaf_penalty`` (up to which pilot samples/whitening
         operator snapshot are current at evaluation time) and directly
         comparable across orchestrators.
+
+        With ``eval_alignment='posthoc'`` (the default, for learnable and
+        closed-form whitening alike) the learned whitening and restriction
+        maps are bypassed: the evaluation runs the non-cooperative baseline's
+        post-training procedure on the trained encoders (closed-form whitening
+        on ``whitening_source``, one ``alignment_method`` map per edge fitted
+        on the matched pilots), so communication accuracy, misalignment loss
+        and MRR are the exact quantities NonCooperativeLearning reports.
+        ``'learned'`` restores the evaluation through the learned operators.
         """
+        if self.hparams.get('eval_alignment', 'posthoc') == 'posthoc':
+            return self._evaluate_with_posthoc_alignment(dm, prefix=prefix)
         logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
         logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
         logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
         return logs
+
+    # Mixin methods that make up the post-training pipeline. During a posthoc
+    # evaluation they shadow SheafFRL's own (learned-operator) versions on the
+    # instance, so every evaluator downstream — comm accuracy, misalignment
+    # loss, MRR, whitening quality — goes through the post-hoc operators.
+    @contextmanager
+    def _pilot_bn_context(self, agent):
+        """BatchNorm behaviour for the extra train-mode pilot forward passes.
+
+        Every training step encodes the pilot batch after the task batch. Left
+        alone ('update'), BatchNorm folds that batch into its running stats
+        with momentum 0.1, so the stats the encoder is TESTED with end up
+        tracking the small, fixed, un-augmented pilot set instead of the
+        agent's own data. Measured (CIFAR-10, 2 agents, 128 pilots):
+        recomputing the BN stats on the train split lifted private test
+        accuracy 0.750 -> 0.877, i.e. the entire SheafFRL-vs-non-coop gap.
+
+            running      - BN normalises the pilots with its running stats
+                           and does not update them: pilot latents are the
+                           ones the encoder produces at test time (default)
+            frozen_batch - pilot-batch statistics, running stats untouched
+            update       - legacy behaviour
+        """
+        mode = str(getattr(self.hparams, 'pilot_bn_mode', 'running'))
+        bns = [
+            m for m in agent.modules()
+            if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training
+        ]
+        if mode == 'update' or not bns:
+            yield
+            return
+        saved = [m.momentum for m in bns]
+        for m in bns:
+            if mode == 'running':
+                m.eval()
+            else:
+                m.momentum = 0.0
+        try:
+            yield
+        finally:
+            for m, mom in zip(bns, saved):
+                m.train()
+                m.momentum = mom
+
+    _POSTHOC_METHODS = (
+        '_fit_alignment_maps',
+        'send_message',
+        '_cleanup_alignment',
+        '_whiten_own_latents',
+        '_directed_alignment_map',
+        '_comm_accuracy_with_fitted_maps',
+        '_posthoc_shrinkage',
+    )
+
+    def _evaluate_with_posthoc_alignment(
+        self, dm, prefix: str = 'test'
+    ) -> dict[str, float]:
+        import types
+
+        for name in self._POSTHOC_METHODS:
+            object.__setattr__(
+                self, name,
+                types.MethodType(getattr(PostTrainingAlignmentMixin, name), self),
+            )
+        try:
+            return dict(
+                PostTrainingAlignmentMixin.evaluate_communication_accuracy(
+                    self, dm, prefix=prefix
+                )
+            )
+        finally:
+            for name in self._POSTHOC_METHODS:
+                self.__dict__.pop(name, None)
 
     def on_test_epoch_end(self) -> None:
         super().on_test_epoch_end()

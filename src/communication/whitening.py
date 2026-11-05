@@ -252,6 +252,30 @@ def fit_whitening(
     )
 
 
+def ledoit_wolf_shrinkage(Z: torch.Tensor) -> float:
+    """Ledoit-Wolf (2004) optimal shrinkage intensity of cov(Z) towards (tr/d) I.
+
+    Closed form, no tuning: ``g = min(beta_bar, delta) / delta`` with
+    ``delta = ||S - mu I||_F^2`` (distance of the sample covariance ``S`` to
+    the scaled identity) and ``beta_bar = (1/n^2) sum_k ||x_k x_k^T - S||_F^2``
+    (variance of the estimate), where ``sum_k ||x_k x_k^T - S||_F^2 =
+    sum_k ||x_k||^4 - n ||S||_F^2``. ``g`` is large exactly when ``n`` is small
+    relative to ``d`` (the estimate is noisy), and vanishes as ``n -> inf``.
+    """
+    X = Z.double()
+    X = X - X.mean(dim=0, keepdim=True)
+    n, d = X.shape
+    if n < 2 or d == 0:
+        return 0.0
+    S = X.T @ X / n
+    mu = torch.trace(S) / d
+    delta = ((S - mu * torch.eye(d, dtype=S.dtype)) ** 2).sum()
+    if float(delta) <= 0.0:
+        return 0.0
+    beta_bar = ((X.pow(2).sum(dim=1) ** 2).sum() - n * (S**2).sum()) / n**2
+    return float((torch.clamp(beta_bar, min=0.0) / delta).clamp(max=1.0))
+
+
 def whiten(Z: torch.Tensor, op: WhiteningOp) -> torch.Tensor:
     dev = Z.device
     return (Z.float() - op.mean.to(dev)) @ op.W.to(dev)
@@ -499,8 +523,19 @@ def fit_procrustes(
     try:
         U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
     except RuntimeError:
-        C = C.cpu()
-        U, _S, W_T = torch.linalg.svd(C, full_matrices=False)
+        # gesdd can fail to converge when C has many (near-)repeated singular
+        # values, e.g. when the anchors were whitened on n ~ d pilots and both
+        # sides become near-orthonormal bases of the same subspace. Retry on
+        # CPU in float64, then with jitter scaled to ||C|| (the fixed 1e-6
+        # above is negligible once C is O(n)) to split the ties.
+        C64 = C.detach().cpu().double()
+        try:
+            U, _S, W_T = torch.linalg.svd(C64, full_matrices=False)
+        except RuntimeError:
+            scale = C64.norm() / max(min(C64.shape), 1) ** 0.5
+            C64 = C64 + torch.randn_like(C64) * 1e-6 * scale
+            U, _S, W_T = torch.linalg.svd(C64, full_matrices=False)
+        U, W_T = U.float(), W_T.float()
     return (U @ W_T).cpu()
 
 

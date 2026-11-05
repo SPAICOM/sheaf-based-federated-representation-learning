@@ -17,6 +17,7 @@ from src.communication.whitening import (
     fit_procrustes,
     fit_relative_alignment,
     fit_whitening,
+    ledoit_wolf_shrinkage,
     whiten,
 )
 from src.utils.anchors import select_paired_anchors
@@ -26,6 +27,17 @@ VALID_ALIGNMENT_METHODS = ('general', 'procrustes', 'relative')
 # classical post-hoc recipe; 'pilots' matches the SheafFRL/CESheafFRL SWBN
 # layers, which only ever see pilot rows.
 VALID_WHITENING_SOURCES = ('train', 'pilots', 'train+pilots')
+
+
+def _check_posthoc_shrinkage(value) -> None:
+    """Validate ``posthoc_whitening_shrinkage``: 'auto' or a float in [0, 1)."""
+    if value is None or str(value) == 'auto':
+        return
+    if not 0.0 <= float(value) < 1.0:
+        raise ValueError(
+            "posthoc_whitening_shrinkage must be 'auto' or a float in [0, 1), "
+            f'got {value!r}'
+        )
 
 
 class PostTrainingAlignmentMixin:
@@ -163,19 +175,41 @@ class PostTrainingAlignmentMixin:
                 num_workers=0,
                 collate_fn=_collate_x,
             )
+            # Fit on un-augmented images: augmentation is a train-time input
+            # perturbation, while the operator is applied to clean pilot/test
+            # latents (same convention as SheafFRL's ZCA refit).
+            parts = getattr(whiten_ds, 'datasets', [whiten_ds])
+            saved_transforms = [getattr(d, 'transform', None) for d in parts]
+            for d in parts:
+                if getattr(d, 'transform', None) is not None:
+                    d.transform = None
             was_training = agent.training
             agent.eval()
             Zs = []
-            for x_batch in loader:
-                Zs.append(
-                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
-                )
-            agent.train(was_training)
+            try:
+                for x_batch in loader:
+                    Zs.append(
+                        agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                    )
+            finally:
+                agent.train(was_training)
+                for d, t in zip(parts, saved_transforms):
+                    if t is not None:
+                        d.transform = t
 
             if Zs:
-                self._train_whitening_ops[idx] = fit_whitening(
-                    torch.cat(Zs, dim=0)
-                )
+                Z_fit = torch.cat(Zs, dim=0)
+                if getattr(self.hparams, 'posthoc_whitening', True):
+                    self._train_whitening_ops[idx] = fit_whitening(
+                        Z_fit, shrinkage=self._posthoc_shrinkage(Z_fit)
+                    )
+                else:
+                    # posthoc_whitening=false: identity operator, so the map
+                    # is fitted on (and applied to) the raw latents.
+                    d = Z_fit.shape[1]
+                    self._train_whitening_ops[idx] = WhiteningOp(
+                        mean=torch.zeros(d), W=torch.eye(d), C=torch.eye(d)
+                    )
 
         if not self._train_whitening_ops:
             return False
@@ -365,6 +399,26 @@ class PostTrainingAlignmentMixin:
 
         return any_fitted
 
+    def _posthoc_shrinkage(self, Z: torch.Tensor) -> float:
+        """Shrinkage intensity for the post-hoc whitening fit on ``Z``.
+
+        ``hparams.posthoc_whitening_shrinkage``: 0.0 = plain sample
+        covariance; a float in [0, 1) = fixed intensity; ``'auto'`` =
+        Ledoit-Wolf optimal intensity (default), computed per agent on its own fit rows.
+        Shrinking towards a scaled identity keeps the smallest eigenvalues
+        away from 0 when the number of fit rows is close to the latent
+        dimension, where the plain estimate amplifies noise.
+        """
+        value = getattr(self.hparams, 'posthoc_whitening_shrinkage', 'auto')
+        if value is None:
+            return 0.0
+        if str(value) == 'auto':
+            g = ledoit_wolf_shrinkage(Z)
+        else:
+            g = float(value)
+        # whitening_from_moments requires an intensity strictly below 1.
+        return min(max(g, 0.0), 0.999)
+
     @torch.no_grad()
     def send_message(
         self,
@@ -500,10 +554,21 @@ class PostTrainingAlignmentMixin:
             return logs
 
         if not self._fit_alignment_maps(dm):
-            return {}
+            # A graph without edges (e.g. a single agent) has nothing to align
+            # but still has private accuracy to report; anything else that
+            # leaves no fitted map keeps the old behaviour.
+            if any((getattr(self.hparams, 'neighbors', None) or {}).values()):
+                return {}
+            if not hasattr(self, '_alignment_maps'):
+                self._alignment_maps = {}
         try:
             logs = dict(self._comm_accuracy_with_fitted_maps(dm, prefix=prefix))
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
+            if prefix == 'test':
+                # In-sample counterpart: the same residual on the pilots the
+                # maps were fitted on.
+                logs.update(self.evaluate_misalignment_loss(
+                    dm, prefix='pilots', force_pilots=True))
             # Computed while the post-hoc whitening operators are still active
             # (before cleanup), same as the misalignment loss above.
             logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))

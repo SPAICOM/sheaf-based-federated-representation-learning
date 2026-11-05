@@ -545,4 +545,7 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == '__main__':
+    from src.utils.hydra_outputs import disable_hydra_outputs
+
+    disable_hydra_outputs()
     main()

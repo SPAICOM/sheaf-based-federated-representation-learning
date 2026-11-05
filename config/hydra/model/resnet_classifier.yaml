@@ -19,3 +19,4 @@ stem_pool: false
 weight_decay: 5e-4
 l1_reg: 0.0
 sparsity_type: l1
+latent_norm: false   # CenterNorm at the bottleneck: (z - mean) / ||z - mean||

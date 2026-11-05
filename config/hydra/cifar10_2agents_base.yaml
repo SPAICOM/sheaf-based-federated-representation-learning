@@ -1,0 +1,127 @@
+# Shared base for the 2-agent CIFAR-10 heterogeneity study. Not run directly:
+# pick one of the setup configs, which only set the heterogeneity knobs.
+#
+#   cifar10_2agents_grayblur  (i)   agent 0 grayscale, agent 1 Gaussian blur, shift 0.4
+#   cifar10_2agents_crops     (ii)  agent 0 grayscale centre zoom, agent 1 periphery only, shift 0.4
+#   cifar10_2agents_shift     (iii) clean images, label shift 0.8
+#
+# Data (overlapping_shift):
+#   * train  = each agent draws from the official train split with
+#              P_i(y) = s*Unif{C_i} + (1-s)*Unif{all 10} (C_0={0,1,2}, C_1={5,6,7});
+#              the draws overlap; agent_train_samples: max = largest feasible draw
+#   * test   = the full official test split, same 10k rows for both agents
+#   * pilots = rows BOTH agents hold in train (pilot_source: intersection),
+#              subsampled to dataset.pilot_num_samples (null = all of them).
+#              Pilots stay in the training sets, so non-coop training does not
+#              depend on the pilot budget (one run + scripts/pilot_count_sweep.py
+#              covers every budget). Each agent sees its pilots, train and test
+#              images through its own corruption (dataset.agent_input_noise).
+#
+# Orchestrators: orchestrator=non_cooperative (default) | sheaf_frl (SWBN
+# whitening) | sheaf_frl_zca (closed-form ZCA whitening). Commands: README, "Two heterogeneous agents on CIFAR-10".
+defaults:
+  - dataset: hetero_cifar10
+  - model: resnet_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd_cosine
+  - _self_
+
+seed: 42
+study_name: "CIFAR-10 2 agents"
+
+# Lambda search, only read by SheafFRL. Off: lambda is orchestrator.max_lmb.
+# Turn on with lmb_study.enabled=true (7-point log grid on [1e-3, 1], 25 epochs
+# each, ranked by comm accuracy on a 10% holdout of the training data).
+lmb_study:
+  enabled: false
+  efficient: false
+  sampler: grid
+  objective: comm
+  n_trials: 7
+  n_tune_epochs: 25
+  lmb_low: 1e-3
+  lmb_high: 1
+  val_split: 0.1
+
+graph:
+  neighbors_mode: "fully_connected"   # 2 agents -> 1 edge
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: cifar10_2agents
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 40
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch
+
+dataset:
+  split_strategy: overlapping_shift
+  test_source: original
+  pilot_source: intersection
+  n_agents: 2
+  shift_strength: 0.4
+  agent_train_samples: max
+  val_split: 0.0
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 6
+  mode: min_size
+  pilot_split: 0.0
+  pilot_num_samples: null    # null = whole intersection (non-coop); set 128 / 2048 for SheafFRL
+  pilot_batch_size: 128      # pilot rows per SheafFRL training step
+  pilot_exclusive: false     # required by pilot_source: intersection
+  comm_data: shared_global_pilots
+  agent_input_noise: null    # set by the setup configs
+  groups:
+    0:
+      agents: [0]
+      target_classes: [0, 1, 2]
+    1:
+      agents: [1]
+      target_classes: [5, 6, 7]
+
+model:
+  decoder_hidden_dims: [256]
+  dropout: 0.0
+  weight_decay: 0.0          # L2 already applied by the optimizer (5e-4)
+  agents:
+    0:   # ResNet-10, 4 stages x 1 block, d=512
+      encoder_hidden_dims: [64, 128, 256, 512]
+      blocks_per_stage: [1, 1, 1, 1]
+      stage_strides: [1, 2, 2, 2]
+    1:   # 3 stages x 2 blocks, d=256
+      encoder_hidden_dims: [64, 128, 256]
+      blocks_per_stage: [2, 2, 2]
+      stage_strides: [1, 2, 2]
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  alignment_method: procrustes
+  max_lmb: 1e-2              # SheafFRL penalty weight (ignored by non_cooperative)
+  learn_lmb: false
+  comm_task_coeff: 0         # keep 0: it would optimise the evaluation metric directly
+  # Whitening statistics are fitted on the pilots, the rows the alignment is
+  # fitted on. 'train' fits them on each agent's training set instead; under
+  # label shift that costs ~28pt comm accuracy on grayblur_harsh (README).
+  whitening_source: pilots   # post-hoc (non-coop and SheafFRL evaluation)
+  swbn_fit_source: pilots    # sheaf_frl (SWBN): stats from the per-step pilot batch
+  zca_refit_source: pilots   # sheaf_frl_zca: epoch-end ZCA refit on the pilots
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

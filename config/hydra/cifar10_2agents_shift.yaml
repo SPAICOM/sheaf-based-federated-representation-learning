@@ -1,0 +1,12 @@
+# (iii) Label shift only: clean images for both agents, shift 0.8
+# (each agent's training draw is 80% from its own 3 target classes).
+defaults:
+  - cifar10_2agents_base
+  - _self_
+
+study_name: "CIFAR-10 2 agents shift 0.8"
+logger:
+  project: cifar10_2agents_shift
+
+dataset:
+  shift_strength: 0.8

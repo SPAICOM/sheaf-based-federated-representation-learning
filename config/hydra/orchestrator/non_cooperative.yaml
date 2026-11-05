@@ -27,7 +27,15 @@ num_anchors: 128
 #            runs, or the comparison confounds the alignment map with where the
 #            normalisation statistics came from. (learn_whitening=false runs fit
 #            their ZCA on TRAINING latents, so 'train' is their matched setting.)
-whitening_source: train
+whitening_source: pilots   # fit the post-hoc whitening on the PILOT split,
+posthoc_whitening: true   # false = no post-hoc whitening: the map is fitted on raw latents
+posthoc_whitening_shrinkage: auto # post-hoc whitening shrinkage towards (tr/d) I: 0.0 off,
+                                  # float in [0,1) fixed, 'auto' = Ledoit-Wolf per agent
+                           # matching where SheafFRL/CESheafFRL SWBN layers get
+                           # their statistics. 'train' (the classical post-hoc
+                           # recipe) confounds the alignment map with the
+                           # normalisation source and is worth ~+9pt to whoever
+                           # gets pilots; keep both sides on pilots to compare.
 protos_per_class: 1
 anchor_parseval_normalize: null  # Parseval-prewhiten each side's anchor frame.
                                  # null = auto (True for 'relative', False for

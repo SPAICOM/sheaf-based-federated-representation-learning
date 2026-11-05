@@ -1,0 +1,10 @@
+# SheafFRL with a directed sheaf penalty (src/orchestrators/di_sheaf_frl.py): per pilot
+# row the agent whose own decoder is more confident leads (its latents are a frozen
+# target) and the other agent aligns to it; gate a = sigmoid((c_i - c_j) / tau).
+defaults:
+  - sheaf_frl
+  - _self_
+
+_target_: src.orchestrators.DiSheafFRL
+gate_score: zlogit       # 'zlogit' (max logit z-scored over the batch) | 'softmax' (max softmax prob; saturates, weak gate)
+gate_temperature: 0.1    # tau; -> 0 gives hard routing

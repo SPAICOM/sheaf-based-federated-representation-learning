@@ -27,6 +27,7 @@ class ResNetClassifier(PersonalizedClassifier):
         stem_kernel_size: int = 3,
         stem_stride: int = 1,
         stem_pool: bool = False,
+        latent_norm: bool = False,
     ):
         encoder = ResNetEncoder(
             in_features=in_features,
@@ -52,4 +53,5 @@ class ResNetClassifier(PersonalizedClassifier):
             weight_decay=weight_decay,
             l1_reg=l1_reg,
             sparsity_type=sparsity_type,
+            latent_norm=latent_norm,
         )

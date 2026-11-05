@@ -12,7 +12,44 @@ dual_rho: 0.1        # tolerated fraction of the unaligned residual energy, in (
 dual_lr: 0.01        # per-step dual-ascent rate on the normalised violation
 dual_lmb_max: 100.0  # safety cap per multiplier (guards genuinely infeasible edges)
 anchor_strategy: pilots
+# Test/monitoring evaluation (comm accuracy, misalignment loss, MRR):
+#   posthoc — run the non-cooperative post-training pipeline on the trained
+#             encoders (closed-form whitening on whitening_source + one
+#             alignment_method map per edge on the matched pilots), so the
+#             metrics are exactly NonCooperativeLearning's; default for both
+#             learn_whitening values.
+#   learned — evaluate through the learned whitening / restriction maps.
+eval_alignment: posthoc
+alignment_method: procrustes   # posthoc map type ('general' | 'procrustes' | 'relative')
+whitening_source: pilots       # posthoc whitening source ('train' | 'pilots' | 'train+pilots')
+posthoc_whitening_shrinkage: auto # post-hoc whitening shrinkage towards (tr/d) I: 0.0 off,
+                                  # float in [0,1) fixed, 'auto' = Ledoit-Wolf per agent
+pilot_bn_mode: running  # BatchNorm in the per-step pilot passes: running (use the
+                        # running stats, don't update them) | frozen_batch |
+                        # update (legacy: the pilot batch contaminates the
+                        # running stats -> ~6-13pt private-acc loss at test)
+whitening: True        # False = no whitening during training (no SWBN, no ZCA): penalty and maps on raw latents
+posthoc_whitening: True # False = the posthoc evaluation map is fitted on raw latents too
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA
+swbn_fit_source: pilots # where SWBN collects its statistics (learn_whitening: True):
+                        #   pilots — updated on the per-step pilot batch
+                        #   train  — updated on the agent's own training batches,
+                        #            which go encoder -> whiten -> colour (frozen
+                        #            running stats) -> decoder; pilots only apply them
+swbn_momentum: 0.95     # EMA retention of the SWBN running mean/var (learn_whitening: True)
+penalty_lr: null        # learning rate of the sheaf-penalty gradient; null = the optimizer lr.
+                        # Shares the momentum buffer and cosine schedule, so under SGD
+                        # it acts like lambda * penalty_lr / lr
+# VICReg-style anti-collapse terms (Bardes, Ponce & LeCun 2022). The sheaf
+# penalty plays VICReg's invariance term between the agents' "views" of a pilot;
+# these add, for every agent, a variance hinge and a covariance term on its raw
+# pilot latents, scaled by lambda with the penalty:
+#   lambda * (sheaf + vicreg_var_coeff * sum_i v(Z_i) + vicreg_cov_coeff * sum_i c(Z_i))
+# Default weights keep VICReg's 25 : 25 : 1 ratio.
+vicreg_vc: false
+vicreg_var_coeff: 1.0
+vicreg_cov_coeff: 0.04
+vicreg_gamma: 1.0       # target std per latent dimension
 
 # ── Closed-form (ZCA) whitening — only read when learn_whitening: False ───────
 zca_refit_mode: exact      # where the epoch-end fit gets its latents:
@@ -32,6 +69,10 @@ zca_refit_source: train    # where the closed-form whitening statistics come fro
                            #                  own data. Pair with model.pilot_loss_weight > 0
                            #                  so the pilots are also SUPERVISED, and with the
                            #                  baseline's orchestrator.whitening_source=train+pilots.
+whitening_shrinkage: 0.0  # closed-form ZCA shrinkage towards (tr/d) I: 0.0 off,
+                          # float in [0,1) fixed, 'auto' = Ledoit-Wolf per refit
+                          # (pair zca_refit_source: pilots + auto to train in the
+                          # exact frame the posthoc eval whitens in)
 zca_fit_max_samples: 8192  # per-agent rows re-encoded per refit (exact mode);
                            # redrawn every epoch, so a run still covers the
                            # whole split

@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image as _PILImage
 from torchvision.transforms.functional import to_tensor as _pil_to_tensor
 
@@ -81,6 +82,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         pid_hidden_dim: int = 32,
         pid_embed_dim: int = 10,
         eval_on_class_intersection: bool = False,
+        train_comm_eval_every_n_epochs: int = 1,
         **kwargs: Any,
     ):
         super().__init__()
@@ -1381,6 +1383,13 @@ class BaseOrchestrator(l.LightningModule, ABC):
         dm = getattr(self.trainer, 'datamodule', None)
         if dm is None:
             return
+        # Monitoring only (re-encodes the test split and the pilots): with
+        # train_comm_eval_every_n_epochs > 1 it runs every n epochs and on
+        # the last one.
+        every = int(getattr(self.hparams, 'train_comm_eval_every_n_epochs', 1))
+        epoch = int(self.current_epoch) + 1
+        if every > 1 and epoch % every and epoch != int(self.trainer.max_epochs):
+            return
         logs = self.evaluate_communication_accuracy(dm, prefix='train')
         keep = {
             key: value
@@ -1429,7 +1438,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     @torch.no_grad()
     def evaluate_misalignment_loss(
-        self, dm, prefix: str = 'test'
+        self, dm, prefix: str = 'test', force_pilots: bool = False
     ) -> dict[str, float]:
         """Cross-agent coboundary misalignment loss on matched pilot pairs.
 
@@ -1466,11 +1475,38 @@ class BaseOrchestrator(l.LightningModule, ABC):
         These live under the ``pilots/`` group since they are measured on the
         pilot set, not the test split.
 
+        When the datamodule flags a **shared test set** (``dm.shared_test_set``:
+        every agent holds the same test samples, matched by ``sample_ids``),
+        both metrics are measured on those held-out test rows instead of the
+        pilots. The pilots are what post-hoc maps are fitted on, so with
+        ``n_pilots <= d`` an orthogonal map matches them exactly and the
+        in-sample loss/MRR are trivially ~0/~1. MRR is then logged as
+        ``{prefix}/mrr_edge_{i}_{j}`` / ``{prefix}/mean_reciprocal_rank`` (and
+        only for ``prefix='test'``: ranking every test row against every
+        other is too costly for per-epoch monitoring).
+
+        ``force_pilots=True`` always scores on the pilots (the rows the maps
+        are fitted on), whatever ``dm.shared_test_set`` says; call it with
+        ``prefix='pilots'`` to log the in-sample counterpart of the test
+        misalignment.
+
+        Also logs the effective rank of each agent's raw latents on the
+        scored rows (``{group}/effective_rank_agent_{i}``).
+
         Returns a dict of metric name → value; the caller logs it.
         """
-        pilot_datasets = getattr(dm, 'pilot_datasets', None)
+        shared_test = (
+            not force_pilots
+            and bool(getattr(dm, 'shared_test_set', False))
+            and bool(getattr(dm, 'test_datasets', None))
+        )
+        pilot_datasets = (
+            dm.test_datasets if shared_test else getattr(dm, 'pilot_datasets', None)
+        )
         if not pilot_datasets:
             return {}
+        mrr_group = prefix if shared_test else 'pilots'
+        compute_mrr = prefix == 'test' or not shared_test
 
         # Labels are needed only for the intersection-class scoping below.
         scope_intersection = getattr(
@@ -1532,6 +1568,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if not pilot_Z:
             return {}
 
+        logs: dict[str, float] = {
+            f'{mrr_group}/effective_rank_agent_{idx}': self._effective_rank(Z)
+            for idx, Z in pilot_Z.items()
+        }
+
         neighbors_map: dict[int, set[int]] = {
             int(k): {int(n) for n in v}
             for k, v in self.hparams.neighbors.items()
@@ -1541,7 +1582,6 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         per_receiver_energy: dict[int, list[float]] = {}
         per_edge_mrr: list[float] = []
-        logs: dict[str, float] = {}
         for sender_idx, receiver_set in neighbors_map.items():
             if sender_idx not in pilot_Z:
                 continue
@@ -1650,20 +1690,25 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 # instance identity in whitened space — decoder-free, so unlike
                 # the decoder-floored comm accuracy it tracks the coboundary.
                 n_rows = int(diff.shape[0])
-                if n_rows >= 2:
-                    a = torch.nn.functional.normalize(Z_i_to_j, dim=1)
-                    b = torch.nn.functional.normalize(Z_j_w, dim=1)
-                    sim = (
-                        a @ b.T
-                    )  # (n, n): transported sender row vs receiver rows
-                    correct = sim.diagonal().unsqueeze(1)
-                    # rank = 1 + #{receiver rows strictly more similar than the match}
-                    ranks = (sim >= correct).sum(dim=1).clamp(min=1)
+                if n_rows >= 2 and compute_mrr:
+                    a = torch.nn.functional.normalize(
+                        Z_i_to_j.to(self.device), dim=1
+                    )
+                    b = torch.nn.functional.normalize(Z_j_w.to(self.device), dim=1)
+                    # Chunked over sender rows so a 10k-row shared test set
+                    # never materialises the full (n, n) similarity matrix.
+                    ranks = []
+                    for start in range(0, n_rows, 1024):
+                        sim = a[start:start + 1024] @ b.T
+                        rows = torch.arange(sim.shape[0], device=sim.device)
+                        correct = sim[rows, rows + start].unsqueeze(1)
+                        # rank = 1 + #{receiver rows strictly more similar than the match}
+                        ranks.append((sim >= correct).sum(dim=1).clamp(min=1))
+                    ranks = torch.cat(ranks)
                     mrr = float((1.0 / ranks.float()).mean().item())
-                    # MRR is a *pilot-set* retrieval metric — namespaced under
-                    # 'pilots/' (not the {prefix} test/train group) to reflect
-                    # the data it is measured on.
-                    logs[f'pilots/mrr_edge_{sender_idx}_{receiver_idx}'] = mrr
+                    # Namespaced by the data it is measured on: 'pilots/' for
+                    # the pilot set, the {prefix} group for the shared test set.
+                    logs[f'{mrr_group}/mrr_edge_{sender_idx}_{receiver_idx}'] = mrr
                     per_edge_mrr.append(mrr)
 
         all_vals = [v for vs in per_receiver.values() for v in vs]
@@ -1675,7 +1720,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
             # compare THIS against the training penalty, not the line above.
             logs[f'{prefix}/misalignment_energy'] = sum(all_e) / len(all_e)
         if per_edge_mrr:
-            logs['pilots/mean_reciprocal_rank'] = sum(per_edge_mrr) / len(
+            logs[f'{mrr_group}/mean_reciprocal_rank'] = sum(per_edge_mrr) / len(
                 per_edge_mrr
             )
 
@@ -2287,12 +2332,27 @@ class BaseOrchestrator(l.LightningModule, ABC):
         dict[str, object]
             Dictionary containing the configured optimizer.
         """
-        optimizer = instantiate(
-            self.hparams.optimizer,
-            params=self.parameters(),
+        # Optional ``scheduler`` key in the optimizer config (stripped before
+        # instantiation): 'cosine' anneals the lr to 0 over trainer.max_epochs,
+        # stepped once per epoch. Absent/None keeps a constant lr.
+        opt_cfg = self.hparams.optimizer
+        if isinstance(opt_cfg, DictConfig):
+            opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)
+        opt_cfg = dict(opt_cfg)
+        scheduler = opt_cfg.pop('scheduler', None)
+        optimizer = instantiate(opt_cfg, params=self.parameters())
+        if scheduler is None:
+            return {'optimizer': optimizer}
+        if scheduler != 'cosine':
+            raise ValueError(
+                f"Unknown optimizer.scheduler {scheduler!r}; expected 'cosine'"
+            )
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(int(self.trainer.max_epochs), 1)
         )
         return {
             'optimizer': optimizer,
+            'lr_scheduler': {'scheduler': lr_scheduler, 'interval': 'epoch'},
         }
 
     # ── PID logging on training data ─────────────────────────────────────────

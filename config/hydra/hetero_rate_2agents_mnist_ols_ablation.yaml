@@ -1,0 +1,103 @@
+# OLS-vs-Procrustes restriction-map ablation for SheafFRL.
+#
+# Same 2-agent heterogeneous setup as the bottleneck study
+# (hetero_rate_2agents_mnist_hetero_bottleneck.yaml), pinned to the d=32
+# bottleneck. The only thing that varies between the two arms is how each
+# edge's restriction map is refit from the whitened pilot anchors:
+#   use_general_maps: false — orthogonal Procrustes, V = U W^T from SVD(Z_i^T Z_j)
+#   use_general_maps: true  — unconstrained (ridge 1e-4) OLS, Z_i V ≈ Z_j
+#                             (reverse direction uses pinv(V) instead of V^T)
+# λ is fixed and shared by both arms (Optuna off), so the map family is the
+# only difference; each arm is repeated over several seeds.
+defaults:
+  - dataset: hetero_mnist
+  - model: hetero_bottleneck_32
+  - orchestrator: sheaf_frl
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "HeteroRate MNIST 2 agents - OLS vs Procrustes maps (d=32)"
+
+optimizer:
+  lr: 0.01
+
+lmb_study:
+  enabled: false        # shared fixed λ: tuning per arm would confound the ablation
+  n_trials: 15
+  n_tune_epochs: 5
+  lmb_low: 1e-4
+  lmb_high: 1
+
+graph:
+  neighbors_mode: "fully_connected"
+  seed: 42
+  p: 0.15
+  m: 3
+  neighbors: {}
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: sfrl_ols_ablation
+  # one wandb group per arm; seed and map type are also in the run config
+  group: general_maps_${orchestrator.use_general_maps}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 20
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 25
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: step
+
+dataset:
+  split_strategy: grouped_non_iid
+  n_agents: 2
+  classes_per_agent: 10
+  shift_strength: 0.7
+  monitor_test_during_fit: true
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  pilot_split: 0.1
+  pilot_batch_size: 64
+  comm_data: shared_global_pilots
+  groups:
+    0:
+      agents: [0]
+      target_classes: [4, 5, 6, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 1, 2, 3, 4, 5]
+
+orchestrator:
+  pid_logging: false
+  parseval_normalization: false
+  l2_normalization: false
+  log_latent_diagnostics: true
+  warmup_epochs: 0
+  use_general_maps: false   # swept below
+  soft_maps: false          # maps are closed-form refits, never trained by SGD
+  align_on_intersection: false
+  alignment_method: procrustes  # unused by SheafFRL (post-hoc baselines only)
+  comm_task_coeff: 0
+  learn_lmb: false
+  max_lmb: 3.82e-3          # orchestrator/sheaf_frl.yaml default; override with orchestrator.max_lmb=...
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      orchestrator.use_general_maps: false, true
+      seed: 1, 2, 3, 4, 5

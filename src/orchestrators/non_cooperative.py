@@ -14,6 +14,7 @@ import torch.nn as nn
 from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
+    _check_posthoc_shrinkage,
 )
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 from src.utils.anchors import VALID_PAIRED_ANCHOR_SELECTIONS
@@ -52,6 +53,8 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         num_anchors: int = 128,
         protos_per_class: int = 1,
         anchor_parseval_normalize: bool | None = None,
+        posthoc_whitening_shrinkage: float | str = 'auto',
+        posthoc_whitening: bool = True,
         **kwargs,
     ):
         super().__init__(
@@ -75,6 +78,7 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
             raise ValueError('num_anchors must be at least 1')
         if int(protos_per_class) < 1:
             raise ValueError('protos_per_class must be at least 1')
+        _check_posthoc_shrinkage(posthoc_whitening_shrinkage)
         self.save_hyperparameters(ignore=['agents'])
 
     def on_train_epoch_end(self) -> None:

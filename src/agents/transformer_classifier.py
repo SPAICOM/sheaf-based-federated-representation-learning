@@ -71,6 +71,7 @@ class TransformerClassifier(PersonalizedClassifier):
         use_batchnorm: bool = False,
         weight_decay: float = 0.0,
         l1_reg: float = 0.0,
+        latent_norm: bool = False,
     ):
         encoder = ViTEncoder(
             in_features=in_features,
@@ -94,4 +95,5 @@ class TransformerClassifier(PersonalizedClassifier):
             use_batchnorm=use_batchnorm,
             weight_decay=weight_decay,
             l1_reg=l1_reg,
+            latent_norm=latent_norm,
         )

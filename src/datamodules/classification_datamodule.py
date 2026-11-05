@@ -12,6 +12,7 @@ Features:
 - Create train/val/test partitions
 """
 
+import copy
 from typing import Callable
 
 import lightning as l
@@ -22,6 +23,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from src.datamodules.input_noise import build_input_noise
 from src.datamodules.utils import (
     PairwiseDataset,
     compute_split_indices,
@@ -96,8 +98,12 @@ class ClassificationDataset(Dataset):
         rotation_angle: float = 0,
         sample_ids: list[int] | None = None,
         transform: Callable | None = None,
+        noise: Callable | None = None,
     ) -> None:
         self.dataset = hf_dataset
+        # Agent-specific input corruption, applied before ``transform`` and
+        # never switched off (see src/datamodules/input_noise.py).
+        self.noise = noise
         self.data_key = data_key
         self.label_key = label_key
         # Normalize rotation angle to [0, 360) range
@@ -133,8 +139,11 @@ class ClassificationDataset(Dataset):
         data = item[self.data_key]
         if isinstance(data, list):
             data = torch.tensor(data, dtype=torch.float32)
-        elif self.transform is not None:
-            data = self.transform(data)
+        else:
+            if self.noise is not None:
+                data = self.noise(data)
+            if self.transform is not None:
+                data = self.transform(data)
 
         # Extract label from specified column
         # Convert integer labels to long tensors for classification
@@ -267,7 +276,9 @@ class ClassificationDataModule(l.LightningDataModule):
         pilot_split: float = 0.0,
         pilot_num_samples: int | None = None,
         pilot_batch_size: int | None = None,
+        pilot_shuffle: bool = False,
         pilot_apply_agent_rotations: bool = False,
+        agent_input_noise: dict | None = None,
         comm_data: str = 'private_pilots',
         starve_clients: bool = False,
         seed: int = 42,
@@ -298,7 +309,17 @@ class ClassificationDataModule(l.LightningDataModule):
         self.pilot_batch_size = (
             batch_size if pilot_batch_size is None else pilot_batch_size
         )
+        # Reshuffle the pilot rows every epoch, with the same permutation for
+        # every agent (identically seeded samplers), so rows stay matched.
+        # Needed when the pilot split is larger than what an epoch consumes:
+        # an unshuffled loader restarts each epoch and only ever yields its
+        # first (train batches x pilot_batch_size) rows.
+        self.pilot_shuffle = bool(pilot_shuffle)
         self.pilot_apply_agent_rotations = pilot_apply_agent_rotations
+        # {agent: noise spec}; see src/datamodules/input_noise.py
+        self.agent_noise = {
+            int(k): build_input_noise(v) for k, v in (agent_input_noise or {}).items()
+        }
         _valid = ('private_pilots', 'shared_global_pilots', 'pairwise_pilots')
         if comm_data not in _valid:
             raise ValueError(
@@ -382,6 +403,7 @@ class ClassificationDataModule(l.LightningDataModule):
                 label_key,
                 rotation_angle=rotation,
                 sample_ids=pilot_indices,
+                noise=self.agent_noise.get(i),
             )
 
     def _filter_by_classes(
@@ -851,10 +873,17 @@ class ClassificationDataModule(l.LightningDataModule):
             dataset,
             target_num_samples,
         )
+        sampler = None
+        if self.pilot_shuffle:
+            sampler = torch.utils.data.RandomSampler(
+                repeated_dataset,
+                generator=torch.Generator().manual_seed(self.seed + 7919),
+            )
         return DataLoader(
             repeated_dataset,
             batch_size=self.pilot_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.num_workers,
             collate_fn=_collate_fn,
         )
@@ -889,9 +918,23 @@ class ClassificationDataModule(l.LightningDataModule):
                     }
                 )
             elif self.comm_data == 'shared_global_pilots':
-                loaders['global_pilot'] = self._make_pilot_loader(
-                    self.pilot_datasets[0], target_num_batches
-                )
+                shared = self.pilot_datasets[0]
+                if any(n is not None for n in self.agent_noise.values()):
+                    # One shared batch would show every agent the same pixels
+                    # (clean, or agent 0's corruption). Emit one loader per
+                    # agent over the SAME rows in the same order (pilot
+                    # loaders don't shuffle), each seen through that agent's
+                    # own corruption; orchestrators read 'global_pilot_{i}'.
+                    for i in datasets:
+                        view = copy.copy(shared)
+                        view.noise = self.agent_noise.get(i)
+                        loaders[f'global_pilot_{i}'] = self._make_pilot_loader(
+                            view, target_num_batches
+                        )
+                else:
+                    loaders['global_pilot'] = self._make_pilot_loader(
+                        shared, target_num_batches
+                    )
             elif self.comm_data == 'pairwise_pilots':
                 loaders.update(
                     {

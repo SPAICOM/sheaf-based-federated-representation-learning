@@ -16,6 +16,32 @@ from .utils import MLP
 _SPARSITY_TYPES = {'l1', 'sae-l1', 'l21'}
 
 
+class CenterNorm(nn.Module):
+    """Bottleneck normalisation: z -> (z - mu) / ||z - mu||.
+
+    Like BatchNorm1d without the affine part and with a per-sample scale:
+    mu is the batch mean in training and a running mean (same momentum
+    convention as BatchNorm) in eval; each centred vector is then divided by
+    its own L2 norm, so every latent lies on the unit sphere.
+    """
+
+    def __init__(self, dim: int, momentum: float = 0.1, eps: float = 1e-6):
+        super().__init__()
+        self.momentum = momentum
+        self.eps = eps
+        self.register_buffer('running_mean', torch.zeros(dim))
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.training and z.shape[0] > 1:
+            mu = z.mean(0)
+            with torch.no_grad():
+                self.running_mean.lerp_(mu.detach(), self.momentum)
+        else:
+            mu = self.running_mean
+        z = z - mu
+        return z / z.norm(dim=1, keepdim=True).clamp_min(self.eps)
+
+
 class PersonalizedClassifier(BaseAgent):
     """Classifier agent with an injected encoder backbone.
 
@@ -58,6 +84,10 @@ class PersonalizedClassifier(BaseAgent):
           L2 norm over the batch is computed, then summed across dimensions:
           sum_d ||Z[:, d]||_2.
         Defaults to ``"l1"``.
+    latent_norm : bool, optional
+        Append a :class:`CenterNorm` layer at the bottleneck: subtract the
+        batch (eval: running) mean and divide each latent by its L2 norm
+        (default: False).
     """
 
     def __init__(
@@ -73,6 +103,7 @@ class PersonalizedClassifier(BaseAgent):
         l1_reg: float = 0.0,
         sparsity_type: str = 'l1',
         pilot_loss_weight: float = 0.0,
+        latent_norm: bool = False,
     ):
         super().__init__()
         # >0 makes the shared pilots part of this agent's SUPERVISED task, not
@@ -91,6 +122,9 @@ class PersonalizedClassifier(BaseAgent):
 
         self._encoder = encoder
         self._pool = nn.AdaptiveAvgPool2d((1, 1))
+        # Optional bottleneck normalisation (CenterNorm): the latent the
+        # decoder and every alignment / communication path see.
+        self._latent_norm = CenterNorm(latent_dim) if latent_norm else None
         self._last_latent = None
         self._decoder = MLP(
             input_dim=latent_dim,
@@ -141,6 +175,8 @@ class PersonalizedClassifier(BaseAgent):
             features = self._pool(features)
 
         latent = features.flatten(1)
+        if self._latent_norm is not None:
+            latent = self._latent_norm(latent)
         self._last_latent = latent
         return latent
 

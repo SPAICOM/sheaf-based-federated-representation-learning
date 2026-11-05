@@ -1,0 +1,31 @@
+# Task heterogeneity: same images, different label granularity.
+#   agent 0: ResNet-10 (d=512), the 10 CIFAR-10 classes
+#   agent 1: plain CNN, no residuals (d=384), animate vs inanimate
+#            (0 = plane, car, ship, truck; 1 = bird, cat, deer, dog, frog, horse)
+# Clean images, no label shift: both agents draw from every class. Pilots = 2048
+# images both agents hold (all classes). Agent 1 keeps 10 outputs, only targets
+# 0/1 are trained; val/test/pilots keep the 10-class labels, so its logged
+# private/comm numbers are NOT meaningful: score with scripts/per_class_comm.py
+# --label-map 1:0,0,1,1,1,1,1,1,0,0. Control: dataset.agent_label_map=null.
+defaults:
+  - cifar10_2agents_base
+  - _self_
+
+study_name: "CIFAR-10 2 agents, 10 classes vs animate/inanimate"
+logger:
+  project: cifar10_2agents_coarse
+
+trainer:
+  max_epochs: 100
+
+dataset:
+  shift_strength: 0.0
+  pilot_num_samples: 2048
+  agent_label_map:
+    1: [0, 0, 1, 1, 1, 1, 1, 1, 0, 0]
+
+model:
+  agents:
+    1:
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [64, 128, 256, 384]

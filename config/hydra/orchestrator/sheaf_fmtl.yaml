@@ -25,3 +25,16 @@ pid_align_epochs: 10     # Neural-PID alignment epochs.
 pid_batch_size: 256      # Neural-PID mini-batch size.
 pid_hidden_dim: 32
 pid_embed_dim: 10
+
+# Where each agent's post-hoc whitening operator is estimated:
+#   train  - the full local training split (classical post-hoc recipe)
+#   pilots - the pilot split, i.e. the rows SheafFRL/CESheafFRL's SWBN layers
+#            see during training. Use this when comparing against a
+#            learn_whitening=true SheafFRL run, or the comparison confounds the
+#            alignment map with where the normalisation statistics came from.
+whitening_source: pilots   # fit the post-hoc whitening on the PILOT split,
+                           # matching where SheafFRL/CESheafFRL SWBN layers get
+                           # their statistics. 'train' (the classical post-hoc
+                           # recipe) confounds the alignment map with the
+                           # normalisation source and is worth ~+9pt to whoever
+                           # gets pilots; keep both sides on pilots to compare.

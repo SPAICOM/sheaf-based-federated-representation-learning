@@ -201,8 +201,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Claude
-.claude
+# Claude (private: agent config, instructions, research state, theory notes)
+.claude/
+CLAUDE.md
+state/
+refs/
 
 # Marimo
 marimo/_static/
@@ -244,3 +247,4 @@ results/
 
 # Config files - ignore hetero_cifar10 and rotated_mnist experiments
 config/hydra/rotated_mnist_anchor_sweep.yaml
+

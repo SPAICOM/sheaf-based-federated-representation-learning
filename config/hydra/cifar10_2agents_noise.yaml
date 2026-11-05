@@ -1,0 +1,113 @@
+# CIFAR-10, 2 heterogeneous agents observing the images through different
+# agent-specific corruptions (agent 0: grayscale, agent 1: Gaussian blur).
+#
+# Data (overlapping_shift, test_source: original):
+#   * test   = the official CIFAR-10 test split, all 10,000 images, the SAME
+#              rows for both agents, each seen through its own corruption
+#   * train  = each agent independently draws from the official train split
+#              with P_i(y) = s*Unif{C_i} + (1-s)*Unif{all 10}; draws overlap.
+#              agent_train_samples: max -> largest feasible draw at s
+#   * pilots = pilot_source: intersection -> the rows BOTH agents hold in
+#              their training split, subsampled to pilot_num_samples (null =
+#              the whole intersection). Pilots stay in the training sets, so
+#              training does not depend on the pilot budget: one trained pair
+#              of encoders serves every budget (scripts/pilot_count_sweep.py)
+defaults:
+  - dataset: hetero_cifar10
+  - model: resnet_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd_cosine
+  - _self_
+
+seed: 42
+study_name: "CIFAR-10 2 agents grayscale vs blur (intersection pilots)"
+
+lmb_study:
+  enabled: true         # only read by orchestrators with a lambda
+  efficient: false
+  sampler: grid
+  objective: comm
+  n_trials: 7
+  n_tune_epochs: 25
+  lmb_low: 1e-3
+  lmb_high: 1
+  val_split: 0.1
+
+graph:
+  neighbors_mode: "fully_connected"   # 2 agents -> 1 edge
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: cifar10_2agents_noise
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 60
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch
+
+dataset:
+  split_strategy: overlapping_shift
+  test_source: original
+  pilot_source: intersection
+  n_agents: 2
+  shift_strength: 0.4
+  agent_train_samples: max
+  val_split: 0.0
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 8
+  mode: min_size
+  pilot_split: 0.0
+  pilot_num_samples: null    # whole intersection; subsample with the sweep
+  pilot_batch_size: 128
+  pilot_exclusive: false     # required by pilot_source: intersection
+  comm_data: shared_global_pilots
+  agent_input_noise:
+    0: {type: grayscale}
+    1: {type: blur, kernel_size: 5, sigma: 1.0}
+  groups:
+    0:
+      agents: [0]
+      target_classes: [0, 1, 2]
+    1:
+      agents: [1]
+      target_classes: [5, 6, 7]
+
+model:
+  decoder_hidden_dims: [256]
+  dropout: 0.0
+  weight_decay: 0.0          # L2 already applied by the optimizer (5e-4)
+  agents:
+    0:   # ResNet-10, 4 stages x 1 block, d=512
+      encoder_hidden_dims: [64, 128, 256, 512]
+      blocks_per_stage: [1, 1, 1, 1]
+      stage_strides: [1, 2, 2, 2]
+    1:   # 3 stages x 2 blocks, d=256
+      encoder_hidden_dims: [64, 128, 256]
+      blocks_per_stage: [2, 2, 2]
+      stage_strides: [1, 2, 2]
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  alignment_method: procrustes
+  max_lmb: 1e-2
+  learn_lmb: false
+  comm_task_coeff: 0
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

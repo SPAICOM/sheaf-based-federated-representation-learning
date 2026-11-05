@@ -51,6 +51,7 @@ class CNNClassifier(PersonalizedClassifier):
         weight_decay: float = 0.0,
         l1_reg: float = 0.0,
         pilot_loss_weight: float = 0.0,
+        latent_norm: bool = False,
     ):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
@@ -74,4 +75,5 @@ class CNNClassifier(PersonalizedClassifier):
             weight_decay=weight_decay,
             l1_reg=l1_reg,
             pilot_loss_weight=pilot_loss_weight,
+            latent_norm=latent_norm,
         )

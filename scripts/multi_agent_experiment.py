@@ -39,7 +39,6 @@ import inspect
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +53,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from src.utils import remove_non_empty_dir
 from src.utils.graph_generator import generate_neighbors
+from src.utils.progress import StatusFileCallback
 
 # ── Orchestrators that support max_lmb and/or comm_task_coeff ─────────────────
 ORCHESTRATORS_WITH_LMB = {
@@ -247,6 +247,7 @@ def _build_agents(
             'CNNClassifier' in agent_type
             or 'TimmClassifier' in agent_type
             or 'TransformerClassifier' in agent_type
+            or 'ResNetClassifier' in agent_type
         ):
             latent_dims[i] = agents[i].encoder.out_features
         elif hasattr(agents[i], 'latent_dim'):
@@ -363,8 +364,15 @@ def tune_max_lmb(
     lmb_low: float = 1e-4,
     lmb_high: float = 10.0,
     agent_subset: list[int] | None = None,
-) -> float:
+    sampler: str = 'tpe',
+    objective_name: str = 'harmonic',
+) -> tuple[float, list[dict[str, float]]]:
     """Search for the best max_lmb using Optuna.
+
+    ``sampler='grid'`` evaluates exactly ``n_trials`` log-spaced values in
+    ``[lmb_low, lmb_high]`` instead of TPE. ``objective_name='comm'`` ranks
+    trials by the network-wide ``avg_comm_task_perf`` alone (every agent,
+    every edge) instead of its harmonic mean with task performance.
 
     Runs ``n_trials`` short training runs of ``n_tune_epochs`` epochs each,
     maximising the harmonic mean of ``validation/avg_task_performance`` and
@@ -379,8 +387,10 @@ def tune_max_lmb(
     agents (with the graph and per-agent configs restricted to match), which
     makes the search dramatically cheaper for large networks.
 
-    Returns the best max_lmb found.
+    Returns the best max_lmb found and one ``{max_lmb, task, comm,
+    objective}`` record per trial.
     """
+    import numpy as np
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -400,13 +410,29 @@ def tune_max_lmb(
         if agent_subset is not None
         else 'all agents'
     )
+    if sampler not in ('tpe', 'grid'):
+        raise ValueError(f"lmb_study.sampler must be 'tpe' or 'grid', got {sampler!r}")
+    if objective_name not in ('harmonic', 'comm'):
+        raise ValueError(
+            f"lmb_study.objective must be 'harmonic' or 'comm', got {objective_name!r}"
+        )
+    grid = (
+        np.logspace(np.log10(lmb_low), np.log10(lmb_high), n_trials).tolist()
+        if sampler == 'grid'
+        else None
+    )
     print(
         f'\nTuning max_lmb in [{lmb_low:.0e}, {lmb_high:.0e}] on {scope} '
-        f'— {n_trials} trials × {n_tune_epochs} epochs ...'
+        f'— {n_trials} trials × {n_tune_epochs} epochs '
+        f'({sampler} sampler, objective={objective_name}) ...'
     )
+    records: list[dict[str, float]] = []
 
     def objective(trial: optuna.Trial) -> float:
-        lmb = trial.suggest_float('max_lmb', lmb_low, lmb_high, log=True)
+        if grid is not None:
+            lmb = trial.suggest_categorical('max_lmb', grid)
+        else:
+            lmb = trial.suggest_float('max_lmb', lmb_low, lmb_high, log=True)
 
         # Build a plain-dict copy of cfg so we can override max_lmb freely.
         trial_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
@@ -443,10 +469,15 @@ def tune_max_lmb(
             # Lightning calling setup() (and load_dataset()) on every trial.
             # Fresh DataLoader objects are created each time so worker
             # processes are not shared across trainers.
+            # Only the validation loader: with monitor_test_during_fit the
+            # datamodule appends the test loader, which tuning must not touch.
+            val_loaders = dm_view.val_dataloader()
+            if isinstance(val_loaders, list):
+                val_loaders = val_loaders[0]
             trainer.fit(
                 orchestrator,
                 train_dataloaders=dm_view.train_dataloader(),
-                val_dataloaders=dm_view.val_dataloader(),
+                val_dataloaders=val_loaders,
             )
 
             task_perf = float(
@@ -461,18 +492,37 @@ def tune_max_lmb(
 
         comm_perf = float(comm_logs.get('test/avg_comm_task_perf', 0.0))
 
-        denom = task_perf + comm_perf
-        return (2.0 * task_perf * comm_perf / denom) if denom > 0.0 else 0.0
+        if objective_name == 'comm':
+            value = comm_perf
+        else:
+            denom = task_perf + comm_perf
+            value = (2.0 * task_perf * comm_perf / denom) if denom > 0.0 else 0.0
+        records.append(
+            {'max_lmb': lmb, 'task': task_perf, 'comm': comm_perf, 'objective': value}
+        )
+        print(
+            f'  [lmb_study] max_lmb={lmb:.3e}  task={task_perf:.4f}  '
+            f'comm={comm_perf:.4f}  objective={value:.4f}',
+            flush=True,
+        )
+        return value
 
-    study = optuna.create_study(direction='maximize')
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=(
+            optuna.samplers.GridSampler({'max_lmb': grid})
+            if grid is not None
+            else None
+        ),
+    )
     study.optimize(objective, n_trials=n_trials)
 
     best_lmb = study.best_params['max_lmb']
     print(
         f'Tuning done  →  best max_lmb = {best_lmb:.4e}'
-        f'  (harmonic mean = {study.best_value:.4f})\n'
+        f'  ({objective_name} = {study.best_value:.4f})\n'
     )
-    return best_lmb
+    return best_lmb, records
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -535,7 +585,7 @@ def main(cfg: DictConfig) -> float:
     print(
         f'\nCommunication graph ({cfg.graph.neighbors_mode}): '
         f'{n_edges}/{possible} edges '
-        f'({100 * n_edges / possible:.1f}% of fully connected)'
+        f"({100 * n_edges / max(possible, 1):.1f}% of fully connected)"
     )
     print(
         f'  degree: min={min(degrees)}, max={max(degrees)}, '
@@ -560,6 +610,7 @@ def main(cfg: DictConfig) -> float:
         OmegaConf.select(cfg, 'orchestrator.learn_lmb', default=False)
     )
     lmb_study_cfg = cfg.get('lmb_study', {})
+    lmb_study_records: list[dict[str, float]] = []
     if learn_lmb and lmb_study_cfg.get('enabled', False):
         print('\n[lmb_study] skipped: orchestrator.learn_lmb=True (dual ascent).')
     if (
@@ -575,9 +626,29 @@ def main(cfg: DictConfig) -> float:
                 f'\n[lmb_study] efficient mode → tuning on the first '
                 f'{n_lmb_agents} agents only.'
             )
-        best_lmb = tune_max_lmb(
+        # lmb_study.val_split > 0 tunes on a study-only datamodule whose
+        # agents hold out that fraction of their own draw, so the main run
+        # can keep val_split: 0 and the test set is never seen while tuning.
+        study_val_split = float(lmb_study_cfg.get('val_split', 0.0) or 0.0)
+        study_dm = datamodule
+        if study_val_split > 0.0:
+            study_dataset_cfg = copy.deepcopy(dataset_cfg)
+            study_dataset_cfg['val_split'] = study_val_split
+            study_dm = instantiate(study_dataset_cfg)
+            study_dm.prepare_data()
+            study_dm.setup()
+            print(
+                f'[lmb_study] tuning on a study-only split: each agent holds '
+                f'out {study_val_split:.0%} of its own draw.'
+            )
+        elif not any(len(d) for d in datamodule.val_datasets.values()):
+            raise ValueError(
+                'lmb_study needs held-out data: set dataset.val_split > 0 or '
+                'lmb_study.val_split > 0 (the test set is never used for tuning).'
+            )
+        best_lmb, lmb_study_records = tune_max_lmb(
             cfg,
-            datamodule,
+            study_dm,
             neighbors,
             per_agents_cfg,
             n_trials=lmb_study_cfg.get('n_trials', 20),
@@ -585,7 +656,12 @@ def main(cfg: DictConfig) -> float:
             lmb_low=lmb_study_cfg.get('lmb_low', 1e-4),
             lmb_high=lmb_study_cfg.get('lmb_high', 10.0),
             agent_subset=agent_subset,
+            sampler=lmb_study_cfg.get('sampler', 'tpe'),
+            objective_name=lmb_study_cfg.get('objective', 'harmonic'),
         )
+        if study_dm is not datamodule:
+            del study_dm
+            gc.collect()
         with open_dict(cfg):
             cfg.orchestrator.max_lmb = best_lmb
 
@@ -613,7 +689,11 @@ def main(cfg: DictConfig) -> float:
         )
         name_parts.append(f'ctc_{ctc}')
     shift = OmegaConf.select(cfg, 'dataset.shift_strength')
-    name_parts.append(f'shift_{shift}_')
+    pilots = OmegaConf.select(cfg, 'dataset.pilot_num_samples')
+    if pilots is not None:
+        name_parts.append(f'shift_{shift}_p{pilots}_')
+    else:
+        name_parts.append(f'shift_{shift}_')
     name_parts.append(str(job_num))
     run_name = '_'.join(name_parts)
 
@@ -624,6 +704,8 @@ def main(cfg: DictConfig) -> float:
 
     _update_logger_config(logger, OmegaConf.to_container(cfg, resolve=True))
     _update_logger_config(logger, {'orchestrator_name': orch_name})
+    if lmb_study_records:
+        _update_logger_config(logger, {'lmb_study_results': lmb_study_records})
 
     # ── Build agents + orchestrator ───────────────────────────────────────────
     agents, latent_dims = _build_agents(cfg, datamodule, per_agents_cfg)
@@ -641,6 +723,7 @@ def main(cfg: DictConfig) -> float:
         for key in ('gradient_clip_val', 'gradient_clip_algorithm'):
             trainer_kwargs.pop(key, None)
     callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
+    callbacks.append(StatusFileCallback())
     trainer = Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
 
     trainer.fit(orchestrator, datamodule=datamodule)
@@ -689,18 +772,7 @@ def main(cfg: DictConfig) -> float:
 
     df = pd.DataFrame(rows)
 
-    # ── Save parquet ──────────────────────────────────────────────────────────
-    results_dir = Path('.') / 'results' / 'multi_agent'
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    fname = (
-        f'multi_agent__shift{shift_strength:.3f}__seed{cfg.seed}'
-        f'__{timestamp}.parquet'
-    )
-    out_path = results_dir / fname
-    df.to_parquet(out_path, index=False)
-    print(f'\nResults saved → {out_path}')
+    # Per-agent summary for the console; the numbers live on wandb.
     print(
         df[
             [
@@ -714,8 +786,6 @@ def main(cfg: DictConfig) -> float:
     )
 
     # Cleanup.
-    remove_non_empty_dir('./multirun/')
-    remove_non_empty_dir('./outputs/')
     remove_non_empty_dir('~/.cache/wandb/')
     remove_non_empty_dir(cfg.logger.project)
     _finish_active_wandb_run()
@@ -737,4 +807,7 @@ def main(cfg: DictConfig) -> float:
 
 
 if __name__ == '__main__':
+    from src.utils.hydra_outputs import disable_hydra_outputs
+
+    disable_hydra_outputs()
     main()

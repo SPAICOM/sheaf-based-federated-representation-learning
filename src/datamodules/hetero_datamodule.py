@@ -29,6 +29,7 @@ from src.utils.data_partitioner import (
     partition_non_iid,
     partition_non_iid_fair,
     partition_non_iid_with_margin,
+    _group_class_distribution,
     sample_shifted_subsets,
 )
 
@@ -56,14 +57,38 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         safety_margin: int = 10,
         groups: dict | None = None,
         shift_strength: float = 0.0,
-        agent_train_samples: int | None = None,
+        agent_train_samples: int | str | None = None,
         agent_train_frac: float | None = None,
         agent_test_samples: int | None = None,
         agent_test_frac: float | None = None,
         pilot_exclusive: bool = False,
+        pilot_class_filter: bool = True,
+        test_source: str = 'pool',
+        pilot_source: str = 'pool',
+        agent_label_noise: dict | None = None,
+        agent_label_map: dict | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        # {agent: {classes: [a, b], fraction: p}}: in that agent's TRAINING rows
+        # (overlapping_shift only), round(p * n) of the n rows labelled a or b
+        # get the other label (a <-> b). With direction: one_way, round(p * n_a)
+        # of the rows labelled a get label b and b is untouched (a -> b).
+        # Val, test and pilots keep true labels.
+        self.agent_label_noise = {}
+        for k, v in (agent_label_noise or {}).items():
+            classes = [int(c) for c in v['classes']]
+            frac = float(v['fraction'])
+            direction = v.get('direction', 'swap')
+            if len(classes) != 2 or not 0.0 <= frac <= 1.0 or direction not in ('swap', 'one_way'):
+                raise ValueError(f'agent_label_noise[{k}] needs 2 classes, fraction in [0, 1] '
+                                 f"and direction 'swap' | 'one_way', got {v}")
+            self.agent_label_noise[int(k)] = (classes, frac, direction)
+        # {agent: [t_0, ..., t_{C-1}]}: that agent's TRAINING rows (overlapping_shift
+        # only) get label t_y instead of y, e.g. a coarse task (animate vs inanimate).
+        # The model keeps C outputs; only the targets used are ever trained.
+        # Val, test and pilots keep the original labels (score coarse agents offline).
+        self.agent_label_map = {int(k): [int(t) for t in v] for k, v in (agent_label_map or {}).items()}
         self.safety_margin = int(safety_margin)
         self.shift_strength = float(shift_strength)
         # Agent subset sizes for split_strategy='overlapping_shift'. Absolute
@@ -79,6 +104,42 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         # them from the agent pool, which zeroes contamination at any n and
         # only costs a (1 - pilot_split) factor in the feasibility bound.
         self.pilot_exclusive = bool(pilot_exclusive)
+        # False: every agent gets every pilot, whatever its class — an unlabeled
+        # shared set the agents also encode on classes they never trained on.
+        self.pilot_class_filter = bool(pilot_class_filter)
+        # Where overlapping_shift takes its test rows from:
+        #   pool     - carve test_split out of the merged corpus, then let each
+        #              agent draw a shifted test subset from it (default)
+        #   original - the dataset's own 'test' split, given IN FULL and
+        #              unshifted to every agent; train rows and pilots come
+        #              only from the original 'train' split. test_split and
+        #              agent_test_* are ignored.
+        if test_source not in ('pool', 'original'):
+            raise ValueError(
+                f"test_source must be 'pool' or 'original', got {test_source!r}"
+            )
+        self.test_source = test_source
+        # Where overlapping_shift takes its pilots from:
+        #   pool         - pilot_num_samples rows uniform over the TRAIN pool,
+        #                  drawn before the agent draws (default)
+        #   intersection - the rows held by EVERY agent's training split (the
+        #                  data they already share); pilot_num_samples rows
+        #                  are subsampled from it (all of it when null or
+        #                  larger). The pilots stay in the training sets, so
+        #                  the agents' training data do not depend on the
+        #                  pilot budget; incompatible with pilot_exclusive.
+        if pilot_source not in ('pool', 'intersection'):
+            raise ValueError(
+                f"pilot_source must be 'pool' or 'intersection', got {pilot_source!r}"
+            )
+        if pilot_source == 'intersection' and self.pilot_exclusive:
+            raise ValueError("pilot_source='intersection' requires pilot_exclusive: false")
+        self.pilot_source = pilot_source
+        # True when every agent is scored on the very same test samples (with
+        # matching sample_ids), so cross-agent instance metrics (misalignment
+        # loss, MRR) can be measured on held-out test rows instead of on the
+        # pilots the alignment maps are fitted on.
+        self.shared_test_set = False
 
         # groups accepts two formats:
         #   {0: [agents], 1: [agents], ...}
@@ -174,8 +235,13 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         pilot_labels = pilot_data[label_key]
         all_seen: list[set] = []
         for i in range(self.n_agents):
-            seen_classes = set(self.train_datasets[i].dataset[label_key])
+            rows = self.train_datasets[i].dataset
+            # original classes, not the remapped/noisy training targets
+            col = f'{label_key}_clean' if f'{label_key}_clean' in rows.column_names else label_key
+            seen_classes = set(rows[col])
             all_seen.append(seen_classes)
+            if not self.pilot_class_filter:
+                seen_classes = set(pilot_labels)
             keep = [
                 idx
                 for idx, lbl in enumerate(pilot_labels)
@@ -190,10 +256,13 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 self.data_key,
                 label_key,
                 sample_ids=filtered_ids,
+                noise=self.agent_noise.get(i),
             )
 
         # Intersection pilot: only classes every agent has been trained on.
         shared_classes = set.intersection(*all_seen) if len(all_seen) > 1 else (all_seen[0] if all_seen else set())
+        if not self.pilot_class_filter:
+            shared_classes = set(pilot_labels)
         keep_shared = [idx for idx, lbl in enumerate(pilot_labels) if lbl in shared_classes]
         if not keep_shared:
             keep_shared = [0]
@@ -300,13 +369,19 @@ class HeteroClassificationDataModule(ClassificationDataModule):
     def _agent_subset_sizes(self, train_pool_size: int) -> tuple[int, int]:
         """Resolve the per-agent train/test draw sizes for ``overlapping_shift``.
 
+        ``agent_train_samples='max'`` resolves to the largest draw every agent
+        can take at the current shift (see :meth:`_max_feasible_train_size`),
+        so the training set shrinks naturally as ``shift_strength`` grows.
+
         Absolute counts take precedence over fractions.  With neither set the
         train draw defaults to ``train_pool_size / n_agents`` — the volume a
         disjoint partition would have produced — so switching strategies does
         not silently change how much data each agent holds.  The test draw
         defaults to mirroring the global train/test ratio onto the agent.
         """
-        if self.agent_train_samples is not None:
+        if self.agent_train_samples == 'max':
+            n_train = self._max_train_size
+        elif self.agent_train_samples is not None:
             n_train = int(self.agent_train_samples)
         elif self.agent_train_frac is not None:
             n_train = int(round(train_pool_size * float(self.agent_train_frac)))
@@ -324,6 +399,73 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         else:
             n_test = 0
         return max(n_train, 1), max(n_test, 0)
+
+    def _max_feasible_train_size(
+        self, labels: list[int], pool: list[int]
+    ) -> int:
+        """Largest per-agent draw that every agent can take from ``pool``.
+
+        Agent i needs ~n·P_i(k) rows of class k, and largest-remainder rounding
+        adds at most one, so n is feasible iff n·P_i(k) + 1 <= N_k for every
+        class k and agent i.
+        """
+        pool_labels = torch.tensor(labels, dtype=torch.long)[
+            torch.tensor(pool, dtype=torch.long)
+        ]
+        classes = sorted(torch.unique(pool_labels).tolist())
+        counts = torch.tensor(
+            [(pool_labels == c).sum().item() for c in classes],
+            dtype=torch.float64,
+        )
+        bound = float('inf')
+        for agent_list_gid, agent_list in self.groups.items():
+            dist = _group_class_distribution(
+                classes,
+                self.group_target_classes.get(agent_list_gid),
+                self.shift_strength,
+            ).double()
+            positive = dist > 0
+            bound = min(
+                bound,
+                float(((counts[positive] - 1) / dist[positive]).min()),
+            )
+        return max(int(bound), 1)
+
+    def _swap_labels(self, rows, label_key: str, client_idx: int):
+        """Swap the labels of a random fraction of the rows of two classes
+        (one_way: relabel a random fraction of the class-a rows as b)."""
+        (a, b), frac, direction = self.agent_label_noise[client_idx]
+        labels = [int(y) for y in rows[label_key]]
+        src = (a,) if direction == 'one_way' else (a, b)
+        pair = [k for k, y in enumerate(labels) if y in src]
+        gen = torch.Generator().manual_seed(self.seed + 104729 + client_idx)
+        n_flip = round(frac * len(pair))
+        flip = [pair[k] for k in torch.randperm(len(pair), generator=gen)[:n_flip].tolist()]
+        for k in flip:
+            labels[k] = b if labels[k] == a else a
+        self.label_noise_stats = getattr(self, 'label_noise_stats', {})
+        self.label_noise_stats[client_idx] = {
+            'classes': (a, b), 'direction': direction, 'rows': len(pair), 'flipped': n_flip,
+            f'{a}->{b}': sum(1 for k in flip if labels[k] == b),
+            f'{b}->{a}': sum(1 for k in flip if labels[k] == a),
+        }
+        print(f'[label noise] agent {client_idx}: {self.label_noise_stats[client_idx]}')
+        feature = rows.features[label_key]
+        # keep the true label next to the noisy one (diagnostics only; unused in training)
+        rows = rows.add_column(f'{label_key}_clean', [int(y) for y in rows[label_key]], feature=feature)
+        return rows.remove_columns(label_key).add_column(label_key, labels, feature=feature)
+
+    def _map_labels(self, rows, label_key: str, client_idx: int):
+        """Replace each label y by agent_label_map[client_idx][y]."""
+        target = self.agent_label_map[client_idx]
+        clean = [int(y) for y in rows[label_key]]
+        labels = [target[y] for y in clean]
+        counts = {t: labels.count(t) for t in sorted(set(labels))}
+        print(f'[label map] agent {client_idx}: {target} -> train label counts {counts}')
+        feature = rows.features[label_key]
+        if f'{label_key}_clean' not in rows.column_names:
+            rows = rows.add_column(f'{label_key}_clean', clean, feature=feature)
+        return rows.remove_columns(label_key).add_column(label_key, labels, feature=feature)
 
     def _setup_overlapping_shift(self) -> None:
         """Split-first pipeline with overlapping, label-shifted agent draws.
@@ -359,7 +501,8 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             )
 
         ds = load_dataset(f'{self.repo}/{self.name}')
-        all_data = concatenate_datasets([ds[s] for s in ds])
+        split_names = list(ds)
+        all_data = concatenate_datasets([ds[s] for s in split_names])
         label_key = self.attributes[0]
         labels = all_data[label_key]
         total_size = len(all_data)
@@ -377,10 +520,25 @@ class HeteroClassificationDataModule(ClassificationDataModule):
 
         # ── 1. Global train/test split ───────────────────────────────────────
         generator = torch.Generator().manual_seed(self.seed)
-        permutation = torch.randperm(total_size, generator=generator).tolist()
-        test_count = int(round(total_size * self.test_split))
-        test_pool = sorted(permutation[:test_count])
-        train_pool = sorted(permutation[test_count:])
+        if self.test_source == 'original':
+            if 'train' not in split_names or 'test' not in split_names:
+                raise ValueError(
+                    "test_source='original' needs 'train' and 'test' splits; "
+                    f'{self.repo}/{self.name} has {split_names}'
+                )
+            offsets, start = {}, 0
+            for name in split_names:
+                offsets[name] = (start, start + len(ds[name]))
+                start += len(ds[name])
+            train_pool = list(range(*offsets['train']))
+            test_pool = list(range(*offsets['test']))
+        else:
+            permutation = torch.randperm(
+                total_size, generator=generator
+            ).tolist()
+            test_count = int(round(total_size * self.test_split))
+            test_pool = sorted(permutation[:test_count])
+            train_pool = sorted(permutation[test_count:])
         if not train_pool:
             raise ValueError('test_split leaves no training samples')
 
@@ -390,6 +548,8 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         else:
             pilot_count = int(round(len(train_pool) * self.pilot_split))
         pilot_indices: list[int] = []
+        if self.pilot_source == 'intersection':
+            pilot_count = 0  # drawn after the agent draws (step 4b)
         if pilot_count > 0:
             picks = torch.randperm(len(train_pool), generator=generator)[
                 :pilot_count
@@ -411,6 +571,10 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             excluded = set(pilot_indices)
             agent_pool = [i for i in train_pool if i not in excluded]
 
+        if self.agent_train_samples == 'max':
+            self._max_train_size = self._max_feasible_train_size(
+                labels, agent_pool
+            )
         n_train, n_test = self._agent_subset_sizes(len(agent_pool))
         train_draws, agent_classes = sample_shifted_subsets(
             labels=labels,
@@ -423,8 +587,12 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             seed=self.seed,
             return_agent_classes=True,
         )
-        test_draws: dict[int, list[int]] = (
-            sample_shifted_subsets(
+        if self.test_source == 'original':
+            # Every agent is scored on the same, complete, unshifted test set.
+            test_draws = {i: list(test_pool) for i in range(self.n_agents)}
+            self.shared_test_set = self.n_agents > 1
+        elif n_test > 0 and test_pool:
+            test_draws = sample_shifted_subsets(
                 labels=labels,
                 n_agents=self.n_agents,
                 groups=self.groups,
@@ -435,12 +603,12 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 seed=self.seed + 1,
                 return_agent_classes=False,
             )
-            if n_test > 0 and test_pool
-            else {i: [] for i in range(self.n_agents)}
-        )
+        else:
+            test_draws = {i: [] for i in range(self.n_agents)}
         self.agent_classes = agent_classes
 
         # ── 4. Materialise the per-agent datasets ────────────────────────────
+        kept_train_ids: dict[int, list[int]] = {}
         for client_idx in range(self.n_agents):
             rotation = self.agent_rotations.get(client_idx, 0)
             local_data = all_data.select(train_draws[client_idx])
@@ -449,27 +617,64 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 self.val_split,
                 seed=self.seed + client_idx,
             )
+            kept_train_ids[client_idx] = [train_draws[client_idx][k] for k in keep]
+            noise = self.agent_noise.get(client_idx)
+            train_rows = local_data.select(keep)
+            if client_idx in self.agent_label_noise:
+                train_rows = self._swap_labels(train_rows, label_key, client_idx)
+            if client_idx in self.agent_label_map:
+                train_rows = self._map_labels(train_rows, label_key, client_idx)
+            # Augmentation (CIFAR-10 crop+flip, None otherwise) on the
+            # training rows only; val/test/pilots keep the raw inputs.
             self.train_datasets[client_idx] = ClassificationDataset(
-                local_data.select(keep),
+                train_rows,
                 self.data_key,
                 label_key,
                 rotation_angle=rotation,
+                transform=self.train_transform,
+                noise=noise,
             )
             self.val_datasets[client_idx] = ClassificationDataset(
                 local_data.select(held),
                 self.data_key,
                 label_key,
                 rotation_angle=rotation,
+                noise=noise,
             )
             self.test_datasets[client_idx] = ClassificationDataset(
                 all_data.select(test_draws[client_idx]),
                 self.data_key,
                 label_key,
                 rotation_angle=rotation,
+                sample_ids=list(test_draws[client_idx]),
+                noise=noise,
             )
             self.num_classes[client_idx] = len(
                 set(self.train_datasets[client_idx].dataset[label_key])
             )
+
+        # ── 4b. Pilots from the agents' shared training rows ─────────────────
+        self.pilot_intersection_size = None
+        if self.pilot_source == 'intersection':
+            shared = set(kept_train_ids[0])
+            for ids in kept_train_ids.values():
+                shared &= set(ids)
+            shared = sorted(shared)
+            self.pilot_intersection_size = len(shared)
+            want = (
+                len(shared) if self.pilot_num_samples is None
+                else min(int(self.pilot_num_samples), len(shared))
+            )
+            if self.pilot_num_samples is not None and int(self.pilot_num_samples) > len(shared):
+                print(
+                    f'[pilots] requested {self.pilot_num_samples} but the training '
+                    f'intersection holds {len(shared)}; using all of it'
+                )
+            pick_gen = torch.Generator().manual_seed(self.seed + 7919)
+            picks = torch.randperm(len(shared), generator=pick_gen)[:want].tolist()
+            pilot_indices = sorted(shared[p] for p in picks)
+            if pilot_indices and self.pilot_batch_size > len(pilot_indices):
+                self.pilot_batch_size = len(pilot_indices)
 
         # ── 5. Shared pilots (same rows, same ids, on every agent) ───────────
         if pilot_indices:

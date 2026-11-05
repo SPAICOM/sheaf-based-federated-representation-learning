@@ -142,6 +142,16 @@ simple-trial *args="":
 hetero-bottleneck *args="":
     uv run scripts/multi_agent_experiment.py --config-name hetero_rate_2agents_mnist_hetero_bottleneck {{args}}
 
+# ── OLS-vs-Procrustes restriction-map ablation (config: hetero_rate_2agents_mnist_ols_ablation)
+# SheafFRL on the 2-agent d=32 bottleneck setup, same fixed λ for both arms:
+# {Procrustes, OLS} x seeds, logged to the sfrl_ols_ablation wandb project.
+#   just ols-ablation                          # seeds 1-5, both arms (10 runs)
+#   just ols-ablation "1,2,3" orchestrator.max_lmb=1e-2
+ols-ablation seeds="1,2,3,4,5" *args="":
+    uv run scripts/multi_agent_experiment.py --config-name hetero_rate_2agents_mnist_ols_ablation --multirun \
+        'orchestrator.use_general_maps=false,true' \
+        'seed={{seeds}}' {{args}}
+
 # Plot the sfrl_bottleneck sweep (comm task perf vs latent dim)
 plot-bottleneck *args="":
     uv run scripts/plot_bottleneck_metrics.py --project sfrl_bottleneck {{args}}
@@ -258,3 +268,85 @@ ring-density frac lmb *args="":
         graph.max_edge_frac={{frac}} orchestrator.max_lmb={{lmb}} \
         'dataset.shift_strength=0.7' \
         logger.project=ring_topology {{args}}
+
+# ── CIFAR-10 study (overlapping draws, official 10k test split for every agent) ──
+# Step 1: single-agent ResNet-10, no shift (target ~0.9 test accuracy)
+cifar10-single *args="":
+    uv run scripts/multi_agent_experiment.py --config-name cifar10_single_agent {{args}}
+
+# Step 2: single agent under shift (train size shrinks naturally with s)
+cifar10-single-shift *args="":
+    uv run scripts/multi_agent_experiment.py --config-name cifar10_single_agent \
+        'dataset.shift_strength=0.2,0.5,0.8' {{args}}
+
+# Step 3: 4 agents, {sheaf_frl, non_cooperative} x shift {0.2, 0.8} x pilots {128, 256, 2048}
+# (SheafFRL jobs run a 10-point lambda grid on [1e-4, 1] first, ranked by network-wide comm acc)
+cifar10-4agents *args="":
+    uv run scripts/multi_agent_experiment.py --config-name cifar10_4agents_shift {{args}}
+
+# ── CIFAR-10, 2 heterogeneous agents (guide: README, "Two heterogeneous agents on CIFAR-10") ──
+# setup = grayblur | grayblur_harsh | crops | shift   (config/hydra/cifar10_2agents_<setup>.yaml)
+# Non-coop: one training run with all intersection pilots; prints the wandb run id.
+two-agents-noncoop setup *args="":
+    OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 uv run scripts/multi_agent_experiment.py \
+        --config-name cifar10_2agents_{{setup}} orchestrator=non_cooperative {{args}}
+
+# Non-coop comm accuracy vs pilot budget, encoders fixed (run_id from two-agents-noncoop).
+two-agents-sweep setup run_id *args="":
+    OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 uv run scripts/pilot_count_sweep.py \
+        --config-name cifar10_2agents_{{setup}} --run {{run_id}}:::non_cooperative \
+        --n 8 32 128 512 2048 100000 --repeats 2 \
+        --csv results/cifar10_2agents_{{setup}}/noncoop_sweep.csv {{args}}
+
+# SheafFRL at one pilot budget; whitening = sheaf_frl (SWBN) | sheaf_frl_zca (closed-form ZCA).
+two-agents-sheaf setup whitening pilots lmb *args="":
+    OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 uv run scripts/multi_agent_experiment.py \
+        --config-name cifar10_2agents_{{setup}} orchestrator={{whitening}} \
+        dataset.pilot_num_samples={{pilots}} orchestrator.max_lmb={{lmb}} {{args}}
+
+# ── Tracked launch: run in a detached tmux session with a live dashboard ───────
+# Usage:  just launch <sweep-name> <n-jobs|0> "<command>"
+#   just launch grayblur_lmb 10 "uv run scripts/multi_agent_experiment.py -m --config-name cifar10_2agents_grayblur_harsh orchestrator.max_lmb=0.01,0.03,..."
+# Left pane: the run (log also teed to logs/<sweep>.log). Right pane: dashboard.
+# Survives closing Claude/your terminal (tmux server owns it). Attach: just attach <sweep>
+launch sweep total cmd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root="{{justfile_directory()}}"
+    s="{{sweep}}"
+    if tmux has-session -t "$s" 2>/dev/null; then echo "tmux session '$s' exists"; exit 1; fi
+    mkdir -p "$root/logs/status/$s" "$root/logs/console"
+    printf '{"total": %s, "cmd": %s, "started": "%s", "commit": "%s"}\n' \
+        "{{total}}" "$(printf '%s' '{{cmd}}' | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
+        "$(date -Is)" "$(git -C "$root" rev-parse --short HEAD)$(git -C "$root" diff --quiet || echo -dirty)" \
+        > "$root/logs/status/$s/_sweep.json"
+    tmux new-session -d -s "$s" -n run -c "$root"
+    tmux send-keys -t "$s:run" "export SWEEP=$s; {{cmd}} 2>&1 | tee logs/console/$s.log; echo '[sweep finished]'" C-m
+    tmux split-window -h -t "$s:run" -c "$root" "uv run python scripts/runs_dashboard.py $s"
+    tmux select-pane -t "$s:run.0"
+    echo "launched '$s' → attach: just attach $s   |   overview: just dash"
+
+# Attach to (or switch to) a launched sweep's tmux session
+attach sweep:
+    @if [ -n "${TMUX:-}" ]; then tmux switch-client -t {{sweep}}; else tmux attach -t {{sweep}}; fi
+
+# Dashboard over all sweeps (add a name to filter); --once prints a snapshot
+dash *args="":
+    uv run python scripts/runs_dashboard.py {{args}}
+
+# Smoke-run an experiment config: no wandb, 1 epoch, a few batches, no λ study.
+#   just smoke cifar10_2agents_grayblur_6v6 orchestrator=di_sheaf_frl
+smoke config *args="":
+    WANDB_MODE=disabled uv run python scripts/multi_agent_experiment.py \
+        --config-name {{config}} trainer.max_epochs=1 ++trainer.limit_train_batches=3 \
+        ++trainer.limit_val_batches=2 ++trainer.limit_test_batches=2 \
+        ++lmb_study.enabled=false {{args}}
+
+# Score wandb runs against state/objectives/<objective>.yaml and append to its .tsv
+#   just score 6v6_cnorm <run_id> [<run_id> ...] --note "what changed"
+score objective *args="":
+    uv run python scripts/score_run.py {{objective}} {{args}}
+
+# Table + curves of a finished sweep from wandb → tmp/<date>_<project>_<slug>/ (see scripts/sweep_report.py)
+report project *args:
+    uv run python scripts/sweep_report.py {{project}} {{args}}
