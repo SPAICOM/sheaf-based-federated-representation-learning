@@ -278,6 +278,9 @@ class PostTrainingAlignmentMixin:
         # _alignment_maps so misalignment-loss scoring still sees exactly one
         # direction per edge (see _directed_alignment_map).
         self._relative_reverse_maps: dict[tuple[int, int], torch.Tensor] = {}
+        # Per canonical edge, the map E fitted so Z_receiver @ E ≈ Z_sender:
+        # the embedding that evaluate_misalignment_loss scores (X − A·Y).
+        self._embedding_maps: dict[tuple[int, int], torch.Tensor] = {}
 
         any_fitted = False
         # Charge the post-hoc alignment's pilot exchange exactly once per fit()
@@ -370,17 +373,19 @@ class PostTrainingAlignmentMixin:
 
                 if method == 'relative':
                     M = fit_relative_alignment(A_s, A_r)
-                    self._relative_reverse_maps[(sender_idx, receiver_idx)] = (
-                        fit_relative_alignment(A_r, A_s)
-                    )
+                    E = fit_relative_alignment(A_r, A_s)
+                    self._relative_reverse_maps[(sender_idx, receiver_idx)] = E
                 elif method == 'procrustes':
                     M = fit_procrustes(A_s, A_r)
+                    E = M.T
                 else:
                     # fit_alignment returns A s.t. A_s @ A.T ≈ A_r;
                     # store as right-multiply M = A.T.
                     M = fit_alignment(A_s, A_r).T
+                    E = fit_alignment(A_r, A_s).T
 
                 self._alignment_maps[sender_idx][receiver_idx] = M
+                self._embedding_maps[(sender_idx, receiver_idx)] = E
                 any_fitted = True
 
                 if record_comm:
@@ -498,6 +503,7 @@ class PostTrainingAlignmentMixin:
         self._train_whitening_ops = {}
         self._alignment_maps = {}
         self._relative_reverse_maps = {}
+        self._embedding_maps = {}
 
     def _whiten_own_latents(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
         """Whiten with this agent's own post-hoc-fitted training-set operator."""
@@ -525,6 +531,14 @@ class PostTrainingAlignmentMixin:
         """
         return getattr(self, '_alignment_maps', {}).get(sender_idx, {}).get(
             receiver_idx
+        )
+
+    def _directed_embedding_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """``E`` fitted so ``Z_receiver @ E ≈ Z_sender``, canonical orientation only."""
+        return getattr(self, '_embedding_maps', {}).get(
+            (sender_idx, receiver_idx)
         )
 
     @torch.no_grad()

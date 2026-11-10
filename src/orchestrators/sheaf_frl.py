@@ -458,24 +458,31 @@ class SheafFRL(BaseOrchestrator):
         """The two sides ``(X, A·Y)`` of the coboundary ``X − A·Y``.
 
         ``X = Z_i`` is the higher-dimensional side and ``A·Y = Z_j Vᵀ`` is the
-        lower-dimensional side isometrically embedded into it.  General maps
-        keep the residual their least-squares fit minimises (``Z_i V − Z_j``);
-        there ``Vᵀ`` is not an embedding of the fitted map.
+        lower-dimensional side embedded into it, for Stiefel and general maps
+        alike (:meth:`_fit_edge_map` fits both in this direction).
+        """
+        return Z_i, torch.matmul(Z_j, V.T)
+
+    def _large_to_small_map(self, V: torch.Tensor) -> torch.Tensor:
+        """Right-multiply map from the higher- to the lower-dim side of an edge.
+
+        ``V`` itself is the embedding ``Z_j Vᵀ ≈ Z_i``; its inverse direction
+        is ``V`` for a Stiefel map and ``pinv(V)ᵀ`` for a general one.
         """
         if self.hparams.use_general_maps:
-            return torch.matmul(Z_i, V), Z_j
-        return Z_i, torch.matmul(Z_j, V.T)
+            return torch.linalg.pinv(V).T
+        return V
 
     def _edge_unaligned_energy(
         self, edge_key: str, diff: torch.Tensor
     ) -> float:
         """``E‖diff‖²`` for two unrelated whitened latents on this edge.
 
-        ``d_i + d_j`` for an isometric embedding (``2·d`` on equal-dim edges);
-        ``2·d_e`` when both sides live in the ``d_e``-dim coboundary space.
+        ``d_i + d_j`` for an embedding map (``2·d`` on equal-dim edges);
+        ``2·c_ij`` when both sides live in a compressed edge stalk.
         """
         V = self.stiefel_matrices.get(edge_key)
-        if V is None or self.hparams.use_general_maps:
+        if V is None:
             return 2.0 * diff.shape[1]
         return float(V.shape[0] + V.shape[1])
 
@@ -846,11 +853,11 @@ class SheafFRL(BaseOrchestrator):
         )
 
         if self.hparams.use_general_maps:
-            # Unconstrained least-squares: A s.t. A_i @ A.T ≈ A_j.
-            # fit_alignment returns A of shape (d_j, d_i); V = A.T is (d_i, d_j).
+            # Unconstrained least-squares embedding: V s.t. A_j @ V.T ≈ A_i.
+            # fit_alignment(A_j, A_i) returns exactly that V, shape (d_i, d_j).
             if update_maps:
-                A = fit_alignment(A_i, A_j)
-                V_param.copy_(A.T.to(dtype=V_param.dtype, device=param_device))
+                A = fit_alignment(A_j, A_i)
+                V_param.copy_(A.to(dtype=V_param.dtype, device=param_device))
         else:
             C_svd = C + torch.randn_like(C) * 1e-6
             if not torch.isfinite(C_svd).all():
@@ -2042,15 +2049,9 @@ class SheafFRL(BaseOrchestrator):
                         'reconstruction',
                     }
 
-                # Inverse map: for Stiefel (semi-orthogonal cols) V.T; general → pinv(V).
-                if self.hparams.use_general_maps:
-                    V_inv = torch.linalg.pinv(V.float())
-                else:
-                    V_inv = V.float().T
-
                 # j → i direction
                 if agent_i is not None and _supports_comm_task(agent_i):
-                    Z_j_to_i = torch.matmul(Z_j.float(), V_inv)
+                    Z_j_to_i = torch.matmul(Z_j.float(), V.float().T)
                     Z_j_to_i = self._recolour_node(node_i, Z_j_to_i)
                     logits_ji = agent_i.decoder(Z_j_to_i.to(dtype=Z_i.dtype))
                     if _task_type(agent_i) == 'reconstruction':
@@ -2064,7 +2065,9 @@ class SheafFRL(BaseOrchestrator):
 
                 # i → j direction
                 if agent_j is not None and _supports_comm_task(agent_j):
-                    Z_i_to_j = torch.matmul(Z_i.float(), V.float())
+                    Z_i_to_j = torch.matmul(
+                        Z_i.float(), self._large_to_small_map(V.float())
+                    )
                     Z_i_to_j = self._recolour_node(node_j, Z_i_to_j)
                     logits_ij = agent_j.decoder(Z_i_to_j.to(dtype=Z_j.dtype))
                     if _task_type(agent_j) == 'reconstruction':
@@ -2374,21 +2377,17 @@ class SheafFRL(BaseOrchestrator):
 
         # Step 2 — apply the Stiefel alignment map.
         # Edge convention: key '{node_i}_{node_j}' with d_node_i >= d_node_j.
-        # V maps  whitened node_i space → whitened node_j space  (shape d_i × d_j).
-        # V.T maps whitened node_j space → whitened node_i space.
+        # V (d_i × d_j) is the embedding: Z_j @ V.T lands in node_i's whitened
+        # space; _large_to_small_map(V) is its inverse direction.
         edge_key_ij = f'{sender_idx}_{receiver_idx}'
         edge_key_ji = f'{receiver_idx}_{sender_idx}'
 
         if edge_key_ij in self.stiefel_matrices:
             V = self.stiefel_matrices[edge_key_ij].float().to(work_dev)
-            Z_aligned = Z @ V
+            Z_aligned = Z @ self._large_to_small_map(V)
         elif edge_key_ji in self.stiefel_matrices:
             V = self.stiefel_matrices[edge_key_ji].float().to(work_dev)
-            # For general (non-orthogonal) maps V.T is not the inverse; use pinv.
-            V_inv = (
-                torch.linalg.pinv(V) if self.hparams.use_general_maps else V.T
-            )
-            Z_aligned = Z @ V_inv
+            Z_aligned = Z @ V.T
         else:
             Z_aligned = Z
 
@@ -2428,6 +2427,15 @@ class SheafFRL(BaseOrchestrator):
         if V is None:
             return None
         return V.float()
+
+    def _directed_embedding_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """``E`` with ``Z_receiver @ E ≈ Z_sender`` on the edge's stored orientation."""
+        V = self.stiefel_matrices.get(f'{sender_idx}_{receiver_idx}')
+        if V is None:
+            return None
+        return V.float().T
 
     def evaluate_communication_accuracy(
         self, dm, prefix: str = 'test'
@@ -2514,6 +2522,7 @@ class SheafFRL(BaseOrchestrator):
         '_cleanup_alignment',
         '_whiten_own_latents',
         '_directed_alignment_map',
+        '_directed_embedding_map',
         '_comm_accuracy_with_fitted_maps',
         '_posthoc_shrinkage',
     )

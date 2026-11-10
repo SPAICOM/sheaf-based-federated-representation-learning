@@ -1451,19 +1451,32 @@ class BaseOrchestrator(l.LightningModule, ABC):
             f'{self.__class__.__name__} does not implement _directed_alignment_map'
         )
 
+    def _directed_embedding_map(
+        self, sender_idx: int, receiver_idx: int
+    ) -> torch.Tensor | None:
+        """Map ``E`` with ``Z_receiver @ E ≈ Z_sender``, fitted in that direction.
+
+        Defined for each edge's canonical orientation (sender = higher-dim
+        side), ``None`` otherwise.  Concrete orchestrators must override; the
+        default raises ``NotImplementedError`` so callers can skip cleanly.
+        """
+        raise NotImplementedError(
+            f'{self.__class__.__name__} does not implement _directed_embedding_map'
+        )
+
     @torch.no_grad()
     def evaluate_misalignment_loss(
         self, dm, prefix: str = 'test', force_pilots: bool = False
     ) -> dict[str, float]:
         """Cross-agent coboundary misalignment loss on matched pilot pairs.
 
-        For every directed edge (sender → receiver) that has a map fitted
-        exactly in that orientation (via ``self._directed_alignment_map`` —
-        never a transpose/pseudo-inverse of the reverse edge), whitens both
-        sender and receiver pilot latents with their own whitening operators
-        (via ``self._whiten_own_latents``), applies the map, and diffs
-        against the receiver's own whitened latents on the pilot samples
-        common to both (matched by sample id via ``common_pilot_indices``).
+        For every edge with an embedding map fitted in its canonical
+        orientation (via ``self._directed_embedding_map``), whitens both
+        sender (higher-dim) and receiver (lower-dim) pilot latents with their
+        own whitening operators (via ``self._whiten_own_latents``), embeds the
+        receiver's latents into the sender's space and diffs them against the
+        sender's, ``X − A·Y``, on the pilot samples common to both (matched
+        by sample id via ``common_pilot_indices``).
 
         This is computed entirely in whitened space — no re-colouring back
         into raw scale, no decoder involved — so it is *exactly* the
@@ -1472,7 +1485,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         generically so post-training-alignment baselines are directly
         comparable to it, not merely analogous.
 
-        Normalised by ``2·d_e`` — for whitened (unit-variance, uncorrelated)
+        Normalised by ``d_high + d_low`` — for whitened (unit-variance, uncorrelated)
         latents this is the expected residual under *no* alignment, so the
         result is a dimension-free "fraction of total variation left
         unaligned" (see :meth:`SheafFRL._edge_penalty_term`).
@@ -1609,10 +1622,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     continue
 
                 try:
-                    M = self._directed_alignment_map(sender_idx, receiver_idx)
+                    E = self._directed_embedding_map(sender_idx, receiver_idx)
                 except NotImplementedError:
                     continue
-                if M is None:
+                if E is None:
                     continue
 
                 idx_i, idx_j = common_pilot_indices(pi, pj)
@@ -1658,29 +1671,19 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 except NotImplementedError:
                     continue
 
-                Mc = M.detach().cpu().float()
-                # A rectangular isometry is an embedding: score X − A·Y in the
-                # higher dimension, as the sheaf penalty does.  Equal-dim or
-                # non-isometric maps keep Z_i M − Z_j (identical when square
-                # orthogonal).
-                d_high, d_low = Mc.shape
-                is_embedding = d_high > d_low and torch.allclose(
-                    Mc.T @ Mc, torch.eye(d_low), atol=1e-3
-                )
-                if is_embedding:
-                    Z_i_to_j, Z_j_w = Z_i_w, Z_j_w @ Mc.T
-                else:
-                    Z_i_to_j = Z_i_w @ Mc
-                diff = Z_i_to_j - Z_j_w
+                # X − A·Y: the receiver (lower-dim side) embedded into the
+                # sender's (higher-dim) space, as the sheaf penalty does.
+                Ec = E.detach().cpu().float()
+                X, AY = Z_i_w, Z_j_w @ Ec
+                diff = X - AY
                 d_e = diff.shape[1]
                 if d_e == 0:
                     continue
                 raw = (diff**2).sum(dim=1).mean()
-                # Reported under a FIXED reference (unrelated whitened latents):
-                # comparable across orchestrators, and the only option for
-                # baselines that have no penalty at all.
-                reference = float(d_high + d_low) if is_embedding else 2.0 * d_e
-                normed = float((raw / reference).item())
+                # Reported under a FIXED reference d_high + d_low (unrelated
+                # whitened latents): comparable across orchestrators, and the
+                # only option for baselines that have no penalty at all.
+                normed = float((raw / float(sum(Ec.shape))).item())
                 logs[
                     f'{prefix}/misalignment_loss_edge_{sender_idx}_{receiver_idx}'
                 ] = normed
@@ -1695,8 +1698,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 # being optimised.  Logging both keeps the headline metric
                 # comparable while making the optimised one visible.
                 energy = float(
-                    (Z_i_to_j.pow(2).sum(dim=1).mean()
-                     + Z_j_w.pow(2).sum(dim=1).mean()).item()
+                    (X.pow(2).sum(dim=1).mean()
+                     + AY.pow(2).sum(dim=1).mean()).item()
                 )
                 if energy > 1e-12:
                     normed_e = float(raw.item()) / energy
@@ -1719,9 +1722,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 n_rows = int(diff.shape[0])
                 if n_rows >= 2 and compute_mrr:
                     a = torch.nn.functional.normalize(
-                        Z_i_to_j.to(self.device), dim=1
+                        X.to(self.device), dim=1
                     )
-                    b = torch.nn.functional.normalize(Z_j_w.to(self.device), dim=1)
+                    b = torch.nn.functional.normalize(AY.to(self.device), dim=1)
                     # Chunked over sender rows so a 10k-row shared test set
                     # never materialises the full (n, n) similarity matrix.
                     ranks = []

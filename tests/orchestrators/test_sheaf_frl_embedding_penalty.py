@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 
+from src.communication.whitening import fit_alignment
 from src.orchestrators.di_sheaf_frl import DiSheafFRL
 from src.orchestrators.sheaf_frl import SheafFRL
 
@@ -64,15 +65,41 @@ def test_square_orthogonal_edge_matches_the_old_residual() -> None:
     assert torch.isclose(new, old)
 
 
-def test_general_maps_keep_the_residual_their_fit_minimises() -> None:
+def test_general_map_is_fitted_and_used_as_an_embedding() -> None:
+    orchestrator = _build(SheafFRL, 3, 2, use_general_maps=True)
+    true_map = torch.randn(3, 2)
+    Z_j = torch.randn(64, 2)
+    Z_i = Z_j @ true_map.T
+
+    orchestrator._fit_edge_map('0_1', 0, 1, Z_i, Z_j, update_maps=True)
+
+    V = orchestrator.stiefel_matrices['0_1']
+    X, AY = orchestrator._edge_sides(Z_i, Z_j, V)
+    assert (X - AY).abs().max() < 1e-2
+    assert torch.allclose(
+        orchestrator._directed_embedding_map(0, 1), V.T
+    )
+    assert orchestrator._directed_embedding_map(1, 0) is None
+
+
+def test_large_to_small_map_inverts_a_general_embedding() -> None:
     orchestrator = _build(SheafFRL, 3, 2, use_general_maps=True)
     V = torch.randn(3, 2)
-    Z_i, Z_j = torch.randn(5, 3), torch.randn(5, 2)
+    Z_j = torch.randn(5, 2)
 
-    X, AY = orchestrator._edge_sides(Z_i, Z_j, V)
+    back = Z_j @ V.T @ orchestrator._large_to_small_map(V)
 
-    assert torch.equal(X, Z_i @ V)
-    assert torch.equal(AY, Z_j)
+    assert torch.allclose(back, Z_j, atol=1e-4)
+
+
+def test_posthoc_general_embedding_map_is_fitted_small_to_large() -> None:
+    Z_r = torch.randn(64, 2)
+    Z_s = Z_r @ torch.randn(2, 3)
+
+    E = fit_alignment(Z_r, Z_s).T
+
+    assert E.shape == (2, 3)
+    assert (Z_r @ E - Z_s).abs().max() < 1e-2
 
 
 def test_dim_norm_divides_a_rectangular_edge_by_the_sum_of_dims() -> None:
