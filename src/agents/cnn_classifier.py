@@ -33,6 +33,8 @@ class CNNClassifier(PersonalizedClassifier):
         Activation function class (default: nn.ReLU).
     use_batchnorm : bool, optional
         Whether to use batch normalisation (default: False).
+    pool_blocks : list[bool], optional
+        Per encoder block, whether it ends with MaxPool2d(2) (default: all).
     weight_decay : float, optional
         L2 regularization strength (default: 0.0).
     l1_reg : float, optional
@@ -52,6 +54,7 @@ class CNNClassifier(PersonalizedClassifier):
         l1_reg: float = 0.0,
         pilot_loss_weight: float = 0.0,
         latent_norm: bool = False,
+        pool_blocks: list[bool] | None = None,
     ):
         if encoder_hidden_dims is None:
             encoder_hidden_dims = [32, 64, 128]
@@ -62,6 +65,7 @@ class CNNClassifier(PersonalizedClassifier):
             dropout=dropout,
             activation=activation,
             use_batchnorm=use_batchnorm,
+            pool_blocks=pool_blocks,
         )
 
         super().__init__(

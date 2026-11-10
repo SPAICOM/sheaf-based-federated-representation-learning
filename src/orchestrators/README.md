@@ -22,6 +22,9 @@ This module contains orchestrator implementations for federated learning that co
     - Logs cumulative `communication_kilobytes` and `communication_rounds` for each stage
 
 ### Specific Orchestrators
+- [`fedgh.py`](fedgh.py): FedGH (Yi et al., MM 2023; `refs/notes/yi2023fedgh.md`): private extractors with one shared header, the last linear layer of the decoder
+  - **Algorithm**: each round the server broadcasts the header, agents train locally for `local_epochs`, upload per-class mean representations (LARs), and the server takes one CE step on the header per LAR (`header_lr`)
+  - **Metrics**: subclass of `NonCooperativeLearning`, so comm accuracy uses the same post-hoc pilot alignment; rounds are charged to the `train` communication bucket
 - [`sheaf_frl.py`](sheaf_frl.py): Sheaf-based Federated Representation Learning orchestrator implementing the proposed framework with Sheaf regularization
   - **Algorithm**: 
     - Maintains aligned latent spaces across agents through Stiefel manifold optimization of cross-covariance matrices
@@ -52,6 +55,10 @@ This module contains orchestrator implementations for federated learning that co
     - Communication accounting charges only for exchanged projected vectors `P_ij θ_i`; raw parameter vectors `θ_i` and full matrices `P_ij` are never transmitted
     - One full alternating-gradient iteration incurs two communication rounds: one for the parameter update phase and one for the projection-matrix update phase
   - **Typical Use**: When you want the earlier sheaf-based multitask learning baseline that couples neighboring agents through parameter-space alignment
+
+- [`fedre.py`](fedre.py): FedRE baseline (Yao et al., CVPR 2026; `refs/notes/yao2026fedre.md`)
+  - **Algorithm**: each round, every client uploads one random mix of its class prototypes plus the matching soft label; the server trains a shared classifier on those pairs and broadcasts it
+  - **Key Features**: no pilots and no alignment term; decoders must be identical; with `alignment_method=null` the message is the identity, so cross-agent accuracy equals sender extractor + shared head
 
 - [`federated.py`](federated.py): Standard Federated Learning orchestrator implementing Federated Averaging (FedAvg)
   - **Algorithm**: 

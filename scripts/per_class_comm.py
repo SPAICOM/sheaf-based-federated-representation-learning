@@ -30,8 +30,11 @@ from hydra import compose, initialize_config_dir
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT))
-from multi_agent_experiment import _build_agents, _parse_per_agent_cfg  # noqa: E402
 import plot_pilot_tsne  # noqa: E402
+from multi_agent_experiment import (  # noqa: E402
+    _build_agents,
+    _parse_per_agent_cfg,
+)
 from plot_pilot_tsne import DEV, encode, load_agent, whitener  # noqa: E402
 from posthoc_on_sheaf_encoders import _setup  # noqa: E402
 
@@ -96,7 +99,7 @@ def main():
             err[score] = (((Zm - Zt[j][score]) ** 2).sum(1) / Zt[j].var(0).sum()).float()
         mis[j] = err
     print(f'map: {args.map}, fitted on {args.fit_on} ({len(Zp[0])} pilots, {n} test rows)')
-    T = {a: y for a in (0, 1)}                  # targets of agent a's decoder
+    T = dict.fromkeys((0, 1), y)                  # targets of agent a's decoder
     for spec in args.label_map:
         a, ts = spec.split(':')
         T[int(a)] = torch.tensor([int(t) for t in ts.split(',')])[y]

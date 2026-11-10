@@ -33,8 +33,12 @@ from torchvision.transforms import ToTensor
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT))
-from multi_agent_experiment import _build_agents, _parse_per_agent_cfg  # noqa: E402
+from multi_agent_experiment import (  # noqa: E402
+    _build_agents,
+    _parse_per_agent_cfg,
+)
 from posthoc_on_sheaf_encoders import _setup  # noqa: E402
+
 from src.communication.whitening import ledoit_wolf_shrinkage  # noqa: E402
 
 # agent 1 architectures of the 6v6 runs (tmp/2026-10-30_6v6_noncoop.sh)

@@ -70,6 +70,10 @@ class CNN(nn.Module):
     use_batchnorm : bool, optional
         Whether to add BatchNorm2d after each Conv2d layer.
         Default: False.
+    pool_blocks : list[bool], optional
+        Per block, whether it ends with MaxPool2d(2). Default: every block
+        pools. Unpooled blocks let the network get deeper than the image's
+        log2 side, e.g. to funnel the channels down to a small latent.
 
     Attributes
     ----------
@@ -94,22 +98,28 @@ class CNN(nn.Module):
         dropout: float = 0.0,
         activation: type[nn.Module] = nn.ReLU,
         use_batchnorm: bool = False,
+        pool_blocks: list[bool] | None = None,
     ):
         super().__init__()
 
         if hidden_dims is None:
             hidden_dims = [32, 64, 128]
+        if pool_blocks is None:
+            pool_blocks = [True] * len(hidden_dims)
+        if len(pool_blocks) != len(hidden_dims):
+            raise ValueError('pool_blocks must have one entry per hidden_dims block')
 
         layers = []
         in_ch = in_features
-        for out_ch in hidden_dims:
+        for out_ch, pool in zip(hidden_dims, pool_blocks):
             layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
             if use_batchnorm:
                 layers.append(nn.BatchNorm2d(out_ch))
             layers.append(
                 activation() if isinstance(activation, type) else activation
             )
-            layers.append(nn.MaxPool2d(2))
+            if pool:
+                layers.append(nn.MaxPool2d(2))
             if dropout > 0:
                 layers.append(nn.Dropout2d(p=dropout))
             in_ch = out_ch

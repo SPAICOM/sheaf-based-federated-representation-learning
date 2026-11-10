@@ -73,8 +73,8 @@ import seaborn as sns
 # here is an (orchestrator, alignment_method, anchor_selection) triple.
 from plot_multiagent_metrics import (  # noqa: E402
     _MPLSTYLE,
-    ORCH_ORDER,
     ORCH_LABELS,
+    ORCH_ORDER,
     _load_raw_config,
     _remote_mtime,
     _savefig,

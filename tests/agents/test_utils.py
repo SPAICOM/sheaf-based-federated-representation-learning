@@ -74,3 +74,24 @@ class TestMLP:
         loss = y.sum()
         loss.backward()
         assert x.grad is not None
+
+
+class TestCNNPoolBlocks:
+    """pool_blocks lets the CNN go deeper than log2(image side)."""
+
+    def test_unpooled_funnel_to_small_latent(self):
+        enc = CNN(in_features=3, hidden_dims=[8, 16, 8, 4, 2],
+                  pool_blocks=[True, True, False, False, False], use_batchnorm=True)
+        assert enc.out_features == 2
+        out = enc(torch.randn(2, 3, 16, 16))
+        assert out.shape == (2, 2, 4, 4)
+        out.sum().backward()
+        assert enc.layers[0].weight.grad is not None
+
+    def test_default_pools_every_block(self):
+        assert CNN(in_features=3, hidden_dims=[8, 8])(torch.randn(1, 3, 16, 16)).shape[-1] == 4
+
+    def test_length_mismatch_raises(self):
+        import pytest
+        with pytest.raises(ValueError):
+            CNN(in_features=3, hidden_dims=[8, 8], pool_blocks=[True])

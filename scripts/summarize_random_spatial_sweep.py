@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pandas as pd
 
-
 VALUES = (0.10, 0.20, 0.30, 0.40, 0.50)
 ORCHESTRATORS = ('SheafFRL', 'NonCooperativeLearning')
 

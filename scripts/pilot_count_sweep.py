@@ -30,7 +30,11 @@ import torch
 from hydra import compose, initialize_config_dir
 
 sys.path.insert(0, str(Path(__file__).parent))
-from multi_agent_experiment import _build_agents, _build_orchestrator, _parse_per_agent_cfg  # noqa: E402
+from multi_agent_experiment import (  # noqa: E402
+    _build_agents,
+    _build_orchestrator,
+    _parse_per_agent_cfg,
+)
 from posthoc_on_sheaf_encoders import _setup  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]

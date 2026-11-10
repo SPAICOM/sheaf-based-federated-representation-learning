@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -21,6 +22,7 @@ from plot_6v6_cnorm_study import METRICS
 ROOT = Path(__file__).resolve().parents[1]
 PROJECT = 'engrima18/cifar10_2agents_grayblur_7v7'
 OUT = ROOT / 'results/cifar10_2agents_grayblur_7v7/pilot_count_study'
+TICKS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8128]   # labelled subset of the pilot counts
 METHODS = {  # label -> (groups, extra run ids at 2048 pilots, colour)
     'non-coop': (['pilotsweep_cnorm_noncoop'], ['qt7wgve3'], 'tab:gray'),
     'DiSheafFRL λ=3e-2': (['pilotsweep_cnorm_disheaf'], ['utjhk1eb'], 'tab:green'),
@@ -61,8 +63,8 @@ def main():
         for label, d in data.items():
             ax.plot(d.pilots, d[col], 'o-', color=METHODS[label][2], label=label)
         ax.set_xscale('log', base=2)
-        ax.set_xticks(data['non-coop'].pilots)
-        ax.set_xticklabels(data['non-coop'].pilots)
+        ax.set_xticks(TICKS)
+        ax.set_xticklabels(TICKS)
         ax.set_xlabel('number of shared pilots')
         ax.set_title(title, fontsize=10)
         ax.grid(alpha=0.3)
@@ -80,8 +82,8 @@ def main():
     for label, d in data.items():
         ax.plot(d.pilots, d['comm test'], 'o-', color=METHODS[label][2], label=label, lw=2)
     ax.set_xscale('log', base=2)
-    ax.set_xticks(data['non-coop'].pilots)
-    ax.set_xticklabels(data['non-coop'].pilots)
+    ax.set_xticks(TICKS)
+    ax.set_xticklabels(TICKS)
     ax.set_xlabel('number of shared pilots')
     ax.set_ylabel('post-comm test accuracy (avg of both directions)\n10 test classes, max 0.7')
     ax.set_title('CIFAR-10 7v7, two ResNets, CenterNorm, shared unlabeled pilots, single seed', fontsize=9)

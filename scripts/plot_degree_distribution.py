@@ -41,7 +41,11 @@ from hydra.core.global_hydra import GlobalHydra
 # Reuse the shared matplotlib style, figure-saving helper, and the
 # multi_agent_experiment.py loader (for _parse_agent_target_classes) from the
 # main plotting script, so this figure looks like every other one here.
-from plot_multiagent_metrics import _MPLSTYLE, _load_mae, _savefig  # noqa: E402
+from plot_multiagent_metrics import (  # noqa: E402
+    _MPLSTYLE,
+    _load_mae,
+    _savefig,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _REPO_ROOT / 'config' / 'hydra'

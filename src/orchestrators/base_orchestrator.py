@@ -32,6 +32,12 @@ from src.communication.whitening import (
 )
 from src.utils import calculate_communication_cost
 from src.utils.anchors import select_paired_anchors
+from src.utils.simclr import (
+    frozen_running_stats,
+    nt_xent,
+    projection_head,
+    simclr_augment,
+)
 
 
 class BaseOrchestrator(l.LightningModule, ABC):
@@ -83,6 +89,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
         pid_embed_dim: int = 10,
         eval_on_class_intersection: bool = False,
         train_comm_eval_every_n_epochs: int = 1,
+        simclr_weight: float = 0.0,
+        simclr_temperature: float = 0.5,
+        simclr_sources: tuple[str, ...] = ('train', 'pilots'),
+        simclr_proj_dim: int = 128,
+        simclr_hidden_dim: int = 512,
         **kwargs: Any,
     ):
         super().__init__()
@@ -108,6 +119,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
         self.agents = nn.ModuleDict(
             {str(idx): agent for idx, agent in agents.items()}
+        )
+        self._init_simclr(
+            simclr_weight, simclr_temperature, simclr_sources,
+            simclr_proj_dim, simclr_hidden_dim,
         )
         self._validation_prefixes_seen: set[str] = set()
         self._latent_buffer: dict[int, list[torch.Tensor]] = {}
@@ -1644,16 +1659,28 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     continue
 
                 Mc = M.detach().cpu().float()
-                Z_i_to_j = Z_i_w @ Mc
+                # A rectangular isometry is an embedding: score X − A·Y in the
+                # higher dimension, as the sheaf penalty does.  Equal-dim or
+                # non-isometric maps keep Z_i M − Z_j (identical when square
+                # orthogonal).
+                d_high, d_low = Mc.shape
+                is_embedding = d_high > d_low and torch.allclose(
+                    Mc.T @ Mc, torch.eye(d_low), atol=1e-3
+                )
+                if is_embedding:
+                    Z_i_to_j, Z_j_w = Z_i_w, Z_j_w @ Mc.T
+                else:
+                    Z_i_to_j = Z_i_w @ Mc
                 diff = Z_i_to_j - Z_j_w
                 d_e = diff.shape[1]
                 if d_e == 0:
                     continue
                 raw = (diff**2).sum(dim=1).mean()
-                # Reported under the FIXED 2*d_e reference: comparable across
-                # every orchestrator and every historical run, and the only
-                # option for baselines that have no penalty at all.
-                normed = float((raw / (2.0 * d_e)).item())
+                # Reported under a FIXED reference (unrelated whitened latents):
+                # comparable across orchestrators, and the only option for
+                # baselines that have no penalty at all.
+                reference = float(d_high + d_low) if is_embedding else 2.0 * d_e
+                normed = float((raw / reference).item())
                 logs[
                     f'{prefix}/misalignment_loss_edge_{sender_idx}_{receiver_idx}'
                 ] = normed
@@ -2106,6 +2133,73 @@ class BaseOrchestrator(l.LightningModule, ABC):
         """
         pass
 
+    # ── Optional local SimCLR term (same for every orchestrator) ──────────────
+
+    def _init_simclr(self, weight, temperature, sources, proj_dim, hidden_dim):
+        """Per-agent SimCLR projection heads; ``weight == 0`` disables the term."""
+        self._simclr_weight = float(weight)
+        self._simclr_temperature = float(temperature)
+        self._simclr_sources = tuple(str(s) for s in sources)
+        bad = set(self._simclr_sources) - {'train', 'pilots'}
+        if bad or not self._simclr_sources:
+            raise ValueError(
+                f"simclr_sources must be a non-empty subset of ('train', 'pilots'), got {sources}"
+            )
+        if self._simclr_weight <= 0.0:
+            self.simclr_heads = None
+            return
+        heads = {}
+        for idx, agent in self.agents.items():
+            first = next(
+                (m for m in agent.decoder.modules() if isinstance(m, nn.Linear)), None
+            )
+            if first is None:
+                raise ValueError(
+                    f'SimCLR: cannot infer latent dim of agent {idx} (no nn.Linear in decoder)'
+                )
+            heads[idx] = projection_head(first.in_features, hidden_dim, proj_dim)
+        self.simclr_heads = nn.ModuleDict(heads)
+
+    def _pilot_key(self, batch, idx):
+        return next(
+            (
+                k
+                for k in (f'global_pilot_{idx}', f'pilot_{idx}', 'global_pilot')
+                if k in batch
+            ),
+            None,
+        )
+
+    def _local_simclr_loss(self, agent, batch, idx):
+        """SimCLR (NT-Xent) on two augmented views of this step's task batch
+        and/or pilot batch (``simclr_sources``), through the agent's encoder and
+        its projection head. Running BN/CenterNorm stats are not updated."""
+        if self.simclr_heads is None:
+            return 0.0
+        if isinstance(batch, tuple):
+            batch = batch[0]
+        xs = []
+        if 'train' in self._simclr_sources:
+            key = next(k for k in (idx, str(idx), int(idx)) if k in batch)
+            xs.append(self._unpack_task_batch(batch[key])[0])
+        if 'pilots' in self._simclr_sources:
+            key = self._pilot_key(batch, idx)
+            if key is None:
+                raise ValueError('simclr_sources includes pilots but the batch has none')
+            xs.append(self._unpack_task_batch(batch[key])[0])
+        x = torch.cat([t.to(self.device) for t in xs])
+        v1, v2 = simclr_augment(x), simclr_augment(x)
+        last = getattr(agent, '_last_latent', None)
+        with frozen_running_stats(agent):
+            z = agent.encode(torch.cat([v1, v2]))
+        if last is not None:
+            agent._last_latent = last
+        p = self.simclr_heads[str(idx)](z)
+        loss = nt_xent(p[: x.shape[0]], p[x.shape[0]:], self._simclr_temperature)
+        self.log(f'train/simclr_loss_{idx}', loss.detach(), on_step=False,
+                 on_epoch=True, batch_size=x.shape[0])
+        return self._simclr_weight * loss
+
     def _local_pilot_loss(self, agent, batch, idx):
         """Same local pilot supervision in cooperative and independent training."""
         weight = getattr(agent, 'pilot_loss_weight', 0.0)
@@ -2117,14 +2211,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         # (one shared split for every agent); the per-agent keys come from
         # private_pilots. Without the shared key this raised for every
         # shared-pilot config, so the supervision was unreachable there.
-        key = next(
-            (
-                k
-                for k in (f'global_pilot_{idx}', f'pilot_{idx}', 'global_pilot')
-                if k in batch
-            ),
-            None,
-        )
+        key = self._pilot_key(batch, idx)
         if key is None:
             raise ValueError(
                 'Local pilot supervision requires per-agent pilot batches.'
@@ -2396,7 +2483,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
 
     @torch.no_grad()
     def _encode_full_training_set(
-        self, dm
+        self, dm, num_workers: int = 0
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]:
         """Encode each agent's training set once.
 
@@ -2450,7 +2537,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 ds,
                 batch_size=256,
                 shuffle=False,
-                num_workers=0,
+                num_workers=int(num_workers),
                 collate_fn=_collate,
             )
             was_training = agent.training

@@ -19,7 +19,7 @@ ZCA refit / pilot sweeps set ``ds.transform = None``) must not remove it.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from PIL import Image, ImageDraw
 from torchvision import transforms

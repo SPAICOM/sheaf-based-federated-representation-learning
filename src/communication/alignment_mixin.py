@@ -104,7 +104,9 @@ class PostTrainingAlignmentMixin:
         Returns True if at least one alignment map was successfully fitted.
         """
         from PIL import Image as _PILImg
-        from torchvision.transforms.functional import to_tensor as _pil_to_tensor
+        from torchvision.transforms.functional import (
+            to_tensor as _pil_to_tensor,
+        )
 
         train_datasets = getattr(dm, 'train_datasets', None)
         pilot_datasets = getattr(dm, 'pilot_datasets', None)
@@ -607,7 +609,9 @@ class PostTrainingAlignmentMixin:
         logging so that ``self.log_dict`` runs outside the no-grad context.
         """
         from PIL import Image as _PILImg
-        from torchvision.transforms.functional import to_tensor as _pil_to_tensor
+        from torchvision.transforms.functional import (
+            to_tensor as _pil_to_tensor,
+        )
 
         test_datasets = getattr(dm, 'test_datasets', None)
         if not test_datasets:

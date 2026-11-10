@@ -13,10 +13,10 @@ both with shared pilots (tmp/2026-11-03_7v7_cnorm_sharedpilots_disheaf.sh).
 """
 
 import argparse
-
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd

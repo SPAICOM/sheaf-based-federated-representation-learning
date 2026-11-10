@@ -17,7 +17,6 @@ from pathlib import Path
 import pandas as pd
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-
 from run_reconstruction_loss_ablation import ROOT, execute_runs
 
 METHODS = {
@@ -125,7 +124,9 @@ def main() -> None:
 
     # Import after the script directory is available for reusable runner imports.
     sys.path.insert(0, str(ROOT))
-    from src.datamodules.mask_generators import ConstantVisibleSharedMaskGenerator
+    from src.datamodules.mask_generators import (
+        ConstantVisibleSharedMaskGenerator,
+    )
 
     configs = []
     with initialize_config_dir(config_dir=str(ROOT / 'config/hydra'), version_base='1.3'):

@@ -1,0 +1,54 @@
+# Bottleneck study on clean 7v7 (agent 0 classes 0-6, agent 1 classes 3-9, no input
+# corruption, full 10-class test split, cap 0.7) with two different architectures:
+# agent 0 a small ResNet-10 (~0.3-0.45M params), agent 1 a small plain VGG-style CNN (~0.15-0.23M) (no skip connections). Both latents
+# have the edge dimension d and only the bottleneck layer changes with d: the ResNet's last
+# residual stage and the CNN's last conv have width d, every other layer is fixed (no
+# adapter layer); the latent is the global average pool of the last conv map, then
+# CenterNorm. The per-d lists are set on the command line by
+# tmp/2026-11-07_7v7_clean_bottleneck.sh; with no override this is d=64.
+# 2048 shared unlabeled pilots over all classes (removed from training), CenterNorm,
+# no whitening. DiSheafFRL λ is picked per d by lmb_study (5-point grid on
+# [1e-3, 1e-1], 20 epochs each, comm accuracy on a 10% holdout of the training draw).
+defaults:
+  - cifar10_2agents_7v7
+  - _self_
+
+study_name: "CIFAR-10 2 agents clean 7v7, ResNet vs CNN, bottleneck sweep"
+logger:
+  project: cifar10_2agents_7v7_bottleneck
+
+trainer:
+  max_epochs: 100
+
+lmb_study:
+  enabled: false        # on for the DiSheafFRL shift-1.0 run of every d
+  sampler: grid
+  objective: comm
+  n_trials: 5
+  n_tune_epochs: 20
+  lmb_low: 1e-3
+  lmb_high: 1e-1
+  val_split: 0.1
+
+dataset:
+  num_workers: 1        # every loader spawns its own workers (~10 procs/job); RAM is the limit with 7 jobs
+  pilot_source: pool
+  pilot_exclusive: true
+  pilot_class_filter: false
+  pilot_num_samples: 2048
+
+model:
+  latent_norm: true
+  agents:
+    0:   # small ResNet-10 (widths 32-64-128), last stage = bottleneck (d=64)
+      encoder_hidden_dims: [32, 64, 128, 64]
+      blocks_per_stage: [1, 1, 1, 1]
+      stage_strides: [1, 2, 2, 2]
+    1:   # small VGG-style CNN, 2 convs per stage, 3 pooled stages (32 -> 4 px), last conv = bottleneck (d=64)
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 32, 64, 64, 128, 64]
+      pool_blocks: [false, true, false, true, false, true]
+      use_batchnorm: true
+
+orchestrator:
+  posthoc_whitening: false

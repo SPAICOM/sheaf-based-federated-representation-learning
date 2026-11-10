@@ -58,6 +58,7 @@ from src.utils.progress import StatusFileCallback
 # ── Orchestrators that support max_lmb and/or comm_task_coeff ─────────────────
 ORCHESTRATORS_WITH_LMB = {
     'SheafFRL',
+    'DiSheafFRL',
     'SheafCFRL',
     'SheafFMTL',
     'CESheafFRL',

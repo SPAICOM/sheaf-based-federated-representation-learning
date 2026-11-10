@@ -4,6 +4,8 @@ Orchestrators for federated learning coordination.
 This package provides orchestration classes that manage training across
 multiple federated learning agents:
 - FederatedLearning: Federated averaging with neighbor-restricted updates
+- FedRE: server-trained shared classifier from entangled representations
+- FedGH: private extractors with a server-trained shared header (Yi et al., MM 2023)
 - FedPer: centralized shared-base training with personalized heads
 - LGFed: centralized shared-head training with personalized encoders (reverse of FedPer)
 - HeteroFL: heterogeneous-width federated learning (Diao et al., ICLR 2021)
@@ -27,12 +29,15 @@ Each orchestrator:
 from .ce_sheaf_frl import CESheafFRL
 from .comfed import ComFed
 from .dfedu import DFedU
+from .di_sheaf_frl import DiSheafFRL
 from .dpsgd import DPSGD
 from .epochend_dpsgd import EpochEndDPSGD
 from .federated import FederatedLearning
+from .fedgh import FedGH
 from .fedmuscle import FedMuscle
 from .fedper import FedPer
 from .fedproto import FedProto
+from .fedre import FedRE
 from .heterofl import HeteroFL
 from .lgfed import LGFed
 from .non_cooperative import NonCooperativeLearning
@@ -40,7 +45,6 @@ from .sheaf_align import SheafAlign
 from .sheaf_cfrl import SheafCFRL
 from .sheaf_fmtl import SheafFMTL
 from .sheaf_frl import SheafFRL
-from .di_sheaf_frl import DiSheafFRL
 
 __all__ = [
     'ComFed',
@@ -49,9 +53,11 @@ __all__ = [
     'DFedU',
     'DPSGD',
     'EpochEndDPSGD',
+    'FedGH',
     'FedMuscle',
     'FedPer',
     'FedProto',
+    'FedRE',
     'LGFed',
     'FederatedLearning',
     'HeteroFL',

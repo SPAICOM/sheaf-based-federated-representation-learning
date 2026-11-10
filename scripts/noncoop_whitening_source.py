@@ -27,15 +27,14 @@ sys.path.append(str(Path(sys.path[0]).parent))
 
 import pandas as pd
 import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
-
 from diagnose_mrr_collapse import (  # noqa: E402
     CONFIG_DIR,
     CONFIG_NAME,
     build_datamodule,
     load_orchestrator,
 )
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
 
 KEYS = {
     'comm_acc': 'test/avg_comm_task_perf',

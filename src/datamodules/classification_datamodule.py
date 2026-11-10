@@ -13,7 +13,7 @@ Features:
 """
 
 import copy
-from typing import Callable
+from collections.abc import Callable
 
 import lightning as l
 import torch

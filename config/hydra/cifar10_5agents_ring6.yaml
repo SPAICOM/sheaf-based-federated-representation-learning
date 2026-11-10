@@ -1,0 +1,32 @@
+# 5 agents on a class-cover ring with 6 target classes per agent (4 missing), vs 7 in
+# cifar10_5agents_ring. Each pair of non-neighbours shares 2 missing classes, neighbours
+# miss disjoint sets (union = all 10 -> edge):
+#   M_0={0,3,5,8} M_1={1,4,6,9} M_2={0,2,5,7} M_3={1,3,6,8} M_4={2,4,7,9}
+#   -> ring 0-1-2-3-4-0, degree 2; neighbours share 2 classes (4 in the 7-class ring).
+# (6 is the minimum for a 5-ring: every class can be missing at at most 2 agents.)
+# Tests whether a smaller label coverage per agent keeps a DiSheafFRL gap at shift < 1.
+defaults:
+  - cifar10_5agents_base
+  - _self_
+
+study_name: "CIFAR-10 5 agents ring (class cover, 6 classes/agent)"
+logger:
+  project: cifar10_5agents_ring6
+
+dataset:
+  groups:
+    0:
+      agents: [0]
+      target_classes: [1, 2, 4, 6, 7, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 2, 3, 5, 7, 8]
+    2:
+      agents: [2]
+      target_classes: [1, 3, 4, 6, 8, 9]
+    3:
+      agents: [3]
+      target_classes: [0, 2, 4, 5, 7, 9]
+    4:
+      agents: [4]
+      target_classes: [0, 1, 3, 5, 6, 8]

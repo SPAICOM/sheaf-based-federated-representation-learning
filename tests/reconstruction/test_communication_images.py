@@ -5,7 +5,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from scripts.reconstruction_experiment import MaskedReconstructionDiagnosticsCallback
+from scripts.reconstruction_experiment import (
+    MaskedReconstructionDiagnosticsCallback,
+)
 from src.communication.alignment_mixin import PostTrainingAlignmentMixin
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 

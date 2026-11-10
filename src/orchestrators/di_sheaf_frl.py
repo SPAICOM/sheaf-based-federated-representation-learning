@@ -7,9 +7,9 @@ competent its own decoder is on its own latent (no labels):
     c_i,r = max logit, z-scored over the batch     (gate_score='zlogit')
 
 and the gate ``a_r = σ((c_i,r − c_j,r) / τ)`` (no gradient) decides who leads.
-The symmetric penalty ``‖z_i V − z_j‖²`` is replaced by
+The symmetric penalty ``‖z_i − V z_j‖²`` (``z_i`` the higher-dim side) is replaced by
 
-    P = mean_r [ a_r ‖sg(z_i) V − z_j‖² + (1 − a_r) ‖z_i V − sg(z_j)‖² ]
+    P = mean_r [ a_r ‖sg(z_i) − V z_j‖² + (1 − a_r) ‖z_i − V sg(z_j)‖² ]
 
 so where agent i is the stronger one its latents are a frozen target and only
 agent j's encoder moves toward them, and vice versa.  ``a_r = ½`` (equal
@@ -78,8 +78,8 @@ class DiSheafFRL(SheafFRL):
             (self._competence(node_i, Z_i) - self._competence(node_j, Z_j))
             / self._gate_temperature
         )
-        A, B = Z_i @ V, Z_j                      # same rows as `sides`
-        A_lead, B_lead = Z_i.detach() @ V, Z_j.detach()
+        A, B = self._edge_sides(Z_i, Z_j, V)     # same rows as `sides`
+        A_lead, B_lead = self._edge_sides(Z_i.detach(), Z_j.detach(), V)
         sq_i_leads = (A_lead - B).pow(2).sum(dim=1)   # only j's encoder (and V) move
         sq_j_leads = (A - B_lead).pow(2).sum(dim=1)   # only i's encoder (and V) move
         t_i = (a * sq_i_leads).mean()
@@ -88,7 +88,7 @@ class DiSheafFRL(SheafFRL):
             e = lambda X: X.pow(2).sum(dim=1).mean()
             normed = t_i / (e(A_lead) + e(B)).clamp(min=1e-12) + t_j / (e(A) + e(B_lead)).clamp(min=1e-12)
         else:
-            normed = (t_i + t_j) / (2.0 * diff.shape[1])
+            normed = (t_i + t_j) / self._edge_unaligned_energy(edge_key, diff)
         if self.training:
             self.log(f'train/gate_mean_{edge_key}', a.mean(), on_step=False, on_epoch=True)
             self.log(f'train/gate_frac_i_leads_{edge_key}', (a > 0.5).float().mean(),

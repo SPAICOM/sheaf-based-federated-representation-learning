@@ -17,6 +17,7 @@ def generate_neighbors(
         'fully_connected',
         'manual',
         'class_overlap',
+        'class_cover',
     ],
     n_agents: int,
     seed: int = 42,
@@ -43,6 +44,9 @@ def generate_neighbors(
         - "class_overlap": Sparse, connected graph keeping the edges between
           the agents that share the most target classes (see
           ``class_overlap_neighbors``).
+        - "class_cover": edge (i, j) iff the union of the two agents' target
+          classes is every class held by any agent (see
+          ``class_cover_neighbors``). Raises if the graph is disconnected.
     n_agents : int
         Number of agents (nodes) in the graph
     seed : int
@@ -116,11 +120,19 @@ def generate_neighbors(
                 similarity=similarity,
             )
 
+        case 'class_cover':
+            if target_classes is None:
+                raise ValueError(
+                    "mode='class_cover' requires target_classes "
+                    '(per-agent target class sets).'
+                )
+            return class_cover_neighbors(target_classes)
+
         case _:
             raise ValueError(
                 f'Unknown neighbors_mode: {mode}. Valid options: '
                 "'manual', 'erdos_renyi', 'barabasi', 'fully_connected', "
-                "'class_overlap'"
+                "'class_overlap', 'class_cover'"
             )
 
     # Convert NetworkX graph to neighbor dictionary format
@@ -208,4 +220,34 @@ def class_overlap_neighbors(
         neighbors[i].add(j)
         neighbors[j].add(i)
 
+    return neighbors
+
+
+def class_cover_neighbors(
+    target_classes: dict[int, set[int]],
+) -> dict[int, set[int]]:
+    """Link two agents iff together they hold every class.
+
+    The class universe is the union of all agents' target classes. Edge (i, j)
+    exists iff ``target_classes[i] | target_classes[j]`` equals that universe,
+    i.e. each endpoint can, in principle, receive every class it is missing.
+    The graph is fully determined by the class assignment, so sparsity and
+    connectivity are design choices of the split; a disconnected result raises.
+    """
+    agents = sorted(target_classes)
+    universe = set().union(*target_classes.values()) if agents else set()
+    neighbors: dict[int, set[int]] = {i: set() for i in agents}
+    for a, i in enumerate(agents):
+        for j in agents[a + 1 :]:
+            if target_classes[i] | target_classes[j] == universe:
+                neighbors[i].add(j)
+                neighbors[j].add(i)
+    G = nx.Graph()
+    G.add_nodes_from(agents)
+    G.add_edges_from((i, j) for i in agents for j in neighbors[i])
+    if len(agents) > 1 and not nx.is_connected(G):
+        raise ValueError(
+            'class_cover graph is disconnected for target classes '
+            f'{target_classes}: components {list(nx.connected_components(G))}'
+        )
     return neighbors

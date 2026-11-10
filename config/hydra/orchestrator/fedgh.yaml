@@ -1,0 +1,11 @@
+# FedGH (Yi et al., MM '23; refs/notes/yi2023fedgh.md): private extractors + a shared
+# last linear layer, trained on the server from per-class mean representations.
+# Post-hoc alignment and pilot settings are inherited, so its comm accuracy is
+# scored exactly like non_cooperative's.
+defaults:
+  - non_cooperative
+  - _self_
+
+_target_: src.orchestrators.FedGH
+header_lr: 0.01   # server SGD step per LAR, eq. 4 (paper default)
+local_epochs: 1   # E, local epochs per round; the paper grid-searches {1,10,30,50,100}

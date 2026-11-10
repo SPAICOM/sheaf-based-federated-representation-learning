@@ -405,7 +405,8 @@ class SheafFRL(BaseOrchestrator):
 
         Edge key ``'{node_i}_{node_j}'`` is oriented so ``d_node_i >= d_node_j``;
         the map ``V`` has shape ``(d_i, d_j)`` and embeds node j's stalk into
-        node i's.  Overridden by :class:`SheafCFRL`, which instead builds two
+        node i's (``z_i ≈ V z_j``, i.e. ``Z_i ≈ Z_j Vᵀ`` on row batches).
+        Overridden by :class:`SheafCFRL`, which instead builds two
         fat semi-orthogonal maps per edge that project into a compressed edge
         stalk.
         """
@@ -451,6 +452,33 @@ class SheafFRL(BaseOrchestrator):
             'dual_lambdas', torch.zeros(len(self._dual_edge_index))
         )
 
+    def _edge_sides(
+        self, Z_i: torch.Tensor, Z_j: torch.Tensor, V: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two sides ``(X, A·Y)`` of the coboundary ``X − A·Y``.
+
+        ``X = Z_i`` is the higher-dimensional side and ``A·Y = Z_j Vᵀ`` is the
+        lower-dimensional side isometrically embedded into it.  General maps
+        keep the residual their least-squares fit minimises (``Z_i V − Z_j``);
+        there ``Vᵀ`` is not an embedding of the fitted map.
+        """
+        if self.hparams.use_general_maps:
+            return torch.matmul(Z_i, V), Z_j
+        return Z_i, torch.matmul(Z_j, V.T)
+
+    def _edge_unaligned_energy(
+        self, edge_key: str, diff: torch.Tensor
+    ) -> float:
+        """``E‖diff‖²`` for two unrelated whitened latents on this edge.
+
+        ``d_i + d_j`` for an isometric embedding (``2·d`` on equal-dim edges);
+        ``2·d_e`` when both sides live in the ``d_e``-dim coboundary space.
+        """
+        V = self.stiefel_matrices.get(edge_key)
+        if V is None or self.hparams.use_general_maps:
+            return 2.0 * diff.shape[1]
+        return float(V.shape[0] + V.shape[1])
+
     def _edge_penalty_term(
         self,
         edge_key: str,
@@ -459,10 +487,11 @@ class SheafFRL(BaseOrchestrator):
     ) -> torch.Tensor:
         """One edge's contribution to the sheaf penalty, per the active λ mode.
 
-        ``diff`` holds the matched-row coboundary residuals in the edge's
-        coboundary space, shape ``(n, d_e)`` — ``d_e = d_j`` for embedding
-        maps, ``c_ij`` for compressed edge stalks (i.e. the alignment map's
-        row dimension: each row of ``diff`` lives in this space).
+        ``diff`` holds the matched-row coboundary residuals, shape
+        ``(n, d_e)`` — ``d_e = d_i`` (the higher dimension) for embedding
+        maps, ``c_ij`` for compressed edge stalks.  On a rectangular
+        embedding edge the ``2·d_e`` below reads ``d_i + d_j``
+        (:meth:`_edge_unaligned_energy`).
 
         The raw penalty is ``mean_rows ‖diff‖²``.  How it is normalised is
         set by ``penalty_norm``:
@@ -520,7 +549,7 @@ class SheafFRL(BaseOrchestrator):
         else:
             if str(self.hparams.penalty_norm) == 'energy':
                 self._warn_missing_penalty_sides()
-            normed = penalty / (2.0 * diff.shape[1])
+            normed = penalty / self._edge_unaligned_energy(edge_key, diff)
         if not self._dual_lmb_enabled():
             return normed
         resid = normed.detach()
@@ -1989,10 +2018,10 @@ class SheafFRL(BaseOrchestrator):
                     prefix='train',
                     mode='penalty',
                 )
-            Z_i_mapped = torch.matmul(Z_i, V)
-            diff = Z_i_mapped - Z_j
+            X, AY = self._edge_sides(Z_i, Z_j, V)
+            diff = X - AY
             sheaf_penalty += self._edge_penalty_term(
-                edge_key, diff, sides=(Z_i_mapped, Z_j)
+                edge_key, diff, sides=(X, AY)
             )
 
             # ── After-communication task loss ─────────────────────────────────
@@ -2110,6 +2139,7 @@ class SheafFRL(BaseOrchestrator):
 
             if prefix == 'train':
                 agent_losses[idx] += self._local_pilot_loss(agent, batch, idx)
+                agent_losses[idx] += self._local_simclr_loss(agent, batch, idx)
 
             # ── Pilot extraction ─────────────────────────────────────────────
             if pilots_available:
