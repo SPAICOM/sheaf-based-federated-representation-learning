@@ -53,7 +53,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from src.utils import remove_non_empty_dir
 from src.utils.graph_generator import generate_neighbors
-from src.utils.progress import StatusFileCallback
+from src.utils.progress import EpochProgressBar, StatusFileCallback
 
 # ── Orchestrators that support max_lmb and/or comm_task_coeff ─────────────────
 ORCHESTRATORS_WITH_LMB = {
@@ -695,6 +695,7 @@ def main(cfg: DictConfig) -> float:
         name_parts.append(f'shift_{shift}_p{pilots}_')
     else:
         name_parts.append(f'shift_{shift}_')
+    name_parts.append(f'seed{int(cfg.seed)}')
     name_parts.append(str(job_num))
     run_name = '_'.join(name_parts)
 
@@ -725,6 +726,7 @@ def main(cfg: DictConfig) -> float:
             trainer_kwargs.pop(key, None)
     callbacks = [instantiate(cb_conf) for cb_conf in cfg.callbacks.values()]
     callbacks.append(StatusFileCallback())
+    callbacks.append(EpochProgressBar())
     trainer = Trainer(**trainer_kwargs, callbacks=callbacks, logger=logger)
 
     trainer.fit(orchestrator, datamodule=datamodule)
