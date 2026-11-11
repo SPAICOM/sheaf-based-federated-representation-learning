@@ -1,0 +1,12 @@
+# Shared three-seed map ablation protocol.
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+dataset:
+  batch_size: 256
+  pilot_num_samples: 4096
+orchestrator:
+  use_general_maps: false
+  soft_maps: false
+  general_map_ols: false

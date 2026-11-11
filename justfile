@@ -4,11 +4,15 @@ setup:
 
 # Run static analysis and automatically fix issues where possible
 check:
-    uvx ruff check . --fix
+    uv run --locked ruff check . --fix
+
+# Check lint rules without modifying source files
+lint-check:
+    uv run --locked ruff check . --no-fix
 
 # Format code according to project style
 format:
-    uvx ruff format .
+    uv run --locked ruff format .
 
 # Run formatting and linting (CI-style target)
 clean: format check
@@ -347,6 +351,42 @@ smoke config *args="":
 score objective *args="":
     uv run python scripts/score_run.py {{objective}} {{args}}
 
-# Table + curves of a finished sweep from wandb → tmp/<date>_<project>_<slug>/ (see scripts/sweep_report.py)
+# Table + curves of a finished sweep from wandb → tmp/<date>_<project>_<slug>/
 report project *args:
     uv run python scripts/sweep_report.py {{project}} {{args}}
+
+# MNIST two-agent 7-vs-7, CenterNorm and exclusive pool pilots, clean inputs.
+mnist-7v7 *args="":
+    uv run python scripts/multi_agent_experiment.py --config-name mnist_2agents_7v7 {{args}}
+
+# MNIST 7-vs-7 with native grayscale vs CIFAR-matched Gaussian blur.
+mnist-grayblur-7v7 *args="":
+    uv run python scripts/multi_agent_experiment.py --config-name mnist_2agents_grayblur_7v7 {{args}}
+
+# MNIST four-agents 7-vs-7 (CNNs); setup = clean | grayblur.
+mnist-4agents setup="clean" *args="":
+    uv run python scripts/multi_agent_experiment.py --config-name {{if setup == "clean" {"mnist_4agents_shift"} else {"mnist_4agents_grayblur_shift"}}} {{args}}
+
+# Run one map-ablation experiment (method = zca | ols), with Hydra overrides.
+mnist4-mapstudy method *args="":
+    uv run python scripts/multi_agent_experiment.py --config-name mnist_4agents_mapstudy_{{method}} {{args}}
+
+# Regenerate the retained two-agent summary from remote W&B.
+mnist-7v7-summary:
+    uv run python scripts/plot_mnist_7v7.py
+
+# Re-score saved four-agent checkpoints and regenerate the pilot summary.
+mnist4-pilot-summary:
+    uv run python scripts/plot_mnist4_pilots.py
+
+# Regenerate the four-agent lambda summary from remote W&B.
+mnist4-lambda-summary:
+    uv run python scripts/plot_mnist4_lambda.py
+
+# Regenerate combined pilot/lambda map figures using remote W&B and retained summaries.
+mnist4-map-summary:
+    uv run python scripts/plot_mnist4_maps.py
+
+# Queued MNIST4 pilot-BN-update .
+mnist4-bn-update:
+    just launch mnist4_bn_update 3 "bash tmp/2026-11-10_mnist4_bn_update.sh"

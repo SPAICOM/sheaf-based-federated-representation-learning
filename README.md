@@ -44,6 +44,64 @@ After the command completes, the development environment will be ready to use. ð
 
 ## Reproducing the experiments and figures
 
+### Retained MNIST 7-vs-7 studies
+
+The original successful analyses are promoted from `tmp/` into
+`scripts/plot_mnist_7v7.py`, `scripts/plot_mnist4_pilots.py`,
+`scripts/plot_mnist4_lambda.py`, and `scripts/plot_mnist4_maps.py`.
+The retained [summary results](results/mnist_4agents_shift/README.md) cover
+pilot counts 384/768/1536/2048/4096, lambda .003/.01/.03/.1/.3/1, and
+CenterNorm/ZCA/OLS with posthoc Procrustes evaluation. The
+[two-agent comparison](results/mnist_2agents_7v7/main/table.md) is preliminary
+(two seeds). These results exclude p128, SimCLR, shift .8/.9, BN ablations,
+and saved-map evaluation experiments.
+
+Training uses the existing `scripts/multi_agent_experiment.py` and configs
+`mnist_2agents_7v7`, `mnist_4agents_shift`, and
+`mnist_4agents_mapstudy_{base,zca,ols}`. No new scheduler or shell script is
+needed. Examples below each run **one** experiment; use the matrix to select
+other seeds, pilot counts, and lambdas. Before a long run, check running jobs,
+smoke-test the config with `just smoke`, and launch with `just launch`.
+
+```bash
+# Two agents: seed 42/43, non_cooperative (lambda 0) or di_sheaf_frl (lambda .03).
+just mnist-7v7 seed=42 orchestrator=di_sheaf_frl orchestrator.max_lmb=.03 study_name=mnist_7v7_disheaf
+# Four-agent CenterNorm: batch 256 is an essential override.
+just mnist-4agents clean seed=42 orchestrator=di_sheaf_frl dataset.batch_size=256 dataset.pilot_num_samples=4096 orchestrator.max_lmb=.01 study_name=mnist4_di_clean_bs256_check_di_sheaf_frl_p4096
+# OLS or ZCA: the inherited base config already fixes batch 256.
+just mnist4-mapstudy ols seed=42 dataset.pilot_num_samples=4096 orchestrator.max_lmb=.01 logger.group=ols_p4096_l.01
+```
+
+| Study | Seeds | Pilot counts | Lambda | Historical W&B groups |
+|---|---|---|---|---|
+| Two-agent noncoop / CenterNorm | 42,43 | 4096 | 0 / .03 | `mnist_7v7_noncoop`, `mnist_7v7_disheaf` |
+| Four-agent noncoop / CenterNorm pilots | 42,43,44 | 384,768,1536,2048,4096 | 0 / .01 | `mnist4_di_clean_bs256_pilots_<orchestrator>_p<N>`; 4096 uses `check` instead of `pilots` |
+| Four-agent CenterNorm lambda | 42,43,44 | 4096 | .003,.01,.03,.1,.3,1 | `mnist4_di_clean_bs256_lambda4096_<lambda>` (e.g. `0.003`); .01 reuses the `check` baseline |
+| Four-agent ZCA / OLS pilots | 42,43,44 | 384,768,1536,2048,4096 | .01 | `<method>_p<N>_l.01` |
+| Four-agent ZCA / OLS lambda | 42,43,44 | 4096 | .003,.01,.03,.1,.3,1 | `<method>_p4096_l<lambda>` (e.g. `.003` or `1`); .01 reused |
+
+All train for 100 epochs with shift strength 1 and exclusive pool pilots.
+The two-agent batch size is 128; four-agent studies use 256. Metrics and
+configs live in remote W&B, final checkpoints in `logs/<project>/<run_id>/checkpoints/`.
+Rerunning historical groups adds replicates; analysis scripts deliberately
+reject unexpected counts instead of silently pooling them. Historical runs
+used dirty revisions, so the scripts/configs capture their protocol rather
+than guarantee bitwise reproduction.
+
+```bash
+just mnist-7v7-summary
+just mnist4-lambda-summary
+just mnist4-map-summary
+# Optional regeneration of the retained scoped pilot summary; requires all 30
+# final checkpoints and a free GPU (defaults to the visible CUDA device).
+just mnist4-pilot-summary
+```
+
+The map plot reads the promoted pilot/lambda aggregates and refreshes ZCA/OLS
+metrics from remote W&B. If recomputing the pilot aggregates, run that recipe
+before the map recipe. All promoted figures use the house style and produce
+PDF and PNG under `results/<project>/`.
+
 All experiments log to Weights & Biases (`wandb login` once), and every plotting
 script reads the runs back from the cloud â€” so the figures can be rebuilt on any
 machine, without the training runs sitting on disk.

@@ -1,0 +1,9 @@
+# Matched independent NT-Xent/CE baseline with post-hoc pilot alignment.
+defaults:
+  - cifar10_2agents_mixed_simclr_base
+  - override orchestrator: non_cooperative
+  - _self_
+logger:
+  project: cifar10_2agents_mixed_simclr_ntxent_noncoop
+orchestrator:
+  max_lmb: 0

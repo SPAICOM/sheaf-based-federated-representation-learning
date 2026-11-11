@@ -1,0 +1,13 @@
+# Tests zca; retains baseline posthoc evaluation.
+defaults:
+  - mnist_4agents_mapstudy_base
+  - _self_
+study_name: mnist_4agents_mapstudy_zca
+logger:
+  project: mnist_4agents_mapstudy_zca
+model:
+  latent_norm: false
+orchestrator:
+  whitening: true
+  learn_whitening: false
+  zca_refit_source: pilots

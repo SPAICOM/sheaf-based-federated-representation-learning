@@ -1,0 +1,9 @@
+# MNIST uses the same two-agent protocol with native one-channel 28x28 inputs.
+defaults:
+  - cifar10_2agents_mixed_simclr_base
+  - override dataset: hetero_mnist
+  - _self_
+logger:
+  project: mnist_2agents_mixed_simclr_base
+model:
+  img_size: 28

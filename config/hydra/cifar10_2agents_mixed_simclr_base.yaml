@@ -1,0 +1,78 @@
+# Two ResNets, classes 0-6 / 3-9: NT-Xent encoder vs supervised CE encoder.
+# Same runner, optimizer, pilots and DiSheafFRL as classification experiments.
+defaults:
+  - dataset: hetero_cifar10
+  - model: mixed_simclr_resnets
+  - orchestrator: di_sheaf_frl
+  - optimizer: sgd_cosine
+  - _self_
+seed: 42
+study_name: mixed_simclr_two_agents
+lmb_study:
+  enabled: false
+graph:
+  neighbors_mode: fully_connected
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: cifar10_2agents_mixed_simclr_base
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  precision: 32-true
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch
+dataset:
+  n_agents: 2
+  split_strategy: overlapping_shift
+  shift_strength: 1.0
+  agent_train_samples: max
+  test_source: original
+  val_split: 0.1
+  monitor_test_during_fit: false
+  # NT-Xent draws its own independent views from raw images.
+  augment_train: false
+  batch_size: 256
+  num_workers: 4
+  mode: min_size
+  pilot_source: pool
+  pilot_split: 0.0
+  pilot_num_samples: 4096
+  pilot_batch_size: 256
+  pilot_exclusive: true
+  pilot_class_filter: false
+  comm_data: shared_global_pilots
+  agent_input_noise: null
+  groups:
+    0:
+      agents: [0]
+      target_classes: [0, 1, 2, 3, 4, 5, 6]
+    1:
+      agents: [1]
+      target_classes: [3, 4, 5, 6, 7, 8, 9]
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  alignment_method: procrustes
+  max_lmb: 0.03
+  learn_lmb: false
+  comm_task_coeff: 0
+  whitening: false
+  learn_whitening: false
+  posthoc_whitening: false
+  anchor_selection: all
+  align_on_intersection: false
+  pilot_bn_mode: running
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

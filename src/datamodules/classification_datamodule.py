@@ -282,6 +282,7 @@ class ClassificationDataModule(l.LightningDataModule):
         comm_data: str = 'private_pilots',
         starve_clients: bool = False,
         seed: int = 42,
+        augment_train: bool = True,
     ) -> None:
         super().__init__()
 
@@ -337,7 +338,7 @@ class ClassificationDataModule(l.LightningDataModule):
                     transforms.RandomHorizontalFlip(),
                 ]
             )
-            if self.name.lower() == 'cifar10'
+            if augment_train and self.name.lower() == 'cifar10'
             else None
         )
 

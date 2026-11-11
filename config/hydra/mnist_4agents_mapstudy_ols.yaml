@@ -1,0 +1,10 @@
+# Tests ols; retains baseline posthoc evaluation.
+defaults:
+  - mnist_4agents_mapstudy_base
+  - _self_
+study_name: mnist_4agents_mapstudy_ols
+logger:
+  project: mnist_4agents_mapstudy_ols
+orchestrator:
+  use_general_maps: true
+  general_map_ols: true

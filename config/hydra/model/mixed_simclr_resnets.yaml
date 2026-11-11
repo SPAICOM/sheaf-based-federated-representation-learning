@@ -1,0 +1,9 @@
+# Shared small-image ResNet18; agent 0 alone has the NT-Xent projector.
+_target_: src.agents.SimCLRResNetClassifier
+backbone: resnet18
+img_size: 32
+agents:
+  0:
+    projection_dim: 128
+  1:
+    _target_: src.agents.SupervisedResNetClassifier

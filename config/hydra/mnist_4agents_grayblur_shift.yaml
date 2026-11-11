@@ -1,0 +1,12 @@
+# Same four-agent study, alternating native grayscale and CIFAR-matched blur.
+defaults:
+  - mnist_4agents_shift
+  - _self_
+logger:
+  project: mnist_4agents_grayblur_shift
+dataset:
+  agent_input_noise:
+    0: {type: none}
+    1: {type: blur, kernel_size: 9, sigma: 2.0}
+    2: {type: none}
+    3: {type: blur, kernel_size: 9, sigma: 2.0}

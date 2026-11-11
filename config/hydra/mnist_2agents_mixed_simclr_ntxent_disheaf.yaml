@@ -1,0 +1,6 @@
+# Test directed cooperation between an NT-Xent ResNet and a CE ResNet.
+defaults:
+  - mnist_2agents_mixed_simclr_base
+  - _self_
+logger:
+  project: mnist_2agents_mixed_simclr_ntxent_disheaf

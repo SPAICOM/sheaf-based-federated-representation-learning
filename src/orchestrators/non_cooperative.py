@@ -106,7 +106,13 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         for idx, agent in self.agents.items():
             y_hat, y, *rest = outputs[idx]
             eval_mask = rest[0] if rest else None
-            if self._supports_eval_mask(agent.compute_loss):
+            if prefix == 'train' and hasattr(agent, 'local_training_loss'):
+                task_batch = batch[0] if isinstance(batch, tuple) else batch
+                images = task_batch[idx if idx in task_batch else int(idx)][0]
+                agent_losses[int(idx)] = agent.local_training_loss(
+                    images, y_hat, y
+                )
+            elif self._supports_eval_mask(agent.compute_loss):
                 agent_losses[int(idx)] = agent.compute_loss(
                     y_hat,
                     y,
@@ -147,6 +153,7 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
     # default means maps are always fitted before evaluation.
 
     def on_test_epoch_end(self) -> None:
+        """Log communication accuracy after independent-agent testing."""
         super().on_test_epoch_end()
         dm = getattr(self.trainer, 'datamodule', None)
         if dm is None:

@@ -1,0 +1,118 @@
+# MNIST replication of clean CIFAR 7-vs-7: two CNNs, exclusive all-class pilots.
+defaults:
+- dataset: hetero_mnist
+- model: cnn_classifier
+- orchestrator: non_cooperative
+- optimizer: sgd_cosine
+- _self_
+seed: 42
+study_name: mnist_7v7
+lmb_study:
+  enabled: false
+  efficient: false
+  sampler: grid
+  objective: comm
+  n_trials: 7
+  n_tune_epochs: 25
+  lmb_low: 1e-3
+  lmb_high: 1
+  val_split: 0.1
+graph:
+  neighbors_mode: fully_connected
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: mnist_2agents_7v7
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch
+dataset:
+  split_strategy: overlapping_shift
+  test_source: original
+  pilot_source: pool
+  n_agents: 2
+  shift_strength: 1.0
+  agent_train_samples: max
+  val_split: 0.0
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 4
+  mode: min_size
+  pilot_split: 0.0
+  pilot_num_samples: 4096
+  pilot_batch_size: 128
+  pilot_exclusive: true
+  comm_data: shared_global_pilots
+  agent_input_noise: null
+  groups:
+    0:
+      agents:
+      - 0
+      target_classes:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+    1:
+      agents:
+      - 1
+      target_classes:
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+  pilot_class_filter: false
+model:
+  latent_norm: true
+  dropout: 0.0
+  weight_decay: 0.0
+  decoder_hidden_dims:
+  - 256
+  agents:
+    0:
+      encoder_hidden_dims:
+      - 32
+      - 64
+      - 128
+    1:
+      encoder_hidden_dims:
+      - 32
+      - 64
+      - 128
+      - 224
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: true
+  alignment_method: procrustes
+  max_lmb: 0.03
+  learn_lmb: false
+  comm_task_coeff: 0
+  whitening_source: pilots
+  swbn_fit_source: pilots
+  zca_refit_source: pilots
+  whitening: false
+  learn_whitening: false
+  posthoc_whitening: false
+  anchor_selection: all
+  align_on_intersection: false
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

@@ -1,0 +1,12 @@
+# MNIST counterpart of CIFAR grayblur 7-vs-7: native grayscale vs 9x9 sigma-2 blur.
+# MNIST already has one grayscale channel; avoid the RGB grayscale transform.
+defaults:
+  - mnist_2agents_7v7
+  - _self_
+study_name: mnist_grayblur_7v7
+logger:
+  project: mnist_2agents_grayblur_7v7
+dataset:
+  agent_input_noise:
+    0: {type: none}
+    1: {type: blur, kernel_size: 9, sigma: 2.0}

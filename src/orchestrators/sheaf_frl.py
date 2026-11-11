@@ -145,6 +145,7 @@ class SheafFRL(BaseOrchestrator):
         log_latent_diagnostics: bool = False,
         use_general_maps: bool = False,
         soft_maps: bool = False,
+        general_map_ols: bool = False,
         comm_task_coeff: float = 0.0,
         align_on_intersection: bool = False,
         edge_class_filter: str = 'union',
@@ -213,9 +214,13 @@ class SheafFRL(BaseOrchestrator):
                 f'swbn_momentum is an EMA retention factor in [0, 1); got {swbn_momentum}'
             )
         if penalty_lr is not None and float(penalty_lr) <= 0.0:
-            raise ValueError(f'penalty_lr must be > 0 or None; got {penalty_lr}')
+            raise ValueError(
+                f'penalty_lr must be > 0 or None; got {penalty_lr}'
+            )
         if float(vicreg_var_coeff) < 0 or float(vicreg_cov_coeff) < 0:
-            raise ValueError('vicreg_var_coeff and vicreg_cov_coeff must be >= 0')
+            raise ValueError(
+                'vicreg_var_coeff and vicreg_cov_coeff must be >= 0'
+            )
         if float(vicreg_gamma) <= 0:
             raise ValueError(f'vicreg_gamma must be > 0; got {vicreg_gamma}')
 
@@ -266,7 +271,10 @@ class SheafFRL(BaseOrchestrator):
             )
         if int(zca_fit_max_samples) < 2:
             raise ValueError('zca_fit_max_samples must be at least 2')
-        if str(whitening_shrinkage) != 'auto' and not 0.0 <= float(whitening_shrinkage) < 1.0:
+        if (
+            str(whitening_shrinkage) != 'auto'
+            and not 0.0 <= float(whitening_shrinkage) < 1.0
+        ):
             raise ValueError(
                 'whitening_shrinkage is a Ledoit-Wolf shrinkage intensity '
                 f"towards (tr cov / d) I: 'auto' or a float in [0, 1); got "
@@ -632,7 +640,9 @@ class SheafFRL(BaseOrchestrator):
             layer.train(was_training)
 
     @staticmethod
-    def _vicreg_variance(Z: torch.Tensor, gamma: float, eps: float = 1e-4) -> torch.Tensor:
+    def _vicreg_variance(
+        Z: torch.Tensor, gamma: float, eps: float = 1e-4
+    ) -> torch.Tensor:
         """VICReg variance hinge: mean_j max(0, gamma - sqrt(Var(z_j) + eps))."""
         std = torch.sqrt(Z.var(dim=0) + eps)
         return torch.relu(gamma - std).mean()
@@ -646,7 +656,9 @@ class SheafFRL(BaseOrchestrator):
         off = C - torch.diag(torch.diagonal(C))
         return off.pow(2).sum() / d
 
-    def _vicreg_vc_terms(self, prefix: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def _vicreg_vc_terms(
+        self, prefix: str
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """VICReg variance + covariance regularisers on every agent's raw pilot latents.
 
         With the sheaf penalty as VICReg's invariance term (each agent's
@@ -675,7 +687,8 @@ class SheafFRL(BaseOrchestrator):
             return torch.zeros((), device=self.device), logs
         total = (
             float(self.hparams.vicreg_var_coeff) * torch.stack(var_terms).sum()
-            + float(self.hparams.vicreg_cov_coeff) * torch.stack(cov_terms).sum()
+            + float(self.hparams.vicreg_cov_coeff)
+            * torch.stack(cov_terms).sum()
         )
         logs[f'{prefix}/vicreg_vc'] = total.detach()
         return total, logs
@@ -856,7 +869,12 @@ class SheafFRL(BaseOrchestrator):
             # Unconstrained least-squares embedding: V s.t. A_j @ V.T ≈ A_i.
             # fit_alignment(A_j, A_i) returns exactly that V, shape (d_i, d_j).
             if update_maps:
-                A = fit_alignment(A_j, A_i)
+                if self.hparams.general_map_ols:
+                    A = torch.linalg.lstsq(
+                        A_j.cpu().double(), A_i.cpu().double(), driver='gelsd'
+                    ).solution.T
+                else:
+                    A = fit_alignment(A_j, A_i)
                 V_param.copy_(A.to(dtype=V_param.dtype, device=param_device))
         else:
             C_svd = C + torch.randn_like(C) * 1e-6
@@ -1744,14 +1762,18 @@ class SheafFRL(BaseOrchestrator):
         source = str(getattr(self.hparams, 'zca_refit_source', 'train'))
         parts = []
         if source in ('train', 'train+pilots'):
-            tds = getattr(dm, 'train_datasets', None) if dm is not None else None
+            tds = (
+                getattr(dm, 'train_datasets', None) if dm is not None else None
+            )
             if tds and tds.get(idx) is not None and len(tds[idx]):
                 parts.append(tds[idx])
         if source in ('pilots', 'train+pilots'):
             # The SHARED pilots: every agent sees the same rows, so including
             # them estimates all agents' operators partly on an identical input
             # distribution — and matches where the penalty is evaluated.
-            pds = getattr(dm, 'pilot_datasets', None) if dm is not None else None
+            pds = (
+                getattr(dm, 'pilot_datasets', None) if dm is not None else None
+            )
             if pds and pds.get(idx) is not None and len(pds[idx]):
                 parts.append(pds[idx])
         if not parts:
@@ -2127,7 +2149,11 @@ class SheafFRL(BaseOrchestrator):
                 else agent.decoder(decoder_in)
             )
             outputs[idx_str] = (y_hat.detach(), y_task)
-            if hasattr(agent, 'reconstruction_mse'):
+            if prefix == 'train' and hasattr(agent, 'local_training_loss'):
+                agent_losses[idx] = agent.local_training_loss(
+                    x_task, y_hat, y_task
+                )
+            elif hasattr(agent, 'reconstruction_mse'):
                 agent_losses[idx] = agent.compute_loss(
                     y_hat, y_task, eval_mask=mask_task
                 )
@@ -2224,7 +2250,11 @@ class SheafFRL(BaseOrchestrator):
 
         penalty_term = lmb_coeff * (sheaf_penalty + vc_term)
         lr_ratio = self._penalty_lr_ratio()
-        if prefix == 'train' and lr_ratio != 1.0 and torch.is_tensor(penalty_term):
+        if (
+            prefix == 'train'
+            and lr_ratio != 1.0
+            and torch.is_tensor(penalty_term)
+        ):
             # Same value, gradient scaled by penalty_lr / lr: the optimizer
             # then steps the penalty's gradient with lr penalty_lr and the
             # task gradient with lr, on the same momentum buffer and cosine
@@ -2232,12 +2262,11 @@ class SheafFRL(BaseOrchestrator):
             # the penalty term, and also the same as multiplying lambda by
             # the ratio. Gradient clipping still acts on the sum.
             penalty_term = (
-                lr_ratio * penalty_term + (1.0 - lr_ratio) * penalty_term.detach()
+                lr_ratio * penalty_term
+                + (1.0 - lr_ratio) * penalty_term.detach()
             )
         total_loss = (
-            total_task_loss
-            + penalty_term
-            + comm_weight * after_comm_task_loss
+            total_task_loss + penalty_term + comm_weight * after_comm_task_loss
         )
 
         extra: dict[str, Any] = {
@@ -2497,7 +2526,8 @@ class SheafFRL(BaseOrchestrator):
         """
         mode = str(getattr(self.hparams, 'pilot_bn_mode', 'running'))
         bns = [
-            m for m in agent.modules()
+            m
+            for m in agent.modules()
             if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training
         ]
         if mode == 'update' or not bns:
@@ -2534,8 +2564,11 @@ class SheafFRL(BaseOrchestrator):
 
         for name in self._POSTHOC_METHODS:
             object.__setattr__(
-                self, name,
-                types.MethodType(getattr(PostTrainingAlignmentMixin, name), self),
+                self,
+                name,
+                types.MethodType(
+                    getattr(PostTrainingAlignmentMixin, name), self
+                ),
             )
         try:
             return dict(

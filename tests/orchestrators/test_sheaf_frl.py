@@ -391,3 +391,26 @@ class TestSheafFRL:
         )
 
         trainer.fit(orchestrator, datamodule)
+
+
+def test_ols_edge_fit_rank_deficient_and_backward():
+    """OLS recovers a non-isometric map even with dependent pilot columns."""
+    from types import SimpleNamespace
+
+    torch.manual_seed(17)
+    x = torch.randn(12, 2)
+    x = torch.cat([x, x[:, :1]], dim=1)
+    target = x @ torch.randn(3, 4) * 3
+    v = torch.nn.Parameter(torch.zeros(4, 3), requires_grad=False)
+    stub = SimpleNamespace(
+        stiefel_matrices={'0_1': v},
+        hparams=SimpleNamespace(use_general_maps=True, general_map_ols=True),
+        _effective_rank=lambda _: 0.0,
+    )
+    SheafFRL._fit_edge_map(stub, '0_1', 0, 1, target, x, True)
+    torch.testing.assert_close(x @ v.T, target, atol=1e-5, rtol=1e-5)
+    live = x.clone().requires_grad_()
+    loss = (live @ v.T - target - 1).square().mean()
+    loss.backward()
+    assert torch.isfinite(live.grad).all()
+    assert live.grad.norm() > 0
