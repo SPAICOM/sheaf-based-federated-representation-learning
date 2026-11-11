@@ -1,0 +1,27 @@
+# 4 agents on a complete graph induced by class cover, shift 1.0: the missing-class sets are
+# pairwise disjoint and cover all 10 classes, so every pair of agents holds all 10 classes
+# together (class_cover -> K4, 6 edges, degree 3):
+#   M_0={0,3,6} M_1={1,4,7} M_2={2,5} M_3={8,9}  -> agents 0,1 train on 7 classes, 2,3 on 8.
+# Tests DiSheafFRL and SheafFRL vs non-coop (post-hoc Procrustes on the pilots) on a dense graph.
+defaults:
+  - cifar10_4agents_base
+  - _self_
+
+study_name: "CIFAR-10 4 agents full (class cover), shift 1.0"
+logger:
+  project: cifar10_4agents_full
+
+dataset:
+  groups:
+    0:
+      agents: [0]
+      target_classes: [1, 2, 4, 5, 7, 8, 9]
+    1:
+      agents: [1]
+      target_classes: [0, 2, 3, 5, 6, 8, 9]
+    2:
+      agents: [2]
+      target_classes: [0, 1, 3, 4, 6, 7, 8, 9]
+    3:
+      agents: [3]
+      target_classes: [0, 1, 2, 3, 4, 5, 6, 7]

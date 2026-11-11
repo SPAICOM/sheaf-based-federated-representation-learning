@@ -24,10 +24,13 @@ alignment_method: procrustes   # posthoc map type ('general' | 'procrustes' | 'r
 whitening_source: pilots       # posthoc whitening source ('train' | 'pilots' | 'train+pilots')
 posthoc_whitening_shrinkage: auto # post-hoc whitening shrinkage towards (tr/d) I: 0.0 off,
                                   # float in [0,1) fixed, 'auto' = Ledoit-Wolf per agent
-pilot_bn_mode: running  # BatchNorm in the per-step pilot passes: running (use the
-                        # running stats, don't update them) | frozen_batch |
-                        # update (legacy: the pilot batch contaminates the
-                        # running stats -> ~6-13pt private-acc loss at test)
+pilot_bn_mode: update   # BatchNorm + CenterNorm in the per-step pilot passes: update (pilot-batch
+                        # stats; pilots update the running stats of both; measured ~6-13pt
+                        # private-acc loss at test with BN, 2026-10-22) | running (use the running
+                        # stats, don't update them) | frozen_batch (batch stats, no update)
+pilot_center_mode: batch  # CenterNorm centre of the per-step pilot passes when they don't update it
+                          # (pilot_bn_mode running/frozen_batch): batch (pilot-batch mean) |
+                          # running (task-only running mean, the origin used at evaluation)
 whitening: True        # False = no whitening during training (no SWBN, no ZCA): penalty and maps on raw latents
 posthoc_whitening: True # False = the posthoc evaluation map is fitted on raw latents too
 learn_whitening: True  # learnable SWBN whitening (g_phi_i); set False for closed-form ZCA

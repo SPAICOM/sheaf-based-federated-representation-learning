@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.agents.personalized_classifier import frozen_center_norm
 from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
@@ -428,7 +429,8 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
                 idx = int(idx_str)
                 if idx in pilot_data:
                     x_pilot = pilot_data[idx]
-                    pilot_representations[idx] = agent.encode(x_pilot)
+                    with frozen_center_norm(agent):
+                        pilot_representations[idx] = agent.encode(x_pilot)
 
             if pilot_representations:
                 muscle_loss = self._compute_muscle_loss(pilot_representations)

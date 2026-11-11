@@ -9,13 +9,14 @@ neighboring agents accurately.
 """
 
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
 import torch.nn as nn
 from torch.utils.data import ConcatDataset, Subset
 
+from src.agents.personalized_classifier import CenterNorm, frozen_center_norm
 from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     VALID_WHITENING_SOURCES,
@@ -167,7 +168,8 @@ class SheafFRL(BaseOrchestrator):
         alignment_method: str = 'procrustes',
         whitening_source: str = 'pilots',
         posthoc_whitening_shrinkage: float | str = 'auto',
-        pilot_bn_mode: str = 'running',
+        pilot_bn_mode: str = 'update',
+        pilot_center_mode: str = 'batch',
         swbn_fit_source: str = 'pilots',
         swbn_momentum: float = 0.95,
         penalty_lr: float | None = None,
@@ -198,6 +200,15 @@ class SheafFRL(BaseOrchestrator):
             raise ValueError(
                 "pilot_bn_mode must be 'running', 'frozen_batch' or 'update', "
                 f'got {pilot_bn_mode!r}'
+            )
+        if pilot_center_mode not in ('batch', 'running'):
+            raise ValueError(
+                f"pilot_center_mode must be 'batch' or 'running', got {pilot_center_mode!r}"
+            )
+        if pilot_center_mode == 'running' and pilot_bn_mode == 'update':
+            raise ValueError(
+                "pilot_center_mode='running' freezes CenterNorm on the pilots; "
+                "it needs pilot_bn_mode='running' or 'frozen_batch', not 'update'"
             )
         if str(whitening_source) not in VALID_WHITENING_SOURCES:
             raise ValueError(
@@ -2491,27 +2502,41 @@ class SheafFRL(BaseOrchestrator):
 
             running      - BN normalises the pilots with its running stats
                            and does not update them: pilot latents are the
-                           ones the encoder produces at test time (default)
+                           ones the encoder produces at test time
             frozen_batch - pilot-batch statistics, running stats untouched
-            update       - legacy behaviour
+            update       - pilot-batch statistics, and the pilots update the
+                           running stats of BN *and* CenterNorm (default)
+
+        In 'running' / 'frozen_batch' CenterNorm does not update its running
+        mean from pilots either, and ``pilot_center_mode`` picks the centre the
+        pilots get: 'batch' (the pilot-batch mean) or 'running' (the task-only
+        running mean, the origin used at evaluation).
         """
-        mode = str(getattr(self.hparams, 'pilot_bn_mode', 'running'))
-        bns = [
+        mode = str(getattr(self.hparams, 'pilot_bn_mode', 'update'))
+        bns = [] if mode == 'update' else [
             m for m in agent.modules()
             if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training
         ]
-        if mode == 'update' or not bns:
-            yield
-            return
         saved = [m.momentum for m in bns]
         for m in bns:
             if mode == 'running':
                 m.eval()
             else:
                 m.momentum = 0.0
+        centers = []
+        if str(getattr(self.hparams, 'pilot_center_mode', 'batch')) == 'running':
+            centers = [
+                m for m in agent.modules()
+                if isinstance(m, CenterNorm) and m.training
+            ]
+        for m in centers:
+            m.eval()
         try:
-            yield
+            with nullcontext() if mode == 'update' else frozen_center_norm(agent):
+                yield
         finally:
+            for m in centers:
+                m.train()
             for m, mom in zip(bns, saved):
                 m.train()
                 m.momentum = mom
