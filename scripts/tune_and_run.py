@@ -10,7 +10,7 @@ For every orchestrator given (default: every method the experiment config sweeps
     ``tuned_lmb`` of the experiment config and its run moves to group ``<method>``, where it
     is the first seed; only the remaining seeds then train, at that lambda.
 
-Each job is one run of ``scripts/multi_agent_experiment.py``; up to ``--jobs`` run at once, and
+Each job is one run of ``scripts/multi_agent_experiment.py``; one at a time unless ``--jobs N``, and
 a method's final seeds start as soon as its grid is done. A job whose run already finished on
 wandb (same group, seed, lambda) is skipped and one still running there is waited for, so a
 stopped pipeline resumes where it was. Console output: ``logs/console/<sweep>_<job>.log``.
@@ -356,7 +356,10 @@ def main() -> int:
         '(default: hydra.sweeper.params.orchestrator of the config)',
     )
     p.add_argument(
-        '--jobs', type=int, default=4, help='runs trained at once (default 4)'
+        '--jobs',
+        type=int,
+        default=1,
+        help='runs trained at once (default 1; raise it only if GPU memory and RAM allow)',
     )
     p.add_argument(
         '--grid',

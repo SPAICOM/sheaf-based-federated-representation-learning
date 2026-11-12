@@ -57,7 +57,7 @@ bottleneck *args="":
 hetero dataset *args="":
     uv run python scripts/multi_agent_experiment.py -m --config-name {{ if dataset == "cifar10" { "cifar10_4agents_full" } else { dataset + "_4agents_shift" } }} {{args}}
 
-#   just hetero-pipeline cifar10 [fedproto,fedre] [--jobs 4] [--grid 1e-2,1e-1] [--dry-run]
+#   just hetero-pipeline cifar10 [fedproto,fedre] [--jobs N, default 1] [--grid 1e-2,1e-1] [--dry-run]
 # Heterogeneity table with lambda tuning, all methods of the config unless listed: grid on seed 42 → best comm into tuned_lmb → other seeds; non-coop/FedRE: all seeds. Resumes from wandb.
 hetero-pipeline dataset *args="":
     uv run python scripts/tune_and_run.py {{dataset}} {{args}}
