@@ -238,6 +238,9 @@ class Pipeline:
             log(f'{job.name}: would run  {" ".join(self.cmd(job)[1:])}')
             return True
         console = ROOT / 'logs' / 'console' / f'{self.sweep}_{job.name}.log'
+        console.parent.mkdir(
+            parents=True, exist_ok=True
+        )  # git-ignored: absent in a fresh clone
         log(f'{job.name}: start  (log {console.relative_to(ROOT)})')
         with console.open('a') as f:
             rc = subprocess.run(
