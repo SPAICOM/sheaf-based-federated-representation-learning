@@ -53,9 +53,12 @@ class TestFedProtoProjectors:
         assert orch.projectors is None
         _two_steps(orch)
 
-    def test_different_dims_without_proj_dim_fail_at_init(self):
-        with pytest.raises(ValueError, match='set proj_dim'):
-            _fedproto((5, 7))
+    def test_different_dims_default_to_the_largest_dim(self):
+        orch = _fedproto((5, 7))
+        assert {k: m.weight.shape[0] for k, m in orch.projectors.items()} == {
+            '0': 7,
+            '1': 7,
+        }
 
     def test_different_dims_train_in_the_common_space(self):
         orch = _fedproto((5, 7), proj_dim=8)

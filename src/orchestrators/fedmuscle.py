@@ -60,15 +60,14 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         Muscle *loss* mode used during training: "contrastive" (default) or
         "alignment".
     proj_dim : int or None, optional
-        Common dimension for the Muscle loss. ``None`` (default) compares raw
-        pilot latents and needs every agent to have the same latent dim. An
-        int gives each agent a learned ``Linear(d_i -> proj_dim)`` (see
+        Common dimension for the Muscle loss. Each agent gets a learned,
+        bias-free ``Linear(d_i -> proj_dim)`` (see
         :mod:`src.communication.projectors`); the Muscle loss and the
         exchanged pilot representations live in that space, while the decoder
-        still reads the raw latent. Not part of the original FedMuscle.
-    orthogonal_projector : bool, optional
-        Keep each projector semi-orthogonal (default: True), as for FedProto.
-        The contrastive loss is scale-free, so ``False`` is also usable here.
+        still reads the raw latent. ``None`` (default) uses the largest
+        latent dim in the network, and no projector at all when every agent
+        has the same dim (original FedMuscle). The projectors are not part of
+        the original method.
     alignment_method : str, optional
         Post-training *map* used to measure cross-agent communication accuracy
         at test time: ``'general'`` (unconstrained least-squares, default) or
@@ -98,7 +97,6 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         alignment_mode: str = 'contrastive',
         lambda_schedule: str | None = None,
         proj_dim: int | None = None,
-        orthogonal_projector: bool = True,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -117,9 +115,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
-        self.projectors = build_projectors(
-            self.agents, proj_dim, orthogonal=orthogonal_projector
-        )
+        self.projectors = build_projectors(self.agents, proj_dim)
         self._cl_epoch_count = 0
         self._local_epoch_count = 0
         self._round_complete = False

@@ -52,9 +52,12 @@ class TestFedMuscleProjectors:
         _, loss = orch._shared_eval(_batch(), 0, 'train')
         loss.backward()
 
-    def test_different_dims_without_proj_dim_fail_at_init(self):
-        with pytest.raises(ValueError, match='set proj_dim'):
-            _fedmuscle((5, 7))
+    def test_different_dims_default_to_the_largest_dim(self):
+        orch = _fedmuscle((5, 7))
+        assert {k: m.weight.shape[0] for k, m in orch.projectors.items()} == {
+            '0': 7,
+            '1': 7,
+        }
 
     @pytest.mark.parametrize('mode', ['contrastive', 'alignment'])
     def test_different_dims_train_in_the_common_space(self, mode):

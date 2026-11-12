@@ -8,8 +8,8 @@ head_batch_size: 10
 # head. 'general' | 'procrustes' | 'relative' add post-hoc pilot alignment.
 alignment_method: null
 # FC representation mapping: decoder = Sequential(Linear(d_i -> rm_dim), shared head).
-# null = share the decoder as is (equal latent dims); an int allows heterogeneous dims
-# and needs a post-hoc alignment_method above.
+# null = the largest latent dim in the network (no RM if all dims are equal).
+# With RM, a post-hoc alignment_method above is required.
 rm_dim: null
 
 # Information-theoretic PID logging (Liang et al. 2023).

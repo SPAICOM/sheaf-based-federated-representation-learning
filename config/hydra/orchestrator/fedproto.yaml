@@ -4,10 +4,8 @@ max_lmb: 0.1
 lambda_schedule: null
 prototype_momentum: 0.9
 # Per-agent Linear(d_i -> proj_dim) before the cross-agent loss (src/communication/projectors.py).
-# null = raw latents (all agents need the same latent dim); an int allows heterogeneous dims.
-# Use proj_dim >= the largest latent dim: below it the map can discard what the loss acts on.
+# null = the largest latent dim in the network (no projector if all dims are equal).
 proj_dim: null
-orthogonal_projector: true   # semi-orthogonal maps; keeps the projector from shrinking to zero
 
 neighbors: {}
 

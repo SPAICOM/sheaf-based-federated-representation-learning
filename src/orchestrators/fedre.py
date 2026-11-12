@@ -20,7 +20,11 @@ from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
-from src.communication.projectors import latent_dim, retarget_input
+from src.communication.projectors import (
+    common_dim,
+    latent_dim,
+    retarget_input,
+)
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -51,12 +55,13 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         Server batch size (official ``-hbs``, default 10); one server epoch per
         round, so K <= head_batch_size means a single SGD step.
     rm_dim : int | None, optional
-        Representation mapping (RM, the paper's FC variant). ``None`` (default)
-        shares the decoder as it is, so all latent dims must match. An int
-        turns each agent's decoder into ``Sequential(RM_i, head)``, with
+        Representation mapping (RM, the paper's FC variant): each agent's
+        decoder becomes ``Sequential(RM_i, head)``, with
         ``RM_i = Linear(d_i -> rm_dim)`` private and trained by the local CE,
         and ``head`` (the agent's decoder retargeted to ``rm_dim`` inputs) the
-        shared classifier. Prototypes are taken after RM. The latent that
+        shared classifier. ``None`` (default) uses the largest latent dim in
+        the network, and no RM when every agent has the same dim (the decoder
+        is shared as it is). Prototypes are taken after RM. The latent that
         alignment and the comm metric see is still the raw ``z_i``, so this
         needs a post-hoc ``alignment_method``.
     alignment_method : str | None, optional
@@ -94,21 +99,21 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         if int(head_batch_size) < 1:
             raise ValueError('head_batch_size must be at least 1')
         self.save_hyperparameters(ignore=['agents'])
-        if rm_dim is not None:
-            self._add_representation_maps(int(rm_dim), alignment_method)
+        self._rm_dim = common_dim(self.agents, rm_dim)
+        if self._rm_dim is not None:
+            self._add_representation_maps(self._rm_dim, alignment_method)
         self._validate_shared_decoders()
 
     def _add_representation_maps(
         self, rm_dim: int, alignment_method: str | None
     ) -> None:
         """Replace each decoder with ``Sequential(RM_i, head)`` (see ``rm_dim``)."""
-        if rm_dim < 1:
-            raise ValueError(f'rm_dim must be at least 1, got {rm_dim}')
         if alignment_method is None:
             # Identity would feed z_i to RM_j, a map trained for another agent.
             raise ValueError(
-                'rm_dim needs a post-hoc alignment_method: the comm metric '
-                'sends raw latents, which identity cannot carry across RMs.'
+                'Representation maps (rm_dim, or different latent dims) need a '
+                'post-hoc alignment_method: the comm metric sends raw latents, '
+                'which identity cannot carry across RMs.'
             )
         for key, agent in self.agents.items():
             d = latent_dim(agent)
@@ -124,13 +129,13 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
 
     def _shared_decoder(self, agent: nn.Module) -> nn.Module:
         """Return the part of the decoder the server owns: all of it, or the head after RM."""
-        if self.hparams.rm_dim is None:
+        if self._rm_dim is None:
             return agent.decoder
         return agent.decoder[1]
 
     def _representation_map(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
         """Agent ``idx``'s RM applied to raw latents (identity without RM)."""
-        if self.hparams.rm_dim is None:
+        if self._rm_dim is None:
             return Z
         rm = self.agents[str(idx)].decoder[0]
         return rm(Z.to(rm.weight.device))

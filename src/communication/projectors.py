@@ -9,12 +9,10 @@ the same role there (``src/orchestrators/comfed.py``).
 from __future__ import annotations
 
 import copy
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-from torch.nn.utils import parametrizations
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,61 +40,51 @@ def latent_dim(agent: nn.Module) -> int | None:
     return None if found is None else found[1].in_features
 
 
-def build_projectors(
-    agents: Mapping[str, nn.Module],
-    proj_dim: int | None,
-    *,
-    orthogonal: bool = True,
-) -> nn.ModuleDict | None:
-    """One bias-free ``Linear(d_i -> proj_dim)`` per agent, keyed like ``agents``.
+def common_dim(agents: Mapping[str, nn.Module], dim: int | None) -> int | None:
+    """Resolve the common dimension of a network of agents.
 
-    ``orthogonal`` keeps each map semi-orthogonal (orthonormal columns when
-    ``proj_dim >= d_i``, rows otherwise).  This matters when the loss is a
-    squared distance (FedProto): an unconstrained map can shrink to zero and
-    satisfy it without moving the latents.  Only ``proj_dim >= d_i`` makes the
-    map an isometry.  Below that it is a projection that can rotate onto the
-    directions where the loss is already small, and with few classes it can
-    null a prototype loss outright, so a warning is raised.
-
-    ``proj_dim=None`` builds nothing and returns ``None``.  It then raises if
-    the latent dims are readable and differ, because the caller's
-    cross-agent loss would crash on them later.
+    ``dim=None`` means the largest latent dim in the network, or ``None`` when
+    every agent already has the same dim (no map needed, the original method).
+    Raises ``TypeError`` if the dims differ but some cannot be read.
     """
+    if dim is not None:
+        if int(dim) < 1:
+            raise ValueError(f'The common dim must be at least 1, got {dim}')
+        return int(dim)
     dims = {key: latent_dim(agent) for key, agent in agents.items()}
-    if proj_dim is None:
-        known = {d for d in dims.values() if d is not None}
-        if len(known) > 1:
-            raise ValueError(
-                f'Agents have different latent dims {dims}; set proj_dim to '
-                'project them to a common dimension.'
-            )
+    known = {d for d in dims.values() if d is not None}
+    if len(known) <= 1:
         return None
-    if int(proj_dim) < 1:
-        raise ValueError(f'proj_dim must be at least 1, got {proj_dim}')
     missing = sorted(key for key, d in dims.items() if d is None)
     if missing:
         raise TypeError(
             f'Cannot read the latent dim of agents {missing}: their decoder '
             'has no linear layer.'
         )
+    return max(known)
 
-    narrow = {key: d for key, d in dims.items() if d > int(proj_dim)}
-    if narrow:
-        warnings.warn(
-            f'proj_dim={proj_dim} is below the latent dim of agents {narrow}: '
-            'their projector can discard the directions the cross-agent loss '
-            'acts on instead of moving the encoder. Use proj_dim >= '
-            f'{max(dims.values())} for an isometric map.',
-            UserWarning,
-            stacklevel=2,
-        )
 
+def build_projectors(
+    agents: Mapping[str, nn.Module], proj_dim: int | None
+) -> nn.ModuleDict | None:
+    """One bias-free ``Linear(d_i -> proj_dim)`` per agent, keyed like ``agents``.
+
+    ``proj_dim=None`` projects to the largest latent dim in the network, and
+    builds nothing (returns ``None``) when all dims are already equal.  The
+    maps are unconstrained, as in the original papers.
+    """
+    proj_dim = common_dim(agents, proj_dim)
+    if proj_dim is None:
+        return None
     projectors = {}
-    for key, d in dims.items():
-        linear = nn.Linear(d, int(proj_dim), bias=False)
-        projectors[key] = (
-            parametrizations.orthogonal(linear) if orthogonal else linear
-        )
+    for key, agent in agents.items():
+        d = latent_dim(agent)
+        if d is None:
+            raise TypeError(
+                f'Cannot read the latent dim of agent {key}: its decoder has '
+                'no linear layer.'
+            )
+        projectors[key] = nn.Linear(d, proj_dim, bias=False)
     return nn.ModuleDict(projectors)
 
 

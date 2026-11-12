@@ -50,16 +50,13 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
     prototype_momentum : float, optional
         Momentum for updating global prototypes (default: 0.9).
     proj_dim : int or None, optional
-        Common dimension for prototypes. ``None`` (default) compares raw
-        latents and needs every agent to have the same latent dim. An int
-        gives each agent a learned ``Linear(d_i -> proj_dim)`` (see
-        :mod:`src.communication.projectors`); prototypes, the regulariser and
-        the uploaded payload live in that space, while the decoder still reads
-        the raw latent. Not part of the original FedProto.
-    orthogonal_projector : bool, optional
-        Keep each projector semi-orthogonal (default: True). Without it the
-        squared prototype distance is minimised by shrinking the projector to
-        zero, leaving the latents unchanged.
+        Common dimension for prototypes. Each agent gets a learned, bias-free
+        ``Linear(d_i -> proj_dim)`` (see :mod:`src.communication.projectors`);
+        prototypes, the regulariser and the uploaded payload live in that
+        space, while the decoder still reads the raw latent. ``None``
+        (default) uses the largest latent dim in the network, and no
+        projector at all when every agent has the same dim (original
+        FedProto). The projectors are not part of the original method.
     alignment_method : str, optional
         Post-training alignment used to measure cross-agent communication
         accuracy at test time: ``'general'`` (unconstrained least-squares,
@@ -84,7 +81,6 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         prototype_momentum: float = 0.9,
         lambda_schedule: str | None = None,
         proj_dim: int | None = None,
-        orthogonal_projector: bool = True,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -103,9 +99,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
-        self.projectors = build_projectors(
-            self.agents, proj_dim, orthogonal=orthogonal_projector
-        )
+        self.projectors = build_projectors(self.agents, proj_dim)
         self._global_prototypes: dict[int, torch.Tensor] = {}
 
     def _validate_agents(self) -> None:
