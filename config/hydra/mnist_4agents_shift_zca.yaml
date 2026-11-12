@@ -1,0 +1,21 @@
+# MNIST map ablation: DiSheafFRL with closed-form ZCA whitening (fitted on the
+# pilots) in place of CenterNorm; maps stay Procrustes.
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+
+logger:
+  project: mnist_4agents_mapstudy_zca
+
+model:
+  latent_norm: false
+
+orchestrator:
+  whitening: true
+  learn_whitening: false
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: di_sheaf_frl

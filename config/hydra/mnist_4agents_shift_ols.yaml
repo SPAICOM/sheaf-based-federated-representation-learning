@@ -1,0 +1,18 @@
+# MNIST map ablation: DiSheafFRL with unconstrained least-squares (OLS)
+# restriction maps in place of semi-orthogonal ones; CenterNorm kept.
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+
+logger:
+  project: mnist_4agents_mapstudy_ols
+
+orchestrator:
+  use_general_maps: true
+  general_map_ols: true
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: di_sheaf_frl

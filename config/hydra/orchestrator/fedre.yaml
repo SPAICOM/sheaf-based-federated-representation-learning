@@ -7,6 +7,10 @@ head_batch_size: 10
 # null = native FedRE: identity message, cross-agent = sender extractor + shared
 # head. 'general' | 'procrustes' | 'relative' add post-hoc pilot alignment.
 alignment_method: null
+# FC representation mapping: decoder = Sequential(Linear(d_i -> rm_dim), shared head).
+# null = share the decoder as is (equal latent dims); an int allows heterogeneous dims
+# and needs a post-hoc alignment_method above.
+rm_dim: null
 
 # Information-theoretic PID logging (Liang et al. 2023).
 # Implemented in BaseOrchestrator → applies to *every* orchestrator that

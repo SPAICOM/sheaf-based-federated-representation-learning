@@ -1,0 +1,49 @@
+# MNIST, 4 agents, label shift 1.0, fully connected graph (6 edges).
+# Heterogeneity table (all methods) and the base of the SheafFRL ablations:
+#   pilots  dataset.pilot_num_samples=384,768,1536,2048,4096
+#   lambda  orchestrator.max_lmb=0.003,0.01,0.03,0.1,0.3,1
+#   maps    mnist_4agents_shift_zca / mnist_4agents_shift_ols
+# Each agent trains on 7 of the 10 digits (a rotating window of 7), four CNNs
+# of different depth and latent width (d = 128 / 224 / 256 / 384).
+defaults:
+  - paper_base
+  - override dataset: hetero_mnist
+  - override model: cnn_classifier
+  - _self_
+
+logger:
+  project: mnist_4agents_shift
+
+tuned_lmb:   # lambda study, 3 seeds (results/mnist_4agents_shift/lambda)
+  non_cooperative: 0.0
+  sheaf_frl: 0.01
+  di_sheaf_frl: 0.01
+  comfed: 1.18e-3
+  sheaf_fmtl: 0.01
+  fedproto: 0.1
+  fedmuscle: 0.1
+  fedre: 0.0
+
+dataset:
+  n_agents: 4
+  batch_size: 256               # the retained 4-agent results all use 256
+  num_workers: 2
+  pilot_num_samples: 4096
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6]}
+    1: {agents: [1], target_classes: [3, 4, 5, 6, 7, 8, 9]}
+    2: {agents: [2], target_classes: [5, 6, 7, 8, 9, 0, 1]}
+    3: {agents: [3], target_classes: [8, 9, 0, 1, 2, 3, 4]}
+
+model:
+  agents:
+    0: {encoder_hidden_dims: [32, 64, 128]}
+    1: {encoder_hidden_dims: [32, 64, 128, 224]}
+    2: {encoder_hidden_dims: [32, 96, 256]}
+    3: {encoder_hidden_dims: [32, 64, 192, 384]}
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
+      seed: 42,43,44

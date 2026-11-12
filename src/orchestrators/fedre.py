@@ -20,6 +20,7 @@ from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
+from src.communication.projectors import latent_dim, retarget_input
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -49,6 +50,15 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
     head_batch_size : int, optional
         Server batch size (official ``-hbs``, default 10); one server epoch per
         round, so K <= head_batch_size means a single SGD step.
+    rm_dim : int | None, optional
+        Representation mapping (RM, the paper's FC variant). ``None`` (default)
+        shares the decoder as it is, so all latent dims must match. An int
+        turns each agent's decoder into ``Sequential(RM_i, head)``, with
+        ``RM_i = Linear(d_i -> rm_dim)`` private and trained by the local CE,
+        and ``head`` (the agent's decoder retargeted to ``rm_dim`` inputs) the
+        shared classifier. Prototypes are taken after RM. The latent that
+        alignment and the comm metric see is still the raw ``z_i``, so this
+        needs a post-hoc ``alignment_method``.
     alignment_method : str | None, optional
         ``None`` is native FedRE. A mixin method adds post-hoc alignment on
         pilots at evaluation time; it is not part of the paper.
@@ -61,6 +71,7 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         optimizer: Any,
         server_lr: float = 0.01,
         head_batch_size: int = 10,
+        rm_dim: int | None = None,
         alignment_method: str | None = None,
         **kwargs,
     ):
@@ -83,12 +94,54 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         if int(head_batch_size) < 1:
             raise ValueError('head_batch_size must be at least 1')
         self.save_hyperparameters(ignore=['agents'])
+        if rm_dim is not None:
+            self._add_representation_maps(int(rm_dim), alignment_method)
         self._validate_shared_decoders()
+
+    def _add_representation_maps(
+        self, rm_dim: int, alignment_method: str | None
+    ) -> None:
+        """Replace each decoder with ``Sequential(RM_i, head)`` (see ``rm_dim``)."""
+        if rm_dim < 1:
+            raise ValueError(f'rm_dim must be at least 1, got {rm_dim}')
+        if alignment_method is None:
+            # Identity would feed z_i to RM_j, a map trained for another agent.
+            raise ValueError(
+                'rm_dim needs a post-hoc alignment_method: the comm metric '
+                'sends raw latents, which identity cannot carry across RMs.'
+            )
+        for key, agent in self.agents.items():
+            d = latent_dim(agent)
+            if d is None or not hasattr(agent, '_decoder'):
+                raise TypeError(
+                    f'Agent {key}: rm_dim needs a decoder that starts with a '
+                    'linear layer, stored as agent._decoder.'
+                )
+            agent._decoder = nn.Sequential(
+                nn.Linear(d, rm_dim),
+                retarget_input(agent.decoder, rm_dim),
+            )
+
+    def _shared_decoder(self, agent: nn.Module) -> nn.Module:
+        """Return the part of the decoder the server owns: all of it, or the head after RM."""
+        if self.hparams.rm_dim is None:
+            return agent.decoder
+        return agent.decoder[1]
+
+    def _representation_map(self, idx: int, Z: torch.Tensor) -> torch.Tensor:
+        """Agent ``idx``'s RM applied to raw latents (identity without RM)."""
+        if self.hparams.rm_dim is None:
+            return Z
+        rm = self.agents[str(idx)].decoder[0]
+        return rm(Z.to(rm.weight.device))
 
     def _validate_shared_decoders(self) -> None:
         """Every agent must be able to load the single global classifier."""
         shapes = [
-            {k: v.shape for k, v in agent.decoder.state_dict().items()}
+            {
+                k: v.shape
+                for k, v in self._shared_decoder(agent).state_dict().items()
+            }
             for agent in self.agents.values()
         ]
         if any(s != shapes[0] for s in shapes):
@@ -98,7 +151,7 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         """Replace every local decoder with the server head (Alg. 1, line 3)."""
         state = self._server_head.state_dict()
         for agent in self.agents.values():
-            agent.decoder.load_state_dict(state)
+            self._shared_decoder(agent).load_state_dict(state)
         self._record_communication(state, n_transmissions=len(self.agents))
 
     def on_train_start(self) -> None:
@@ -111,7 +164,7 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
         object.__setattr__(
             self,
             '_server_head',
-            copy.deepcopy(self.agents[first].decoder),
+            copy.deepcopy(self._shared_decoder(self.agents[first])),
         )
         self._broadcast_head()
 
@@ -177,7 +230,9 @@ class FedRE(PostTrainingAlignmentMixin, BaseOrchestrator):
 
         num_classes = next(iter(self.agents.values())).accuracy.num_classes
         reps, soft_labels = [], []
-        for Z, y, _ in encoded.values():
+        for idx, (Z, y, _) in encoded.items():
+            with torch.no_grad():
+                Z = self._representation_map(idx, Z).cpu()
             rep, soft_label = self._entangle(Z, y, num_classes)
             self._record_communication(
                 torch.cat([rep, soft_label]), n_transmissions=1

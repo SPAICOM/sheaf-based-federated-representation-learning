@@ -8,6 +8,11 @@ E: 4
 T: 1
 
 alignment_mode: contrastive
+# Per-agent Linear(d_i -> proj_dim) before the cross-agent loss (src/communication/projectors.py).
+# null = raw latents (all agents need the same latent dim); an int allows heterogeneous dims.
+# Use proj_dim >= the largest latent dim: below it the map can discard what the loss acts on.
+proj_dim: null
+orthogonal_projector: true   # semi-orthogonal maps; keeps the projector from shrinking to zero
 
 neighbors: {}
 

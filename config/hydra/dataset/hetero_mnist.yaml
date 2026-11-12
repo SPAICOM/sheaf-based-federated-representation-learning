@@ -17,5 +17,5 @@ val_split: 0.1
 test_split: 0.1
 pilot_split: 0.0
 pilot_num_samples: null
-comm_data: private_pilots
+comm_data: shared_global_pilots   # every paper experiment shares one pilot set (see paper_base.yaml)
 seed: ${seed}

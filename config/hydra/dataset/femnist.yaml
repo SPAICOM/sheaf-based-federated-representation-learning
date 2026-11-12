@@ -1,0 +1,31 @@
+# FEMNIST (LEAF, via the Hugging Face Hub): 28x28 grayscale handwritten
+# characters with the id of their writer. Only the 10 digits are kept, and
+# with writer_key every agent trains on its own disjoint set of writers
+# (no handwriting style is shared between agents); pilot_writer_frac of the
+# writers supply the shared pilots. The dataset has a single split, so the
+# test rows are test_split of every agent's rows, shared by all agents.
+_target_: src.datamodules.HeteroClassificationDataModule
+
+repo: flwrlabs
+name: femnist
+data_key: image
+
+attributes:
+  - character
+
+label_subset: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+writer_key: writer_id
+pilot_writer_frac: 0.1
+
+split_strategy: overlapping_shift
+
+batch_size: 64
+num_workers: 4
+mode: min_size
+
+val_split: 0.0
+test_split: 0.1
+pilot_split: 0.0
+pilot_num_samples: null
+comm_data: shared_global_pilots
+seed: ${seed}

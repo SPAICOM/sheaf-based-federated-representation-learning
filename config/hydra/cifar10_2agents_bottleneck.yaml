@@ -1,0 +1,38 @@
+# CIFAR-10, 2 agents, label shift 1.0: performance vs bottleneck dimension.
+# Agent 0 trains on classes 0-6, agent 1 on 3-9 (clean images, private cap 0.7).
+# Two different ResNets whose latent widths are d and d/2; the pair is picked
+# with the bottleneck group: d8 (8/4), d16 (16/8), ..., d256 (256/128).
+# 1024 shared pilots over all classes.
+defaults:
+  - paper_base
+  - bottleneck: d64
+  - override dataset: hetero_cifar10
+  - override model: resnet_classifier
+  - _self_
+
+logger:
+  project: cifar10_2agents_bottleneck
+
+tuned_lmb:   # SheafFRL family: lambda of the grayscale/blur bottleneck study
+  non_cooperative: 0.0
+  sheaf_frl: 1e-2
+  di_sheaf_frl: 1e-2
+  comfed: 1.18e-3
+  sheaf_fmtl: 0.01
+  fedproto: 0.1
+  fedmuscle: 0.1
+  fedre: 0.0
+
+dataset:
+  n_agents: 2
+  pilot_num_samples: 1024
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6]}
+    1: {agents: [1], target_classes: [3, 4, 5, 6, 7, 8, 9]}
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
+      bottleneck: d8,d16,d32,d64,d128,d256
+      seed: 42,43,44

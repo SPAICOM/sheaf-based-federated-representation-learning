@@ -1,27 +1,62 @@
-# 4 agents on a complete graph induced by class cover, shift 1.0: the missing-class sets are
-# pairwise disjoint and cover all 10 classes, so every pair of agents holds all 10 classes
-# together (class_cover -> K4, 6 edges, degree 3):
-#   M_0={0,3,6} M_1={1,4,7} M_2={2,5} M_3={8,9}  -> agents 0,1 train on 7 classes, 2,3 on 8.
-# Tests DiSheafFRL and SheafFRL vs non-coop (post-hoc Procrustes on the pilots) on a dense graph.
+# CIFAR-10, 4 agents, label shift 1.0, fully connected graph (6 edges).
+# The classes each agent misses are pairwise disjoint and cover all 10
+# (M0={0,3,6} M1={1,4,7} M2={2,5} M3={8,9}), so every PAIR of agents holds all
+# 10 classes together; agents 0, 1 train on 7 classes, agents 2, 3 on 8.
+# Architectures differ in family AND latent width (all maps rectangular):
+#   0 ResNet-10 d=64   1 VGG-style CNN d=8   2 ResNet-18 d=32   3 VGG-style CNN d=16
+# 30000 training rows per agent.
 defaults:
-  - cifar10_4agents_base
+  - paper_base
+  - override dataset: hetero_cifar10
+  - override model: resnet_classifier
   - _self_
 
-study_name: "CIFAR-10 4 agents full (class cover), shift 1.0"
 logger:
   project: cifar10_4agents_full
 
+tuned_lmb:   # SheafFRL / DiSheafFRL: best of the phase-1 grid, confirmed on 3 seeds (STATUS)
+  non_cooperative: 0.0
+  sheaf_frl: 3e-2
+  di_sheaf_frl: 8e-2
+  comfed: 1.18e-3
+  sheaf_fmtl: 0.01
+  fedproto: 0.1
+  fedmuscle: 0.1
+  fedre: 0.0
+
 dataset:
+  n_agents: 4
+  agent_train_samples: 30000
+  num_workers: 1                 # 5 parallel CIFAR jobs fit in RAM
   groups:
-    0:
-      agents: [0]
-      target_classes: [1, 2, 4, 5, 7, 8, 9]
-    1:
-      agents: [1]
-      target_classes: [0, 2, 3, 5, 6, 8, 9]
-    2:
-      agents: [2]
-      target_classes: [0, 1, 3, 4, 6, 7, 8, 9]
+    0: {agents: [0], target_classes: [1, 2, 4, 5, 7, 8, 9]}
+    1: {agents: [1], target_classes: [0, 2, 3, 5, 6, 8, 9]}
+    2: {agents: [2], target_classes: [0, 1, 3, 4, 6, 7, 8, 9]}
+    3: {agents: [3], target_classes: [0, 1, 2, 3, 4, 5, 6, 7]}
+
+model:
+  agents:
+    0:   # ResNet-10, 1 block per stage
+      encoder_hidden_dims: [32, 64, 128, 64]
+      blocks_per_stage: [1, 1, 1, 1]
+      stage_strides: [1, 2, 2, 2]
+    1:   # VGG-style CNN, 2 convs per stage, 3 pooled stages
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 32, 64, 64, 128, 8]
+      pool_blocks: [false, true, false, true, false, true]
+      use_batchnorm: true
+    2:   # ResNet-18, 2 blocks per stage
+      encoder_hidden_dims: [32, 64, 128, 32]
+      blocks_per_stage: [2, 2, 2, 2]
+      stage_strides: [1, 2, 2, 2]
     3:
-      agents: [3]
-      target_classes: [0, 1, 2, 3, 4, 5, 6, 7]
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 32, 64, 64, 128, 16]
+      pool_blocks: [false, true, false, true, false, true]
+      use_batchnorm: true
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
+      seed: 42,43,44

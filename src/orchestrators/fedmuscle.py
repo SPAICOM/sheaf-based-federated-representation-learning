@@ -24,6 +24,7 @@ from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
+from src.communication.projectors import build_projectors, project
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -58,6 +59,16 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
     alignment_mode : str, optional
         Muscle *loss* mode used during training: "contrastive" (default) or
         "alignment".
+    proj_dim : int or None, optional
+        Common dimension for the Muscle loss. ``None`` (default) compares raw
+        pilot latents and needs every agent to have the same latent dim. An
+        int gives each agent a learned ``Linear(d_i -> proj_dim)`` (see
+        :mod:`src.communication.projectors`); the Muscle loss and the
+        exchanged pilot representations live in that space, while the decoder
+        still reads the raw latent. Not part of the original FedMuscle.
+    orthogonal_projector : bool, optional
+        Keep each projector semi-orthogonal (default: True), as for FedProto.
+        The contrastive loss is scale-free, so ``False`` is also usable here.
     alignment_method : str, optional
         Post-training *map* used to measure cross-agent communication accuracy
         at test time: ``'general'`` (unconstrained least-squares, default) or
@@ -86,6 +97,8 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         T: int = 1,
         alignment_mode: str = 'contrastive',
         lambda_schedule: str | None = None,
+        proj_dim: int | None = None,
+        orthogonal_projector: bool = True,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -104,6 +117,9 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
+        self.projectors = build_projectors(
+            self.agents, proj_dim, orthogonal=orthogonal_projector
+        )
         self._cl_epoch_count = 0
         self._local_epoch_count = 0
         self._round_complete = False
@@ -327,8 +343,10 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
             key = idx if idx in batch else idx_str
 
             if key in batch:
-                x, _ = batch[key]
-                representations[idx] = agent.encode(x)
+                x = self._unpack_task_batch(batch[key])[0]
+                representations[idx] = project(
+                    self.projectors, idx, agent.encode(x)
+                )
 
         return representations
 
@@ -398,7 +416,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
 
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            x, y = batch[_resolve_key(idx)]
+            x, y, _mask = self._unpack_task_batch(batch[_resolve_key(idx)])
 
             z = agent.encode(x)
             y_hat = agent.decoder(z)
@@ -430,7 +448,9 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
                 if idx in pilot_data:
                     x_pilot = pilot_data[idx]
                     with frozen_center_norm(agent):
-                        pilot_representations[idx] = agent.encode(x_pilot)
+                        pilot_representations[idx] = project(
+                            self.projectors, idx, agent.encode(x_pilot)
+                        )
 
             if pilot_representations:
                 muscle_loss = self._compute_muscle_loss(pilot_representations)

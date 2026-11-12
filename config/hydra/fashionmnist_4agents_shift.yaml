@@ -1,0 +1,53 @@
+# FashionMNIST, 4 agents, label shift 1.0, fully connected graph (6 edges).
+# Each agent trains on 6 of the 10 classes and EVERY pair shares exactly 3:
+# classes = the 10 edges of K5 on vertices {1..5}; agent v (v = 1..4) holds the
+# 6 edges not touching v, so agents v, w share the 3 edges among the other
+# three vertices. 4 classes are held by 3 agents, 6 by 2. Private cap 0.6.
+# Four ResNets with latent widths d = 256 / 192 / 128 / 160.
+defaults:
+  - paper_base
+  - override dataset: hetero_fashion_mnist
+  - override model: resnet_classifier
+  - _self_
+
+logger:
+  project: fashionmnist_4agents_shift
+
+tuned_lmb:   # DiSheafFRL: 6-point log grid on [1e-4, 1], 2-agent version, 2048 pilots
+  non_cooperative: 0.0
+  sheaf_frl: 3.981071705534973e-3
+  di_sheaf_frl: 3.981071705534973e-3
+  comfed: 1.18e-3
+  sheaf_fmtl: 0.01
+  fedproto: 0.1
+  fedmuscle: 0.1
+  fedre: 0.0
+
+trainer:
+  max_epochs: 40
+
+dataset:
+  n_agents: 4
+  num_workers: 6
+  pilot_num_samples: 2048
+  groups:
+    0: {agents: [0], target_classes: [4, 5, 6, 7, 8, 9]}
+    1: {agents: [1], target_classes: [1, 2, 3, 7, 8, 9]}
+    2: {agents: [2], target_classes: [0, 2, 3, 5, 6, 9]}
+    3: {agents: [3], target_classes: [0, 1, 3, 4, 6, 8]}
+
+model:
+  agents:
+    0: {encoder_hidden_dims: [64, 128, 256, 256], blocks_per_stage: [1, 1, 1, 1], stage_strides: [1, 2, 2, 2]}
+    1: {encoder_hidden_dims: [64, 128, 256, 192], blocks_per_stage: [1, 1, 1, 1], stage_strides: [1, 2, 2, 2]}
+    2: {encoder_hidden_dims: [64, 128, 128], blocks_per_stage: [2, 2, 2], stage_strides: [1, 2, 2]}
+    3: {encoder_hidden_dims: [64, 128, 160], blocks_per_stage: [1, 2, 2], stage_strides: [1, 2, 2]}
+
+orchestrator:
+  gate_temperature: 0.1   # DiSheafFRL gate, as tuned
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
+      seed: 42,43,44

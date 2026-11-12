@@ -8,6 +8,7 @@ Learning via Latent-Space Consensus", IEEE Wireless Communications Letters, 2026
 import torch
 import torch.nn as nn
 from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
@@ -87,18 +88,36 @@ class ComFed(BaseOrchestrator):
     # Optimizers — separate for wi and Pi so each step only touches one
     # ------------------------------------------------------------------
 
-    def configure_optimizers(self) -> list:
-        model_opt = instantiate(
-            self.hparams.optimizer,
-            params=self.agents.parameters(),
-        )
-        proj_opt = instantiate(
-            self.hparams.optimizer,
-            params=self.projection_matrices.parameters(),
-        )
-        return [model_opt, proj_opt]
+    def configure_optimizers(self) -> tuple[list, list]:
+        """One optimizer for the encoders, one for the projections.
+
+        The optional ``scheduler: cosine`` key of the optimizer config (see
+        BaseOrchestrator.configure_optimizers) gives each optimizer a cosine
+        schedule over trainer.max_epochs, stepped at epoch end (manual
+        optimization: Lightning does not step it).
+        """
+        opt_cfg = self.hparams.optimizer
+        if isinstance(opt_cfg, DictConfig):
+            opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)
+        opt_cfg = dict(opt_cfg)
+        scheduler = opt_cfg.pop('scheduler', None)
+        if scheduler not in (None, 'cosine'):
+            raise ValueError(f"Unknown optimizer.scheduler {scheduler!r}; expected 'cosine'")
+        optimizers = [
+            instantiate(opt_cfg, params=self.agents.parameters()),
+            instantiate(opt_cfg, params=self.projection_matrices.parameters()),
+        ]
+        if scheduler is None:
+            return optimizers, []
+        epochs = max(int(self.trainer.max_epochs), 1)
+        return optimizers, [
+            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs) for opt in optimizers
+        ]
 
     def on_train_epoch_end(self) -> None:
+        schedulers = self.lr_schedulers()
+        for sched in schedulers if isinstance(schedulers, list) else [schedulers] if schedulers else []:
+            sched.step()
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
 

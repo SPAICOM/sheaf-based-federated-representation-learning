@@ -1,0 +1,101 @@
+# Shared protocol of every paper experiment (not run directly).
+#
+#   data   label shift 1.0: agent i trains only on its own target classes
+#          (dataset.groups), drawn from the train split minus the pilots;
+#          every agent is tested on the full, unshifted official test split.
+#   pilots dataset.pilot_num_samples unlabelled rows over ALL classes, shared
+#          by every agent and removed from all training draws.
+#   models heterogeneous encoders, CenterNorm at the bottleneck, no whitening.
+#   eval   private accuracy on the agent's own decoder; communication accuracy
+#          through a post-hoc Procrustes map fitted on the pilots, for EVERY
+#          method, so all methods are scored with the same alignment.
+#
+# An experiment config sets the dataset, the class groups, the models, the
+# pilot budget and `tuned_lmb` (the penalty weight per method), and lists the
+# methods and seeds its multirun sweeps over (hydra.sweeper.params).
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd_cosine
+  - _self_
+
+seed: 42
+study_name: ${hydra:runtime.choices.orchestrator}   # = the wandb group
+
+# orchestrator.max_lmb of the chosen method, looked up by its config name.
+# Every experiment fills this table; a CLI override of orchestrator.max_lmb
+# (e.g. for a lambda ablation) still wins.
+tuned_lmb: ???
+
+graph:
+  neighbors_mode: fully_connected
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: ???
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 2
+  log_every_n_steps: 50
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+
+callbacks:
+  lr_monitor:
+    _target_: lightning.pytorch.callbacks.LearningRateMonitor
+    logging_interval: epoch
+
+dataset:
+  split_strategy: overlapping_shift
+  shift_strength: 1.0
+  test_source: original
+  agent_train_samples: max      # largest draw every agent can take at this shift
+  val_split: 0.0
+  monitor_test_during_fit: true
+  batch_size: 128
+  num_workers: 4
+  mode: min_size
+  pilot_source: pool
+  pilot_split: 0.0
+  pilot_num_samples: 4096
+  pilot_batch_size: 128
+  pilot_exclusive: true         # pilots never appear in a training draw
+  pilot_class_filter: false     # every agent encodes every pilot, any class
+  comm_data: shared_global_pilots
+  agent_input_noise: null
+
+model:
+  latent_norm: true             # CenterNorm: (z - mean) / ||z - mean||
+  dropout: 0.0
+  weight_decay: 0.0
+  decoder_hidden_dims: [256]
+
+orchestrator:
+  max_lmb: ${tuned_lmb.${hydra:runtime.choices.orchestrator}}
+  learn_lmb: false
+  comm_task_coeff: 0
+  # post-hoc evaluation, identical for every method
+  alignment_method: procrustes
+  posthoc_whitening: false
+  whitening_source: pilots
+  # SheafFRL / DiSheafFRL training
+  whitening: false
+  learn_whitening: false
+  swbn_fit_source: pilots
+  zca_refit_source: pilots
+  anchor_selection: all
+  align_on_intersection: false
+  log_latent_diagnostics: true
+  pid_logging: false
+
+optimization:
+  objective_metric: validation/avg_task_performance_epoch
+  run_test: true

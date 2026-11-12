@@ -19,6 +19,7 @@ from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
+from src.communication.projectors import build_projectors, project
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -48,6 +49,17 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     prototype_momentum : float, optional
         Momentum for updating global prototypes (default: 0.9).
+    proj_dim : int or None, optional
+        Common dimension for prototypes. ``None`` (default) compares raw
+        latents and needs every agent to have the same latent dim. An int
+        gives each agent a learned ``Linear(d_i -> proj_dim)`` (see
+        :mod:`src.communication.projectors`); prototypes, the regulariser and
+        the uploaded payload live in that space, while the decoder still reads
+        the raw latent. Not part of the original FedProto.
+    orthogonal_projector : bool, optional
+        Keep each projector semi-orthogonal (default: True). Without it the
+        squared prototype distance is minimised by shrinking the projector to
+        zero, leaving the latents unchanged.
     alignment_method : str, optional
         Post-training alignment used to measure cross-agent communication
         accuracy at test time: ``'general'`` (unconstrained least-squares,
@@ -71,6 +83,8 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         max_lmb: float = 0.1,
         prototype_momentum: float = 0.9,
         lambda_schedule: str | None = None,
+        proj_dim: int | None = None,
+        orthogonal_projector: bool = True,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -89,6 +103,9 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
+        self.projectors = build_projectors(
+            self.agents, proj_dim, orthogonal=orthogonal_projector
+        )
         self._global_prototypes: dict[int, torch.Tensor] = {}
 
     def _validate_agents(self) -> None:
@@ -224,7 +241,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
             key = idx if idx in batch else idx_str
 
             if key in batch:
-                x, y = batch[key]
+                x, y, _mask = self._unpack_task_batch(batch[key])
                 inputs[idx] = x
                 labels[idx] = y
 
@@ -280,7 +297,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
             y_hat = agent.decoder(z)
 
             outputs[idx] = (y_hat.detach(), y)
-            latents_per_agent[idx] = z
+            latents_per_agent[idx] = project(self.projectors, idx, z)
 
             agent_losses[idx] = agent.compute_loss(y_hat, y)
             agent_performances[idx] = agent.task_performance(y_hat, y)

@@ -243,8 +243,24 @@ doc/
 # Project specific ignores
 logs/
 tests/test_*
-results/
+results/*
 
 # Config files - ignore hetero_cifar10 and rotated_mnist experiments
 config/hydra/rotated_mnist_anchor_sweep.yaml
 
+
+# Explicitly promoted MNIST study summaries and figures (no raw run caches).
+!results/mnist_2agents_7v7/
+results/mnist_2agents_7v7/*
+!results/mnist_2agents_7v7/main/
+!results/mnist_4agents_shift/
+results/mnist_4agents_shift/*
+!results/mnist_4agents_shift/README.md
+!results/mnist_4agents_shift/pilots/
+!results/mnist_4agents_shift/lambda/
+!results/mnist_4agents_shift/maps/
+results/mnist_4agents_shift/pilots/progress.txt
+!results/mnist_2agents_7v7/main/*.pdf
+!results/mnist_4agents_shift/pilots/*.pdf
+!results/mnist_4agents_shift/lambda/*.pdf
+!results/mnist_4agents_shift/maps/*.pdf
