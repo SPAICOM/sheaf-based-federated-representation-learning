@@ -3,7 +3,9 @@ _target_: src.orchestrators.ComFed
 max_lmb: 1.18e-3
 lambda_schedule: null
 
-proj_dim: 64
+# Common space of the per-agent maps P_i: R^{d_i} -> R^{proj_dim}.
+# null = the largest latent dim in the network.
+proj_dim: null
 
 neighbors: {}
 
