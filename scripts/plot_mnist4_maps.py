@@ -76,10 +76,59 @@ for method in ('zca', 'ols'):
         + '\n'
     )
     frames[method] = df
+# Frozen-checkpoint evaluation through the OLS maps saved during training.
+learned_rows = []
+for stub in api.runs(
+    f'{api.default_entity}/mnist_4agents_mapstudy_ols',
+    filters={
+        'group': {'$in': ['lambda_saved_ols_eval', 'pilot_saved_ols_eval']}
+    },
+):
+    r = api.run(f'{api.default_entity}/mnist_4agents_mapstudy_ols/{stub.id}')
+    if r.state != 'finished':
+        continue
+    assert r.config['eval_solver'] == 'saved_checkpoint_maps'
+    learned_rows.append(
+        {
+            'run': r.id,
+            'source': r.config['source_run'],
+            'seed': r.config['seed'],
+            'weight': r.config['weight'],
+            'pilots': r.config['pilots'],
+            'comm': r.summary['test/avg_comm_task_perf'],
+            'private': r.summary['test/avg_private_task_perf'],
+        }
+    )
+learned = pd.DataFrame(learned_rows)
+assert learned.source.is_unique
+learned = learned[
+    ((learned.pilots == 4096) | (learned.weight == 0.01))
+    & (learned.pilots != 128)
+]
+assert len(learned) == 30, len(
+    learned
+)  # (6 lambdas + 4 extra pilot counts) x 3 seeds
+assert all(
+    sorted(g.seed) == [42, 43, 44]
+    for _, g in learned.groupby(['pilots', 'weight'])
+)
+(OUT / 'saved_ols_provenance.md').write_text(
+    'Project: mnist_4agents_mapstudy_ols, groups lambda_saved_ols_eval and '
+    'pilot_saved_ols_eval. Frozen final checkpoints scored through the OLS maps '
+    'saved during training (eval_alignment=learned, pseudoinverse reverse map). '
+    'Three seeds per point.\n\n'
+    + '\n'.join(
+        f'- pilots {r.pilots}, lambda {r.weight}, seed {r.seed}: '
+        f'eval {r.run} (source {r.source})'
+        for r in learned.sort_values(['pilots', 'weight', 'seed']).itertuples()
+    )
+    + '\n'
+)
 labels = [
     'Non cooperative',
     'DiSheafFRL + CenterNorm',
     'DiSheafFRL + ZCA',
+    'DiSheafFRL + CenterNorm + OLS (posthoc)',
     'DiSheafFRL + CenterNorm + OLS',
 ]
 for study, directory, x in [
@@ -108,6 +157,12 @@ for study, directory, x in [
             series.append(
                 d.groupby(x)[kind + ' test'].agg(['mean', 'std']) * 100
             )
+        d = (
+            learned[learned.pilots == 4096]
+            if study == 'lambda'
+            else learned[learned.weight == 0.01]
+        )
+        series.append(d.groupby(x)[kind].agg(['mean', 'std']) * 100)
         values = sorted(set().union(*(set(d.index) for d in series[1:])))
         if study == 'lambda':
             series[0] = pd.DataFrame(
@@ -115,17 +170,19 @@ for study, directory, x in [
             )
         for label, color, d in zip(
             labels,
-            ['tab:orange', 'tab:blue', 'tab:green', 'tab:purple'],
+            ['tab:orange', 'tab:blue', 'tab:green', 'tab:purple', 'tab:red'],
             series,
         ):
-            ax.errorbar(
-                d.index,
-                d['mean'],
-                yerr=d['std'],
-                marker='o',
-                color=color,
-                label=label,
-            )
+            # The posthoc OLS stays in the tables but not in the figure.
+            if color != 'tab:purple':
+                ax.errorbar(
+                    d.index,
+                    d['mean'],
+                    yerr=d['std'],
+                    marker='D' if color == 'tab:red' else 'o',
+                    color=color,
+                    label=label,
+                )
             if kind == 'comm':
                 table[label] = d.apply(
                     lambda r: f'{r["mean"]:.2f} ± {r["std"]:.2f}', axis=1
@@ -139,6 +196,8 @@ for study, directory, x in [
             ax.set_xscale('log')
         ax.grid(alpha=0.2)
     axes[0].legend(fontsize=8)
+    if study == 'lambda':
+        fig.suptitle('4096 pilots; mean ± sample SD, seeds 42/43/44')
     fig.tight_layout()
     for ext in ['png', 'pdf']:
         fig.savefig(OUT / f'{study}_study.{ext}', dpi=180)

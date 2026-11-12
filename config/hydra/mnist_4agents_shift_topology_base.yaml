@@ -1,0 +1,18 @@
+# Shared setting of the topology study (ring / star vs the fully connected mnist_4agents_shift):
+# DiSheafFRL with Stiefel maps (use_general_maps default false), CenterNorm latents,
+# no whitening (training and post-hoc), 4096 exclusive pilots, batch 256, lambda 0.01.
+# Run the non_cooperative baseline in the same setting with `orchestrator=non_cooperative`.
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+dataset:
+  batch_size: 256
+  pilot_num_samples: 4096
+model:
+  latent_norm: true
+orchestrator:
+  max_lmb: 0.01
+  whitening: false
+  learn_whitening: false
+  posthoc_whitening: false

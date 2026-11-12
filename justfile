@@ -390,3 +390,19 @@ mnist4-map-summary:
 # Queued MNIST4 pilot-BN-update .
 mnist4-bn-update:
     just launch mnist4_bn_update 3 "bash tmp/2026-11-10_mnist4_bn_update.sh"
+
+# Resume saved OLS-map lambda or pilot evaluation; --plan audits remote coverage.
+mnist4-ols-learned study *args="":
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" OMP_NUM_THREADS=4 uv run python tmp/2026-11-12_mnist4_ols_learned.py {{study}} {{args}}
+
+# Refresh OLS learned-map overlays from finished W&B evaluations.
+mnist4-ols-overlay:
+    uv run python tmp/2026-11-12_mnist4_ols_overlay.py
+
+# Audit posthoc jitter and optionally publish the missing lambda.3 saved-map evaluation.
+mnist4-ols-sanity-audit *args="":
+    CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 OMP_NUM_THREADS=4 WANDB_DIR="{{justfile_directory()}}/logs/wandb" uv run python tmp/2026-11-12_ols_sanity_audit.py {{args}}
+
+# Topology study (ring + star, noncoop vs DiSheafFRL, 3 seeds); launcher tmp/2026-11-12_mnist4_topology.sh.
+mnist4-topology:
+    just launch mnist4_topology 12 "bash tmp/2026-11-12_mnist4_topology.sh"

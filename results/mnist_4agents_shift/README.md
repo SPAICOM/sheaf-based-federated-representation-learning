@@ -10,9 +10,12 @@ standard deviations across seeds. Evaluation fits posthoc Procrustes maps.
 - [Lambda aggregates](lambda/summary.csv): 4096 pilots, lambda
   .003/.01/.03/.1/.3/1, private and communication scores by agent and average.
 - [Combined pilot comparison](maps/pilot_summary.md) and
-  [lambda comparison](maps/lambda_summary.md): noncoop, CenterNorm, ZCA, OLS.
-- [ZCA provenance](maps/zca_provenance.md) and
-  [OLS provenance](maps/ols_provenance.md): remote run IDs and seeds.
+  [lambda comparison](maps/lambda_summary.md): noncoop, CenterNorm, ZCA, OLS (posthoc table column; figure shows saved OLS maps).
+- [ZCA provenance](maps/zca_provenance.md),
+  [OLS provenance](maps/ols_provenance.md) and
+  [saved-OLS-map provenance](maps/saved_ols_provenance.md): remote run IDs and seeds.
+  Saved-OLS curves are frozen-checkpoint evaluations through the maps learned in
+  training (30 evals, three seeds per point; tmp/2026-11-12_mnist4_ols_learned.py).
 - Each study directory includes PDF and PNG figures. Poor completed map
   settings remain in the curves; selecting only high scores would bias them.
 
@@ -22,7 +25,7 @@ standard deviations across seeds. Evaluation fits posthoc Procrustes maps.
 |---|---|---|
 | `scripts/plot_mnist4_pilots.py` | `tmp/2026-11-08_mnist4_table.py` | `just mnist4-pilot-summary` |
 | `scripts/plot_mnist4_lambda.py` | `tmp/2026-11-09_mnist4_extension_report.py` | `just mnist4-lambda-summary` |
-| `scripts/plot_mnist4_maps.py` | `tmp/2026-11-11_mnist4_ols_overlay.py` (without p128) | `just mnist4-map-summary` |
+| `scripts/plot_mnist4_maps.py` | `tmp/2026-11-12_mnist4_ols_overlay.py` (without p128) | `just mnist4-map-summary` |
 
 The pilot summary is the retained remote-verified checkpoint rescore; rerunning
 it requires the 30 saved final checkpoints and CUDA. Its overall totals were
@@ -44,5 +47,5 @@ Pilot evidence is recorded in the valid completed pilot and 1536 rows.
 The separate two-agent study has only two seeds and remains preliminary.
 Historical implementation revisions were dirty (7972e4b / 552cb0e).
 
-Not included: p128, SimCLR, shift .8/.9, BatchNorm ablation, learned-map
+Not included: p128, SimCLR, shift .8/.9, BatchNorm ablation, saved-Stiefel-map
 rescoring, failed/cancelled 1408/3072 trials, or the abandoned batch-128 runs.

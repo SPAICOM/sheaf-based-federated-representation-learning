@@ -1,0 +1,13 @@
+# Tests whether DiSheafFRL on 4-agent MNIST (7 classes/agent) survives a sparse ring.
+# Class overlaps: 0-3 and 1-2 share 5 classes, the other four pairs share 4. The two
+# strongest edges are always kept; the cross edges 0-1,2-3 vs 0-2,1-3 tie (total 18),
+# so the ring follows agent order: 0-1-2-3-0 (4 edges, degree 2).
+defaults:
+  - mnist_4agents_shift_topology_base
+  - _self_
+study_name: mnist_4agents_shift_ring
+logger:
+  project: mnist_4agents_shift_ring
+graph:
+  neighbors_mode: manual
+  neighbors: {0: [1, 3], 1: [0, 2], 2: [1, 3], 3: [2, 0]}
