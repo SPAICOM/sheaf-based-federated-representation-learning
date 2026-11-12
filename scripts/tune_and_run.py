@@ -28,6 +28,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import wandb
@@ -37,6 +38,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / 'config' / 'hydra'
 METRIC = 'test/avg_comm_task_perf'
 POLL_S = 300
+STALE_S = 900  # a 'running' run without a heartbeat for this long is dead (killed job)
 _print_lock = threading.Lock()
 
 
@@ -112,11 +114,13 @@ class Runs:
         out: dict = {}
         if not self.project_exists():
             return out
+        self.api.flush()  # the Api caches run listings: without this, states never update
         for group in groups:
-            for r in self.api.runs(self.path, filters={'group': group}):
-                cfg = self.api.run(
-                    '/'.join(r.path)
-                ).config  # listings carry no config
+            for listed in self.api.runs(self.path, filters={'group': group}):
+                r = self.api.run(
+                    '/'.join(listed.path)
+                )  # listings carry no config
+                cfg = r.config
                 lmb = (
                     lmb_key(float(cfg['orchestrator']['max_lmb']))
                     if with_lmb
@@ -130,6 +134,14 @@ class Runs:
         return self.fetch(job.lookup, job.lmb is not None).get(
             (job.seed, lmb_key(job.lmb)), []
         )
+
+
+def alive(run) -> bool:
+    """Run is running and still sending heartbeats (a killed job stays 'running' for a while)."""
+    if run.state != 'running':
+        return False
+    beat = datetime.fromisoformat(run.heartbeatAt.replace('Z', '+00:00'))
+    return (datetime.now(UTC) - beat).total_seconds() < STALE_S
 
 
 def finished(run) -> bool:
@@ -212,7 +224,7 @@ class Pipeline:
             if any(finished(r) for r in runs):
                 log(f'{job.name}: finished on wandb ({runs[0].id}), skipped')
                 return True
-            if not any(r.state == 'running' for r in runs):
+            if not any(alive(r) for r in runs):
                 break
             if self.dry:
                 log(

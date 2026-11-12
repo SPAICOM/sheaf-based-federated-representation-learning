@@ -5,6 +5,7 @@ import warnings
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.agents.personalized_classifier import PersonalizedClassifier
 from src.orchestrators.fedmuscle import FedMuscle
@@ -76,3 +77,53 @@ class TestFedMuscleProjectors:
         # 4 pilots x 8 floats x 32 bit, each agent to its 1 neighbour.
         kb = orch._communication_by_split['train']['kilobytes']
         assert kb == pytest.approx(2 * 4 * 8 * 4 / 1024)
+
+
+def _reference_contrastive_loss(reps: list[torch.Tensor], tau: float):
+    """Compute the Muscle loss with the original per-sample loop (before vectorisation)."""
+    n, b = len(reps), reps[0].shape[0]
+    means = torch.stack(reps).mean(dim=0)
+    total = torch.tensor(0.0)
+    for k in range(n):
+        losses = []
+        for i in range(b):
+            z = reps[k][i].unsqueeze(0)
+            other = torch.stack([reps[j][i] for j in range(n) if j != k]).mean(
+                0
+            )
+            pos = F.cosine_similarity(z, other.unsqueeze(0), dim=1)
+            negs = [
+                F.cosine_similarity(z, means[j].unsqueeze(0), dim=1)
+                for j in range(b)
+                if j != i
+            ]
+            neg = torch.stack(negs).mean(0) if negs else torch.tensor(-1.0)
+            pe, ne = torch.exp(pos / tau), torch.exp(neg / tau)
+            losses.append(-torch.log(pe / (pe + ne)))
+        total = total + torch.stack(losses).mean()
+    return total / n
+
+
+class TestContrastiveLoss:
+    @pytest.mark.parametrize('n_agents', [2, 3, 4])
+    @pytest.mark.parametrize('batch', [1, 5])
+    def test_matches_the_per_sample_loop(self, n_agents, batch):
+        orch = _fedmuscle((5, 5))
+        torch.manual_seed(1)
+        reps = [
+            torch.randn(batch, 4, requires_grad=True) for _ in range(n_agents)
+        ]
+        loss = orch._compute_contrastive_loss(dict(enumerate(reps)))
+        grads = torch.autograd.grad(loss, reps)
+        ref = _reference_contrastive_loss(reps, orch.hparams.temperature)
+        ref_grads = torch.autograd.grad(ref.sum(), reps)
+        assert loss.item() == pytest.approx(ref.item(), abs=1e-5)
+        for g, r in zip(grads, ref_grads, strict=True):
+            assert torch.allclose(g, r, atol=1e-5)
+
+    def test_unequal_batches_give_zero(self):
+        orch = _fedmuscle((5, 5))
+        loss = orch._compute_contrastive_loss(
+            {0: torch.randn(3, 4), 1: torch.randn(2, 4)}
+        )
+        assert loss.item() == 0.0
