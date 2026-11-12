@@ -1,0 +1,24 @@
+# CIFAR-10, 4 agents: penalty-weight (lambda) ablation of the baselines.
+# Same setup as cifar10_4agents_full; one 100-epoch run per (method, lambda), seed 42.
+#   FedProto   weight of the prototype regulariser
+#   FedMuscle  weight of the contrastive Muscle loss on the pilots
+#   ComFed     weight of the class-mean consensus loss (proj_dim: null = max latent dim)
+# The best lambda per method (test avg comm) goes into tuned_lmb of cifar10_4agents_full.yaml.
+# FedRE has no lambda; SheafFRL and DiSheafFRL are tuned in LEDGER (cifar10_4agents_full rows).
+#
+#   just cifar10-ablation-lambda                         # all methods
+#   just cifar10-ablation-lambda orchestrator=fedproto   # one method
+#
+# wandb: project cifar10_4agents_full, one group per method (<method>_lambda).
+defaults:
+  - cifar10_4agents_full
+  - _self_
+
+study_name: ${hydra:runtime.choices.orchestrator}_lambda
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: fedproto,fedmuscle,comfed
+      orchestrator.max_lmb: 1e-3,3e-3,1e-2,3e-2,1e-1,3e-1,1.0
+      seed: 42

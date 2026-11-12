@@ -110,6 +110,26 @@ method (`logger.group = study_name`, default the method's config name). The
 table and the bottleneck plot only read groups named after a method, and a
 re-run of the same cell replaces the older run.
 
+### Seen/unseen-class breakdown
+
+Under label shift every agent misses some classes, so each run also logs its
+test accuracies split by class scope under `test/scope/`
+(`src/utils/class_scope.py`): private accuracy on the agent's own classes vs
+the rest, and communication accuracy on classes both agents trained on
+(`both_seen`), only the receiver trained on (`tx_unseen_rx_seen`), only the
+sender (`tx_seen_rx_unseen`) or neither (`both_unseen`). Each is logged per
+directed edge, per agent (as receiver `rx` and as sender `tx`) and pooled over
+the network, with the sample counts (`n_*`).
+
+```bash
+just class-scope cifar10_4agents_full                  # network / agent / edge tables + plots → results/<project>/class_scope/
+just class-scope cifar10_2agents_bottleneck --x latent_d
+just rescore-class-scope cifar10_4agents_full 3mgkbida # older runs: recompute from the checkpoint (add --write to store in wandb)
+```
+
+`just table-hetero` also writes `hetero_table_scope.{md,tex}`, and
+`just plot-bottleneck` has a third panel for the receiver-only classes.
+
 ### Retained results
 
 - MNIST ablations: [summary](results/mnist_4agents_shift/README.md), three

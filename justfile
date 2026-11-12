@@ -57,6 +57,11 @@ bottleneck *args="":
 hetero dataset *args="":
     uv run python scripts/multi_agent_experiment.py -m --config-name {{ if dataset == "cifar10" { "cifar10_4agents_full" } else { dataset + "_4agents_shift" } }} {{args}}
 
+#   just hetero-pipeline cifar10 [fedproto,fedre] [--jobs 4] [--grid 1e-2,1e-1] [--dry-run]
+# Heterogeneity table with lambda tuning, all methods of the config unless listed: grid on seed 42 → best comm into tuned_lmb → other seeds; non-coop/FedRE: all seeds. Resumes from wandb.
+hetero-pipeline dataset *args="":
+    uv run python scripts/tune_and_run.py {{dataset}} {{args}}
+
 # MNIST ablation: pilot budget, non-coop vs DiSheafFRL (lambda 0.01).
 mnist-ablation-pilots *args="":
     uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift \
@@ -81,9 +86,20 @@ mnist-ablation-maps method *args="":
 plot-bottleneck:
     uv run python scripts/plot_bottleneck.py
 
-# Heterogeneity table over MNIST, FMNIST, FEMNIST, CIFAR-10 → results/paper/hetero_table.{md,tex}
+# Heterogeneity table over MNIST, FMNIST, FEMNIST, CIFAR-10 (+ seen/unseen split) → results/paper/hetero_table{,_scope}.{md,tex}
 table-hetero:
     uv run python scripts/table_hetero.py
+
+# Seen/unseen-class breakdown of one experiment at network, agent and edge level → results/<project>/class_scope/
+#   just class-scope cifar10_4agents_full
+#   just class-scope cifar10_2agents_bottleneck --x latent_d
+class-scope project *args="":
+    uv run python scripts/report_class_scope.py {{project}} {{args}}
+
+# Add the seen/unseen metrics to finished runs that predate them, from their checkpoints (dry run unless --write)
+#   just rescore-class-scope cifar10_4agents_full --groups non_cooperative,sheaf_frl,di_sheaf_frl --write
+rescore-class-scope project *args="":
+    uv run python scripts/rescore_class_scope.py {{project}} {{args}}
 
 # MNIST pilot ablation: re-scores the 30 saved final checkpoints (needs CUDA)
 mnist-pilots-summary:

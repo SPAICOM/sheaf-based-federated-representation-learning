@@ -4,7 +4,11 @@ Reads the finished runs of ``just hetero <dataset>`` from the wandb remote
 (one project per dataset, one group per method) and tabulates communication
 and private test accuracy, mean and standard deviation over seeds.
 
-Writes results/paper/hetero_table.{md,tex}.
+Writes results/paper/hetero_table.{md,tex} and the seen/unseen split
+hetero_table_scope.{md,tex}: private accuracy on the agent's own classes and
+communication accuracy on classes both agents trained on vs classes only the
+receiver trained on ('–' for runs that predate the split; see
+scripts/rescore_class_scope.py).
 """
 
 from pathlib import Path
@@ -33,6 +37,13 @@ METHODS = {
     'di_sheaf_frl': 'DiSheafFRL',
 }
 METRICS = {'comm': 'Comm.', 'private': 'Private'}
+# seen/unseen split (src/utils/class_scope.py) for the second table:
+# column -> (summary key, label); NaN for runs that predate it
+SCOPES = {
+    'private_seen': ('test/scope/private_seen', 'Private seen'),
+    'comm_both_seen': ('test/scope/comm_both_seen', 'Comm. both seen'),
+    'comm_rx_only': ('test/scope/comm_tx_unseen_rx_seen', 'Comm. rx only'),
+}
 
 
 def load_runs() -> pd.DataFrame:
@@ -42,9 +53,13 @@ def load_runs() -> pd.DataFrame:
     rows = []
     for dataset, project in DATASETS.items():
         if project not in existing:
-            print(f'{api.default_entity}/{project} does not exist yet: {dataset} column left empty')
+            print(
+                f'{api.default_entity}/{project} does not exist yet: {dataset} column left empty'
+            )
             continue
-        for run in api.runs(f'{api.default_entity}/{project}', filters={'state': 'finished'}):
+        for run in api.runs(
+            f'{api.default_entity}/{project}', filters={'state': 'finished'}
+        ):
             if run.group not in METHODS:
                 continue
             rows.append(
@@ -53,19 +68,38 @@ def load_runs() -> pd.DataFrame:
                     'method': run.group,
                     'seed': run.config['seed'],
                     'created': run.created_at,
-                    **{k: 100 * run.summary[f'test/avg_{k}_task_perf'] for k in METRICS},
+                    **{
+                        k: 100 * run.summary[f'test/avg_{k}_task_perf']
+                        for k in METRICS
+                    },
+                    **{
+                        k: 100 * run.summary.get(key, float('nan'))
+                        for k, (key, _) in SCOPES.items()
+                    },
                 }
             )
     if not rows:
-        raise SystemExit('no finished runs with a method group in ' + ', '.join(DATASETS.values()))
+        raise SystemExit(
+            'no finished runs with a method group in '
+            + ', '.join(DATASETS.values())
+        )
     runs = pd.DataFrame(rows)
     # a re-run of the same cell replaces the older one
-    return runs.sort_values('created').drop_duplicates(['dataset', 'method', 'seed'], keep='last')
+    return runs.sort_values('created').drop_duplicates(
+        ['dataset', 'method', 'seed'], keep='last'
+    )
 
 
 def cell(values: pd.Series) -> str:
     """'mean ± std (n)' with the seed count shown only when it is not 3."""
-    text = f'{values.mean():.1f} ± {values.std():.1f}' if len(values) > 1 else f'{values.mean():.1f}'
+    values = values.dropna()
+    if values.empty:
+        return '–'
+    text = (
+        f'{values.mean():.1f} ± {values.std():.1f}'
+        if len(values) > 1
+        else f'{values.mean():.1f}'
+    )
     return text if len(values) == 3 else f'{text} (n={len(values)})'
 
 
@@ -73,24 +107,42 @@ def to_markdown(table: pd.DataFrame) -> str:
     """Pipe table with one header row 'dataset metric'."""
     header = ['method'] + [f'{d} {m}' for d, m in table.columns]
     lines = ['| ' + ' | '.join(header) + ' |', '|' + '---|' * len(header)]
-    lines += ['| ' + ' | '.join([idx, *row]) + ' |' for idx, row in zip(table.index, table.values, strict=True)]
+    lines += [
+        '| ' + ' | '.join([idx, *row]) + ' |'
+        for idx, row in zip(table.index, table.values, strict=True)
+    ]
     return '\n'.join(lines) + '\n'
 
 
-def main() -> None:
-    """Build the method x (dataset, metric) table and write it as Markdown and LaTeX."""
-    runs = load_runs()
-    columns = pd.MultiIndex.from_product([list(DATASETS), list(METRICS.values())])
+def build(runs: pd.DataFrame, metrics: dict[str, str]) -> pd.DataFrame:
+    """Build the method x (dataset, metric) table of 'mean ± std' cells."""
+    columns = pd.MultiIndex.from_product(
+        [list(DATASETS), list(metrics.values())]
+    )
     table = pd.DataFrame('–', index=list(METHODS.values()), columns=columns)
     for (dataset, method), group in runs.groupby(['dataset', 'method']):
-        for key, label in METRICS.items():
+        for key, label in metrics.items():
             table.loc[METHODS[method], (dataset, label)] = cell(group[key])
+    return table
 
+
+def main() -> None:
+    """Write the headline table and its seen/unseen split as Markdown and LaTeX."""
+    runs = load_runs()
     OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / 'hetero_table.md').write_text(to_markdown(table))
-    (OUT / 'hetero_table.tex').write_text(table.to_latex(multicolumn_format='c').replace('±', r'$\pm$'))
-    print(table.to_string())
-    print(f'wrote {OUT}/hetero_table.{{md,tex}}')
+    tables = {
+        'hetero_table': build(runs, METRICS),
+        'hetero_table_scope': build(
+            runs, {k: label for k, (_, label) in SCOPES.items()}
+        ),
+    }
+    for name, table in tables.items():
+        (OUT / f'{name}.md').write_text(to_markdown(table))
+        (OUT / f'{name}.tex').write_text(
+            table.to_latex(multicolumn_format='c').replace('±', r'$\pm$')
+        )
+        print(table.to_string())
+    print(f'wrote {OUT}/hetero_table{{,_scope}}.{{md,tex}}')
 
 
 if __name__ == '__main__':

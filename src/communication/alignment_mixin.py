@@ -21,6 +21,7 @@ from src.communication.whitening import (
     whiten,
 )
 from src.utils.anchors import select_paired_anchors
+from src.utils.class_scope import ClassScopeAccuracy
 
 VALID_ALIGNMENT_METHODS = ('general', 'procrustes', 'relative')
 # Where the per-agent whitening operator is estimated from. 'train' is the
@@ -810,6 +811,10 @@ class PostTrainingAlignmentMixin:
             from src.utils.reconstruction_metrics import ReconstructionLPIPS
 
             lpips_metric = ReconstructionLPIPS(self.device)
+        # Accuracy split by whether sender / receiver trained on the class
+        # (logged under {prefix}/scope/, see src/utils/class_scope.py).
+        agent_classes = getattr(dm, 'agent_classes', None) or {}
+        scope_acc = ClassScopeAccuracy(agent_classes) if agent_classes else None
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
@@ -826,6 +831,8 @@ class PostTrainingAlignmentMixin:
                 test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
+            if scope_acc is not None and _is_classifier(agent) and scope_acc.covers(idx):
+                scope_acc.add_private(idx, y_hat, test_y[idx])
             if lpips_metric is not None and _is_reconstruction(agent):
                 logs[f'{prefix}/private_lpips_full_agent_{idx}'] = (
                     lpips_metric(y_hat, test_y[idx])
@@ -903,6 +910,14 @@ class PostTrainingAlignmentMixin:
                     test_y[sender_idx],
                 )
                 neighbor_accs.append(acc)
+                if (
+                    scope_acc is not None
+                    and _is_classifier(agent_receiver)
+                    and scope_acc.covers(sender_idx, receiver_idx)
+                ):
+                    scope_acc.add_comm(
+                        sender_idx, receiver_idx, y_hat, test_y[sender_idx]
+                    )
                 if lpips_metric is not None and _is_reconstruction(
                     agent_receiver
                 ):
@@ -1017,5 +1032,7 @@ class PostTrainingAlignmentMixin:
             logs[f'{prefix}/avg_private_mse_missing'] = sum(
                 private_missing
             ) / len(private_missing)
+        if scope_acc is not None:
+            logs.update(scope_acc.logs(prefix))
 
         return logs

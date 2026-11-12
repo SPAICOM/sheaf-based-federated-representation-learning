@@ -28,6 +28,15 @@ study_name: ${hydra:runtime.choices.orchestrator}   # = the wandb group
 # (e.g. for a lambda ablation) still wins.
 tuned_lmb: ???
 
+# How `just hetero-pipeline` fills tuned_lmb (scripts/tune_and_run.py): every
+# method not in no_lmb / fixed trains the first seed at each grid value, the
+# best test avg comm wins, then the other seeds train at it. no_lmb methods
+# have no penalty; fixed ones keep their tuned_lmb (already final).
+lmb_tuning:
+  grid: [1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0]
+  no_lmb: [non_cooperative, fedre]
+  fixed: []
+
 graph:
   neighbors_mode: fully_connected
 

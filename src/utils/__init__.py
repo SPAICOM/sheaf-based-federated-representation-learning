@@ -16,6 +16,7 @@ from .anchors import (
     shared_anchor_rows,
     # supported_anchor_strategy,
 )
+from .class_scope import ClassScopeAccuracy
 from .communication import calculate_communication_cost
 from .data_partitioner import (
     build_shared_class_partition,
@@ -40,6 +41,7 @@ from .logging import (
 )
 
 __all__ = [
+    'ClassScopeAccuracy',
     'AnchorConfig',
     #'build_anchor_bundles',
     #'build_semantic_pilot_bundles',

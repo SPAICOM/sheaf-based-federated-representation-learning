@@ -17,12 +17,15 @@ logger:
 tuned_lmb:   # SheafFRL / DiSheafFRL: best of the phase-1 grid, confirmed on 3 seeds (STATUS)
   non_cooperative: 0.0
   sheaf_frl: 3e-2
-  di_sheaf_frl: 8e-2
+  di_sheaf_frl: 1.2e-1
   comfed: 1.18e-3
   sheaf_fmtl: 0.01
   fedproto: 0.1
   fedmuscle: 0.1
   fedre: 0.0
+
+lmb_tuning:
+  fixed: [sheaf_frl, di_sheaf_frl]   # tuned on 3 seeds (LEDGER), not re-tuned by hetero-pipeline
 
 dataset:
   n_agents: 4
