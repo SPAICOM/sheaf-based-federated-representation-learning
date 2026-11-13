@@ -62,6 +62,11 @@ hetero dataset *args="":
 hetero-pipeline dataset *args="":
     uv run python scripts/tune_and_run.py {{dataset}} {{args}}
 
+# SheafFMTL RAM per gamma (its P_ij matrices scale with the parameter count): pick sheaf_fmtl_gamma in the config
+#   just sheaf-fmtl-memory cifar10_4agents_full fashionmnist_4agents_shift
+sheaf-fmtl-memory *configs:
+    uv run python scripts/sheaf_fmtl_memory.py {{configs}}
+
 # MNIST ablation: pilot budget, non-coop vs DiSheafFRL (lambda 0.01).
 mnist-ablation-pilots *args="":
     uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift \
@@ -100,6 +105,12 @@ class-scope project *args="":
 #   just rescore-class-scope cifar10_4agents_full --groups non_cooperative,sheaf_frl,di_sheaf_frl --write
 rescore-class-scope project *args="":
     uv run python scripts/rescore_class_scope.py {{project}} {{args}}
+
+# Re-score finished heterogeneity runs from their checkpoints with one post-hoc protocol for all methods:
+# private (+seen), comm (all / both seen / only RX seen), MRR, misalignment, sheaf TV + λ_min → results/<project>/rescore/
+#   just rescore-hetero cifar10_4agents_full [--groups comfed,sheaf_frl] [--force]
+rescore-hetero project *args="":
+    uv run python scripts/rescore_hetero.py {{project}} {{args}}
 
 # MNIST pilot ablation: re-scores the 30 saved final checkpoints (needs CUDA)
 mnist-pilots-summary:

@@ -14,6 +14,8 @@ defaults:
 logger:
   project: mnist_4agents_shift
 
+sheaf_fmtl_gamma: 1e-3   # SheafFMTL compression, largest that fits RAM: d_ij 129, ~7.8 GB/run
+
 tuned_lmb:   # lambda study, 3 seeds (results/mnist_4agents_shift/lambda)
   non_cooperative: 0.0
   sheaf_frl: 0.01

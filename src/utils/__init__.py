@@ -29,6 +29,7 @@ from .data_partitioner import (
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
+from .sheaf_laplacian import min_eigenvalue, sheaf_laplacian, total_variation
 from .logging import (
     _extract_objective_metric,
     _filter_supported_init_kwargs,
@@ -56,6 +57,9 @@ __all__ = [
     'partition_non_iid_with_margin',
     'remove_non_empty_dir',
     'shared_anchor_rows',
+    'sheaf_laplacian',
+    'total_variation',
+    'min_eigenvalue',
     #'supported_anchor_strategy',
     '_extract_objective_metric',
     '_filter_supported_init_kwargs',
