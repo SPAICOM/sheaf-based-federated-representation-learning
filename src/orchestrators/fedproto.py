@@ -19,6 +19,7 @@ from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
+from src.communication.projectors import build_projectors, project
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -48,6 +49,14 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         Scheduling strategy: ``None`` (constant), ``'cosine'``, or ``'exp'``.
     prototype_momentum : float, optional
         Momentum for updating global prototypes (default: 0.9).
+    proj_dim : int or None, optional
+        Common dimension for prototypes. Each agent gets a learned, bias-free
+        ``Linear(d_i -> proj_dim)`` (see :mod:`src.communication.projectors`);
+        prototypes, the regulariser and the uploaded payload live in that
+        space, while the decoder still reads the raw latent. ``None``
+        (default) uses the largest latent dim in the network, and no
+        projector at all when every agent has the same dim (original
+        FedProto). The projectors are not part of the original method.
     alignment_method : str, optional
         Post-training alignment used to measure cross-agent communication
         accuracy at test time: ``'general'`` (unconstrained least-squares,
@@ -71,6 +80,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         max_lmb: float = 0.1,
         prototype_momentum: float = 0.9,
         lambda_schedule: str | None = None,
+        proj_dim: int | None = None,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -89,6 +99,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
+        self.projectors = build_projectors(self.agents, proj_dim)
         self._global_prototypes: dict[int, torch.Tensor] = {}
 
     def _validate_agents(self) -> None:
@@ -224,7 +235,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
             key = idx if idx in batch else idx_str
 
             if key in batch:
-                x, y = batch[key]
+                x, y, _mask = self._unpack_task_batch(batch[key])
                 inputs[idx] = x
                 labels[idx] = y
 
@@ -280,7 +291,7 @@ class FedProto(PostTrainingAlignmentMixin, BaseOrchestrator):
             y_hat = agent.decoder(z)
 
             outputs[idx] = (y_hat.detach(), y)
-            latents_per_agent[idx] = z
+            latents_per_agent[idx] = project(self.projectors, idx, z)
 
             agent_losses[idx] = agent.compute_loss(y_hat, y)
             agent_performances[idx] = agent.task_performance(y_hat, y)

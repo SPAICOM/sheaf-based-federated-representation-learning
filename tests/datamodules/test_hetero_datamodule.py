@@ -124,3 +124,53 @@ class TestHeteroClassificationDataModule:
                     abs(train_ratios[class_label] - test_ratios[class_label])
                     <= 0.08
                 )
+
+
+def _build_mock_writer_dataset(n_writers: int = 40, rows_per_writer: int = 60) -> DatasetDict:
+    """Rows of 20 'characters' from n_writers writers; image[0] is the row id."""
+    n = n_writers * rows_per_writer
+    data = {
+        'image': [[float(idx), 0.0, 0.0] for idx in range(n)],
+        'character': [idx % 20 for idx in range(n)],
+        'writer_id': [f'w{idx // rows_per_writer}' for idx in range(n)],
+    }
+    return DatasetDict({'train': Dataset.from_dict(data)})
+
+
+def test_writer_disjoint_overlapping_shift() -> None:
+    """Agents get disjoint writers; pilots come from other writers; test is shared."""
+    data = _build_mock_writer_dataset()
+    writer_of = data['train']['writer_id']
+    groups = {
+        0: {'agents': [0], 'target_classes': [0, 1, 2, 3, 4, 5, 6]},
+        1: {'agents': [1], 'target_classes': [3, 4, 5, 6, 7, 8, 9]},
+        2: {'agents': [2], 'target_classes': [6, 7, 8, 9, 0, 1, 2]},
+    }
+    with patch('src.datamodules.hetero_datamodule.load_dataset', return_value=data):
+        dm = HeteroClassificationDataModule(
+            repo='test', name='toy', data_key='image', attributes=['character'],
+            n_agents=3, split_strategy='overlapping_shift', groups=groups,
+            shift_strength=1.0, agent_train_samples='max', label_subset=list(range(10)),
+            writer_key='writer_id', pilot_writer_frac=0.1, pilot_num_samples=32,
+            pilot_batch_size=16, pilot_class_filter=False, val_split=0.0, test_split=0.2, seed=3,
+        )
+        dm.setup()
+
+    def writers(ds: Dataset) -> set[str]:
+        return {writer_of[int(row[0])] for row in ds['image']}
+
+    train_writers = [writers(dm.train_datasets[i].dataset) for i in range(3)]
+    pilot_writers = writers(dm.pilot_datasets[0].dataset)
+    for i in range(3):
+        assert set(dm.train_datasets[i].dataset['character']) == set(groups[i]['target_classes'])
+        assert train_writers[i].isdisjoint(pilot_writers)
+        for j in range(i + 1, 3):
+            assert train_writers[i].isdisjoint(train_writers[j])
+    assert len(dm.pilot_datasets[0]) == 32
+    test_ids = _dataset_ids(dm.test_datasets[0].dataset)
+    assert all(_dataset_ids(dm.test_datasets[i].dataset) == test_ids for i in range(3))
+    assert set(dm.test_datasets[0].dataset['character']) == set(range(10))
+    assert dm.num_classes['label'] == 10
+    for i in range(3):
+        assert test_ids.isdisjoint(_dataset_ids(dm.train_datasets[i].dataset))
+        assert writers(dm.test_datasets[0].dataset) & train_writers[i]

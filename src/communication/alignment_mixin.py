@@ -21,6 +21,7 @@ from src.communication.whitening import (
     whiten,
 )
 from src.utils.anchors import select_paired_anchors
+from src.utils.class_scope import ClassScopeAccuracy
 
 VALID_ALIGNMENT_METHODS = ('general', 'procrustes', 'relative')
 # Where the per-agent whitening operator is estimated from. 'train' is the
@@ -130,7 +131,9 @@ class PostTrainingAlignmentMixin:
                     x = _pil_to_tensor(x)
                 xs.append(x)
                 y = item[1]
-                ys.append(y if isinstance(y, torch.Tensor) else torch.tensor(y))
+                ys.append(
+                    y if isinstance(y, torch.Tensor) else torch.tensor(y)
+                )
             return torch.stack(xs), torch.stack(ys)
 
         # Step 1 — fit whitening on the configured source split.
@@ -152,12 +155,18 @@ class PostTrainingAlignmentMixin:
             # Match SheafFRL's zca_refit_source='train+pilots' so the two
             # estimate their operators from the same rows.
             from torch.utils.data import ConcatDataset as _Concat
+
             whitening_datasets = {}
             for _i in set(train_datasets) | set(pilot_datasets):
-                _p = [d for d in (train_datasets.get(_i), pilot_datasets.get(_i))
-                      if d is not None and len(d)]
+                _p = [
+                    d
+                    for d in (train_datasets.get(_i), pilot_datasets.get(_i))
+                    if d is not None and len(d)
+                ]
                 if _p:
-                    whitening_datasets[_i] = _p[0] if len(_p) == 1 else _Concat(_p)
+                    whitening_datasets[_i] = (
+                        _p[0] if len(_p) == 1 else _Concat(_p)
+                    )
         else:
             whitening_datasets = train_datasets
 
@@ -191,7 +200,10 @@ class PostTrainingAlignmentMixin:
             try:
                 for x_batch in loader:
                     Zs.append(
-                        agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                        agent.encode(x_batch.to(self.device))
+                        .detach()
+                        .cpu()
+                        .float()
                     )
             finally:
                 agent.train(was_training)
@@ -247,7 +259,10 @@ class PostTrainingAlignmentMixin:
             Zs, ys = [], []
             for x_batch, y_batch in loader:
                 Zs.append(
-                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
                 )
                 ys.append(y_batch.cpu())
             agent.train(was_training)
@@ -296,9 +311,7 @@ class PostTrainingAlignmentMixin:
         # _apply_edge_class_filter does, so the two can be compared like for
         # like. Legacy `eval_on_class_intersection=True` still selects
         # 'intersection'.
-        align_filter = str(
-            getattr(self.hparams, 'align_class_filter', 'none')
-        )
+        align_filter = str(getattr(self.hparams, 'align_class_filter', 'none'))
         if align_filter == 'none' and getattr(
             self, '_eval_on_class_intersection', False
         ):
@@ -352,7 +365,10 @@ class PostTrainingAlignmentMixin:
                         torch.as_tensor(idx_i, dtype=torch.long)
                     ]
                     mask = self._class_edge_mask(
-                        agent_tc, sender_idx, receiver_idx, labels_i,
+                        agent_tc,
+                        sender_idx,
+                        receiver_idx,
+                        labels_i,
                         mode=align_filter,
                     )
                     if mask is not None:
@@ -529,8 +545,10 @@ class PostTrainingAlignmentMixin:
         misalignment-loss scoring covers exactly one direction per edge,
         the same edges and orientation as ``SheafFRL._directed_alignment_map``.
         """
-        return getattr(self, '_alignment_maps', {}).get(sender_idx, {}).get(
-            receiver_idx
+        return (
+            getattr(self, '_alignment_maps', {})
+            .get(sender_idx, {})
+            .get(receiver_idx)
         )
 
     def _directed_embedding_map(
@@ -564,7 +582,9 @@ class PostTrainingAlignmentMixin:
         """
         alignment_method = getattr(self.hparams, 'alignment_method', None)
         if alignment_method is None:
-            logs = dict(super().evaluate_communication_accuracy(dm, prefix=prefix))
+            logs = dict(
+                super().evaluate_communication_accuracy(dm, prefix=prefix)
+            )
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
             logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
             return logs
@@ -578,13 +598,18 @@ class PostTrainingAlignmentMixin:
             if not hasattr(self, '_alignment_maps'):
                 self._alignment_maps = {}
         try:
-            logs = dict(self._comm_accuracy_with_fitted_maps(dm, prefix=prefix))
+            logs = dict(
+                self._comm_accuracy_with_fitted_maps(dm, prefix=prefix)
+            )
             logs.update(self.evaluate_misalignment_loss(dm, prefix=prefix))
             if prefix == 'test':
                 # In-sample counterpart: the same residual on the pilots the
                 # maps were fitted on.
-                logs.update(self.evaluate_misalignment_loss(
-                    dm, prefix='pilots', force_pilots=True))
+                logs.update(
+                    self.evaluate_misalignment_loss(
+                        dm, prefix='pilots', force_pilots=True
+                    )
+                )
             # Computed while the post-hoc whitening operators are still active
             # (before cleanup), same as the misalignment loss above.
             logs.update(self.evaluate_whitening_quality(dm, prefix=prefix))
@@ -675,7 +700,10 @@ class PostTrainingAlignmentMixin:
             Zs, ys, masks = [], [], []
             for x_batch, y_batch, mask_batch in loader:
                 Zs.append(
-                    agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
                 )
                 ys.append(y_batch.cpu())
                 if mask_batch is not None:
@@ -783,6 +811,10 @@ class PostTrainingAlignmentMixin:
             from src.utils.reconstruction_metrics import ReconstructionLPIPS
 
             lpips_metric = ReconstructionLPIPS(self.device)
+        # Accuracy split by whether sender / receiver trained on the class
+        # (logged under {prefix}/scope/, see src/utils/class_scope.py).
+        agent_classes = getattr(dm, 'agent_classes', None) or {}
+        scope_acc = ClassScopeAccuracy(agent_classes) if agent_classes else None
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
@@ -799,6 +831,8 @@ class PostTrainingAlignmentMixin:
                 test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
+            if scope_acc is not None and _is_classifier(agent) and scope_acc.covers(idx):
+                scope_acc.add_private(idx, y_hat, test_y[idx])
             if lpips_metric is not None and _is_reconstruction(agent):
                 logs[f'{prefix}/private_lpips_full_agent_{idx}'] = (
                     lpips_metric(y_hat, test_y[idx])
@@ -823,9 +857,9 @@ class PostTrainingAlignmentMixin:
                 )
 
         if self_accs:
-            logs[f'{prefix}/avg_private_task_perf'] = (
-                sum(self_accs.values()) / len(self_accs)
-            )
+            logs[f'{prefix}/avg_private_task_perf'] = sum(
+                self_accs.values()
+            ) / len(self_accs)
 
         receiver_comm_accs: dict[int, float] = {}
         task_fidelities: dict[int, float] = {}
@@ -876,15 +910,32 @@ class PostTrainingAlignmentMixin:
                     test_y[sender_idx],
                 )
                 neighbor_accs.append(acc)
-                if lpips_metric is not None and _is_reconstruction(agent_receiver):
-                    neighbor_lpips.append(lpips_metric(y_hat, test_y[sender_idx]))
+                if (
+                    scope_acc is not None
+                    and _is_classifier(agent_receiver)
+                    and scope_acc.covers(sender_idx, receiver_idx)
+                ):
+                    scope_acc.add_comm(
+                        sender_idx, receiver_idx, y_hat, test_y[sender_idx]
+                    )
+                if lpips_metric is not None and _is_reconstruction(
+                    agent_receiver
+                ):
+                    neighbor_lpips.append(
+                        lpips_metric(y_hat, test_y[sender_idx])
+                    )
                 if prefix == 'test' and _is_reconstruction(agent_receiver):
                     self._log_communication_reconstruction(
                         dm, sender_idx, receiver_idx, y_hat
                     )
-                if _is_reconstruction(agent_receiver) and sender_idx in test_masks:
+                if (
+                    _is_reconstruction(agent_receiver)
+                    and sender_idx in test_masks
+                ):
                     neighbor_missing_mses.append(
-                        _missing_mse(y_hat, test_y[sender_idx], test_masks[sender_idx])
+                        _missing_mse(
+                            y_hat, test_y[sender_idx], test_masks[sender_idx]
+                        )
                     )
                 if _is_reconstruction(agent_receiver):
                     neighbor_visible_mses.append(
@@ -895,13 +946,13 @@ class PostTrainingAlignmentMixin:
                     )
 
             if neighbor_lpips:
-                logs[f'{prefix}/comm_lpips_full_agent_{receiver_idx}'] = (
-                    sum(neighbor_lpips) / len(neighbor_lpips)
-                )
+                logs[f'{prefix}/comm_lpips_full_agent_{receiver_idx}'] = sum(
+                    neighbor_lpips
+                ) / len(neighbor_lpips)
             if neighbor_missing_mses:
-                logs[f'{prefix}/comm_mse_sender_missing_agent_{receiver_idx}'] = (
-                    sum(neighbor_missing_mses) / len(neighbor_missing_mses)
-                )
+                logs[
+                    f'{prefix}/comm_mse_sender_missing_agent_{receiver_idx}'
+                ] = sum(neighbor_missing_mses) / len(neighbor_missing_mses)
             if neighbor_accs:
                 avg_acc = sum(neighbor_accs) / len(neighbor_accs)
                 receiver_comm_accs[receiver_idx] = avg_acc
@@ -926,19 +977,22 @@ class PostTrainingAlignmentMixin:
                 logs[f'{prefix}/task_fidelity_agent_{receiver_idx}'] = fidelity
 
         for metric_name in ('private_lpips_full', 'comm_lpips_full'):
-            values = [value for key, value in logs.items()
-                      if key.startswith(f'{prefix}/{metric_name}_agent_')]
+            values = [
+                value
+                for key, value in logs.items()
+                if key.startswith(f'{prefix}/{metric_name}_agent_')
+            ]
             if values:
                 logs[f'{prefix}/avg_{metric_name}'] = sum(values) / len(values)
 
         if receiver_comm_accs:
-            logs[f'{prefix}/avg_comm_task_perf'] = (
-                sum(receiver_comm_accs.values()) / len(receiver_comm_accs)
-            )
+            logs[f'{prefix}/avg_comm_task_perf'] = sum(
+                receiver_comm_accs.values()
+            ) / len(receiver_comm_accs)
         if task_fidelities:
-            logs[f'{prefix}/avg_task_fidelity'] = (
-                sum(task_fidelities.values()) / len(task_fidelities)
-            )
+            logs[f'{prefix}/avg_task_fidelity'] = sum(
+                task_fidelities.values()
+            ) / len(task_fidelities)
         comm_visible = [
             value
             for key, value in logs.items()
@@ -978,5 +1032,7 @@ class PostTrainingAlignmentMixin:
             logs[f'{prefix}/avg_private_mse_missing'] = sum(
                 private_missing
             ) / len(private_missing)
+        if scope_acc is not None:
+            logs.update(scope_acc.logs(prefix))
 
         return logs

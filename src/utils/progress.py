@@ -1,4 +1,8 @@
-"""Heartbeat callback: writes one JSON status file per run for the tmux dashboard.
+"""Run-progress callbacks: a JSON heartbeat file and a per-epoch printed line.
+
+``StatusFileCallback`` writes one JSON status file per run for the tmux
+dashboard; ``EpochProgressBar`` prints one line per finished epoch, which is
+what survives a stdout redirected into a log file.
 
 Files land in ``logs/status/<sweep>/<job>.json`` and are rewritten atomically
 at most every ``every_s`` seconds. ``scripts/runs_dashboard.py`` renders them;
@@ -138,3 +142,56 @@ class StatusFileCallback(Callback):
 
     def on_exception(self, trainer, pl_module, exception) -> None:
         self._write(trainer, 'failed', force=True, error=repr(exception)[:300])
+
+
+class EpochProgressBar(Callback):
+    """One printed line per finished epoch, for logs you read with ``tail -f``.
+
+    Lightning's own bar is carriage-return driven, so a redirected stdout gets
+    either nothing or thousands of fragments.  This prints exactly one line per
+    epoch with plain ``print(..., flush=True)``::
+
+        Epochs [██████░░░░] 12/40 | 52s/epoch | ETA 24.3m
+
+    ``s/epoch`` and the ETA come from the mean wall-clock time per completed
+    epoch since ``on_fit_start``, so they include validation and the
+    orchestrator's epoch-end work (alignment refits, comm eval) rather than the
+    training loop alone.
+    """
+
+    def __init__(self, width: int = 10, prefix: str = 'Epochs') -> None:
+        self.width = max(int(width), 1)
+        self.prefix = prefix
+        self.t0 = time.time()
+
+    @staticmethod
+    def _fmt_duration(seconds: float) -> str:
+        if seconds < 90:
+            return f'{seconds:.0f}s'
+        if seconds < 90 * 60:
+            return f'{seconds / 60:.1f}m'
+        return f'{seconds / 3600:.1f}h'
+
+    def _bar(self, done: int, total: int) -> str:
+        filled = (
+            min(self.width, round(self.width * done / total)) if total else 0
+        )
+        return '█' * filled + '░' * (self.width - filled)
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        self.t0 = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        done = trainer.current_epoch + 1
+        total = trainer.max_epochs or 0
+        elapsed = time.time() - self.t0
+        per_epoch = elapsed / done
+        parts = [
+            f'{self.prefix} [{self._bar(done, total)}] {done}/{total or "?"}',
+            f'{self._fmt_duration(per_epoch)}/epoch',
+        ]
+        if total:
+            parts.append(
+                f'ETA {self._fmt_duration(per_epoch * (total - done))}'
+            )
+        print(' | '.join(parts), flush=True)

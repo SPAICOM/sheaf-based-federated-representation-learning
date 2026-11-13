@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from src.agents.latent_classifier import LatentClassifier
 from src.orchestrators.fedre import FedRE
@@ -40,7 +41,9 @@ def _make_orchestrator(**kwargs) -> FedRE:
     return orchestrator
 
 
-_DM = SimpleNamespace(train_datasets={0: _dataset([0, 1]), 1: _dataset([1, 2])})
+_DM = SimpleNamespace(
+    train_datasets={0: _dataset([0, 1]), 1: _dataset([1, 2])}
+)
 
 
 def _heads_equal(a, b) -> bool:
@@ -71,7 +74,9 @@ class TestFedRE:
         assert soft_label.sum().item() == pytest.approx(1.0)
         assert soft_label[[0, 2, 4]].abs().sum() == 0
         # Prototypes are (2, 0) and (0, 4), mixed with the label's weights.
-        expected = soft_label[1] * Z[:2].mean(0) + soft_label[3] * Z[2:].mean(0)
+        expected = soft_label[1] * Z[:2].mean(0) + soft_label[3] * Z[2:].mean(
+            0
+        )
         assert torch.allclose(rep, expected)
 
     def test_entangle_resamples_weights(self):
@@ -119,11 +124,16 @@ class TestFedRE:
         orchestrator._server_round(_DM)
 
         changed = orchestrator._server_head.state_dict()
-        assert any(not torch.equal(before_head[k], changed[k]) for k in changed)
+        assert any(
+            not torch.equal(before_head[k], changed[k]) for k in changed
+        )
         for agent in orchestrator.agents.values():
             assert _heads_equal(agent.decoder, orchestrator._server_head)
         after_encoder = orchestrator.agents['1'].encoder.state_dict()
-        assert all(torch.equal(before_encoder[k], after_encoder[k]) for k in after_encoder)
+        assert all(
+            torch.equal(before_encoder[k], after_encoder[k])
+            for k in after_encoder
+        )
 
         split = orchestrator._communication_by_split['train']
         assert split['kilobytes'] > kb_before
@@ -158,3 +168,102 @@ class TestFedRE:
         Z = torch.randn(3, 4)
         assert orchestrator.hparams.alignment_method is None
         assert torch.equal(orchestrator.send_message(0, 1, Z), Z)
+
+
+def _rm_agent(latent_dim: int, seed: int) -> LatentClassifier:
+    torch.manual_seed(seed)
+    return LatentClassifier(
+        in_features=8,
+        num_classes=4,
+        latent_dim=latent_dim,
+        encoder_hidden_dims=[6],
+        decoder_hidden_dims=[5],
+    )
+
+
+def _rm_orchestrator(**kwargs) -> FedRE:
+    orchestrator = FedRE(
+        agents={0: _rm_agent(4, seed=0), 1: _rm_agent(6, seed=1)},
+        neighbors={0: {1}, 1: {0}},
+        optimizer=MockOptimizer(),
+        **{'rm_dim': 3, 'alignment_method': 'general', **kwargs},
+    )
+    orchestrator.on_train_start()
+    return orchestrator
+
+
+class TestFedRERepresentationMap:
+    def test_different_latent_dims_default_to_rm_at_the_largest_dim(self):
+        orchestrator = FedRE(
+            agents={0: _rm_agent(4, 0), 1: _rm_agent(6, 1)},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+            alignment_method='general',
+        )
+        for agent in orchestrator.agents.values():
+            assert agent.decoder[0].out_features == 6
+
+    def test_equal_latent_dims_keep_the_decoder_as_is(self):
+        orchestrator = FedRE(
+            agents={0: _rm_agent(4, 0), 1: _rm_agent(4, 1)},
+            neighbors={0: {1}, 1: {0}},
+            optimizer=MockOptimizer(),
+        )
+        assert not isinstance(orchestrator.agents['0'].decoder, nn.Sequential)
+
+    def test_rm_needs_a_posthoc_alignment_method(self):
+        with pytest.raises(ValueError, match='alignment_method'):
+            _rm_orchestrator(alignment_method=None)
+
+    def test_decoder_is_private_rm_then_shared_head(self):
+        orchestrator = _rm_orchestrator()
+        for idx, d in (('0', 4), ('1', 6)):
+            rm, head = orchestrator.agents[idx].decoder
+            assert (rm.in_features, rm.out_features) == (d, 3)
+            assert _heads_equal(head, orchestrator._server_head)
+        rm_0 = orchestrator.agents['0'].decoder[0]
+        assert rm_0 not in orchestrator._server_head.modules()
+
+    def test_round_broadcasts_the_head_and_keeps_each_rm(self):
+        orchestrator = _rm_orchestrator()
+        rms = {
+            idx: orchestrator.agents[idx].decoder[0].weight.clone()
+            for idx in ('0', '1')
+        }
+        orchestrator._server_round(_DM)
+        for idx, agent in orchestrator.agents.items():
+            assert torch.equal(agent.decoder[0].weight, rms[idx])
+            assert _heads_equal(agent.decoder[1], orchestrator._server_head)
+        # One entangled rep at rm_dim + a 4-class soft label, per agent.
+        split = orchestrator._communication_by_split['train']
+        head_kb = (
+            sum(
+                v.numel() * 4
+                for v in orchestrator._server_head.state_dict().values()
+            )
+            / 1024
+        )
+        assert split['kilobytes'] == pytest.approx(
+            2 * 2 * head_kb + 2 * (3 + 4) * 4 / 1024
+        )
+
+    def test_local_backward_trains_rm_then_round(self):
+        orchestrator = _rm_orchestrator()
+        optimizer = torch.optim.SGD(orchestrator.parameters(), lr=0.1)
+        batch = {
+            0: [torch.randn(4, 8), torch.tensor([0, 1, 0, 1])],
+            1: [torch.randn(4, 8), torch.tensor([1, 2, 1, 2])],
+        }
+        for _ in range(2):
+            outputs = orchestrator(batch)
+            loss = sum(
+                orchestrator.agents[idx].compute_loss(y_hat, y)
+                for idx, (y_hat, y) in outputs.items()
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            assert (
+                orchestrator.agents['1'].decoder[0].weight.grad.abs().sum() > 0
+            )
+            optimizer.step()
+            orchestrator._server_round(_DM)

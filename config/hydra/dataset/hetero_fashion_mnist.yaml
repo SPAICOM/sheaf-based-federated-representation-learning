@@ -1,0 +1,24 @@
+# FashionMNIST twin of hetero_mnist.yaml: same 1-channel 28x28 geometry and the
+# same column names ('image' / 'label'), so HeteroClassificationDataModule needs
+# no changes (input channels are read from the data). 60k train / 10k test.
+_target_: src.datamodules.HeteroClassificationDataModule
+
+repo: zalando-datasets
+name: fashion_mnist
+data_key: image
+
+attributes:
+  - label
+
+split_strategy: uniform
+
+batch_size: 64
+num_workers: 4
+mode: min_size
+
+val_split: 0.1
+test_split: 0.1
+pilot_split: 0.0
+pilot_num_samples: null
+comm_data: shared_global_pilots   # every paper experiment shares one pilot set (see paper_base.yaml)
+seed: ${seed}

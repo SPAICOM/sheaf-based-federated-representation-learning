@@ -21,6 +21,7 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image as _PILImage
 from torchvision.transforms.functional import to_tensor as _pil_to_tensor
 
+from src.agents.personalized_classifier import frozen_center_norm
 from src.communication.whitening import (
     color,
     common_pilot_indices,
@@ -2228,7 +2229,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
         private_components = (
             agent.last_loss_components if has_components else None
         )
-        prediction = agent(x)
+        with frozen_center_norm(agent):
+            prediction = agent(x)
         if 'eval_mask' in inspect.signature(agent.compute_loss).parameters:
             loss = weight * agent.compute_loss(prediction, y, eval_mask=mask)
         else:

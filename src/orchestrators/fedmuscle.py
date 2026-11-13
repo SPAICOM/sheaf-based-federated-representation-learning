@@ -19,10 +19,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.agents.personalized_classifier import frozen_center_norm
 from src.communication.alignment_mixin import (
     VALID_ALIGNMENT_METHODS,
     PostTrainingAlignmentMixin,
 )
+from src.communication.projectors import build_projectors, project
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
 
@@ -57,6 +59,15 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
     alignment_mode : str, optional
         Muscle *loss* mode used during training: "contrastive" (default) or
         "alignment".
+    proj_dim : int or None, optional
+        Common dimension for the Muscle loss. Each agent gets a learned,
+        bias-free ``Linear(d_i -> proj_dim)`` (see
+        :mod:`src.communication.projectors`); the Muscle loss and the
+        exchanged pilot representations live in that space, while the decoder
+        still reads the raw latent. ``None`` (default) uses the largest
+        latent dim in the network, and no projector at all when every agent
+        has the same dim (original FedMuscle). The projectors are not part of
+        the original method.
     alignment_method : str, optional
         Post-training *map* used to measure cross-agent communication accuracy
         at test time: ``'general'`` (unconstrained least-squares, default) or
@@ -85,6 +96,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         T: int = 1,
         alignment_mode: str = 'contrastive',
         lambda_schedule: str | None = None,
+        proj_dim: int | None = None,
         alignment_method: str = 'general',
         **kwargs,
     ):
@@ -103,6 +115,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         self.save_hyperparameters(ignore=['agents'])
 
         self._validate_agents()
+        self.projectors = build_projectors(self.agents, proj_dim)
         self._cl_epoch_count = 0
         self._local_epoch_count = 0
         self._round_complete = False
@@ -160,6 +173,15 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
         - Positive: average representation over ALL OTHER agents for sample i
         - Negatives: average representations for all OTHER samples j != i
 
+        With z_k[i] the representation of sample i by agent k and m[j] the
+        network mean of sample j:
+
+            p_ki = cos(z_k[i], mean_{j != k} z_j[i])
+            n_ki = mean_{j != i} cos(z_k[i], m[j])        (-1 if one sample)
+            loss = mean_{k, i} -log(e^{p/tau} / (e^{p/tau} + e^{n/tau}))
+
+        computed in matrix form (softplus((n - p)/tau) is the same quantity).
+
         Parameters
         ----------
         representations : dict[int, torch.Tensor]
@@ -185,59 +207,22 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
             if reps.shape[0] != batch_size:
                 return torch.tensor(0.0, device=self.device)
 
-        all_reps_stacked = torch.stack(all_reps, dim=0)
-        sample_means = all_reps_stacked.mean(dim=0)
+        reps = torch.stack(all_reps, dim=0)  # K x B x d
+        sample_means = reps.mean(dim=0)  # B x d
+        others = (reps.sum(dim=0, keepdim=True) - reps) / (n_agents - 1)
+        pos_sim = F.cosine_similarity(reps, others, dim=-1)  # K x B
 
-        total_loss = torch.tensor(0.0, device=self.device)
+        if batch_size > 1:
+            cos = (
+                F.normalize(reps, dim=-1, eps=1e-8)
+                @ F.normalize(sample_means, dim=-1, eps=1e-8).T
+            )  # K x B x B: cos(z_k[i], m[j])
+            diag = cos.diagonal(dim1=-2, dim2=-1)
+            neg_sim = (cos.sum(dim=-1) - diag) / (batch_size - 1)
+        else:
+            neg_sim = torch.full_like(pos_sim, -1.0)
 
-        for k_idx in range(n_agents):
-            z_k = all_reps[k_idx]
-
-            sample_losses = []
-
-            for i in range(batch_size):
-                z_k_i = z_k[i]
-
-                pos_sim = torch.tensor(0.0, device=self.device)
-                other_agent_reps = [
-                    all_reps[j][i] for j in range(n_agents) if j != k_idx
-                ]
-                if other_agent_reps:
-                    other_mean = torch.stack(other_agent_reps).mean(dim=0)
-                    pos_sim = F.cosine_similarity(
-                        z_k_i.unsqueeze(0), other_mean.unsqueeze(0), dim=1
-                    )
-
-                neg_sim_sum = torch.tensor(0.0, device=self.device)
-                neg_count = 0
-                for j in range(batch_size):
-                    if j != i:
-                        neg_mean = sample_means[j]
-                        neg_sim = F.cosine_similarity(
-                            z_k_i.unsqueeze(0), neg_mean.unsqueeze(0), dim=1
-                        )
-                        neg_sim_sum = neg_sim_sum + neg_sim
-                        neg_count += 1
-
-                if neg_count > 0:
-                    neg_sim = neg_sim_sum / neg_count
-                else:
-                    neg_sim = torch.tensor(-1.0, device=self.device)
-
-                pos_exp = torch.exp(pos_sim / tau)
-                neg_exp = torch.exp(neg_sim / tau)
-
-                denom = pos_exp + neg_exp
-                sample_loss = -torch.log(pos_exp / denom)
-                sample_losses.append(sample_loss)
-
-            if sample_losses:
-                agent_loss = torch.stack(sample_losses).mean()
-                total_loss = total_loss + agent_loss
-
-        total_loss = total_loss / n_agents
-
-        return total_loss
+        return F.softplus((neg_sim - pos_sim) / tau).mean()
 
     def _compute_muscle_loss(
         self,
@@ -326,8 +311,10 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
             key = idx if idx in batch else idx_str
 
             if key in batch:
-                x, _ = batch[key]
-                representations[idx] = agent.encode(x)
+                x = self._unpack_task_batch(batch[key])[0]
+                representations[idx] = project(
+                    self.projectors, idx, agent.encode(x)
+                )
 
         return representations
 
@@ -397,7 +384,7 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
 
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            x, y = batch[_resolve_key(idx)]
+            x, y, _mask = self._unpack_task_batch(batch[_resolve_key(idx)])
 
             z = agent.encode(x)
             y_hat = agent.decoder(z)
@@ -428,7 +415,10 @@ class FedMuscle(PostTrainingAlignmentMixin, BaseOrchestrator):
                 idx = int(idx_str)
                 if idx in pilot_data:
                     x_pilot = pilot_data[idx]
-                    pilot_representations[idx] = agent.encode(x_pilot)
+                    with frozen_center_norm(agent):
+                        pilot_representations[idx] = project(
+                            self.projectors, idx, agent.encode(x_pilot)
+                        )
 
             if pilot_representations:
                 muscle_loss = self._compute_muscle_loss(pilot_representations)

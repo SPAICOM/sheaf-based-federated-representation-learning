@@ -1,9 +1,0 @@
-# SheafFRL with closed-form ZCA whitening instead of learnable SWBN: refit at
-# every epoch end with Ledoit-Wolf shrinkage, on zca_refit_source (inherited
-# from sheaf_frl.yaml; the 2-agent CIFAR configs set it to train).
-defaults:
-  - sheaf_frl
-  - _self_
-
-learn_whitening: false
-whitening_shrinkage: auto

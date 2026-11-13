@@ -67,9 +67,24 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         pilot_source: str = 'pool',
         agent_label_noise: dict | None = None,
         agent_label_map: dict | None = None,
+        label_subset: list[int] | None = None,
+        writer_key: str | None = None,
+        pilot_writer_frac: float = 0.1,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
+        # Keep only the rows whose label is in this list (e.g. the 10 digits of
+        # FEMNIST's 62 characters); labels keep their original values.
+        self.label_subset = None if label_subset is None else sorted(int(c) for c in label_subset)
+        # Column holding the writer (style) of each row. When set,
+        # overlapping_shift gives every agent a DISJOINT set of writers, so no
+        # two agents ever see the same handwriting style (see
+        # _writer_disjoint_draws); pilot_writer_frac of the writers are kept
+        # apart for the shared pilots.
+        self.writer_key = writer_key
+        if not 0.0 < float(pilot_writer_frac) < 1.0:
+            raise ValueError(f'pilot_writer_frac must be in (0, 1), got {pilot_writer_frac}')
+        self.pilot_writer_frac = float(pilot_writer_frac)
         # {agent: {classes: [a, b], fraction: p}}: in that agent's TRAINING rows
         # (overlapping_shift only), round(p * n) of the n rows labelled a or b
         # get the other label (a <-> b). With direction: one_way, round(p * n_a)
@@ -431,6 +446,79 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             )
         return max(int(bound), 1)
 
+    def _writer_disjoint_draws(
+        self, all_data, labels: list[int]
+    ) -> tuple[dict[int, list[int]], list[int], list[int], dict[int, list[int]]]:
+        """Train draws, shared test rows and pilots with writer-disjoint agents.
+
+        ::
+
+            writers ── shuffle ─┬▶ pilot_writer_frac ──▶ pilots (uniform rows)
+                                └▶ n_agents disjoint writer groups
+                                     agent i rows ─┬▶ test_split (stratified) ─▶ shared TEST
+                                                   └▶ TRAIN pool_i ─▶ shifted draw ~ P_i
+
+        Every agent draws n_train rows from its OWN writers only, with the usual
+        label shift P_i. The test set is the union of the agents' held-out rows:
+        the same rows, all classes and every agent's styles, for every agent.
+        The pilots come from writers no agent trains on.
+        """
+        gen = torch.Generator().manual_seed(self.seed)
+        writer_of = all_data[self.writer_key][:]
+        writers = sorted(set(writer_of))
+        order = [writers[k] for k in torch.randperm(len(writers), generator=gen).tolist()]
+        n_pilot_writers = max(1, int(round(len(writers) * self.pilot_writer_frac)))
+        if len(writers) - n_pilot_writers < self.n_agents:
+            raise ValueError(f'{len(writers)} writers cannot give {self.n_agents} agents one each')
+        group_of = dict.fromkeys(order[:n_pilot_writers], -1)
+        for k, w in enumerate(order[n_pilot_writers:]):
+            group_of[w] = k % self.n_agents
+
+        rows: dict[int, list[int]] = {g: [] for g in range(-1, self.n_agents)}
+        for idx, w in enumerate(writer_of):
+            rows[group_of[w]].append(idx)
+
+        pilot_pool = rows[-1]
+        n_pilots = min(int(self.pilot_num_samples or 0), len(pilot_pool))
+        picks = torch.randperm(len(pilot_pool), generator=gen)[:n_pilots].tolist()
+        pilot_indices = sorted(pilot_pool[p] for p in picks)
+
+        test_rows: list[int] = []
+        pools: dict[int, list[int]] = {}
+        for i in range(self.n_agents):
+            own = rows[i]
+            keep, held = self._stratified_holdout_indices(
+                [labels[r] for r in own], self.test_split, seed=self.seed + 31 * (i + 1)
+            )
+            pools[i] = [own[k] for k in keep]
+            test_rows.extend(own[k] for k in held)
+
+        group_of_agent = {a: gid for gid, agents in self.groups.items() for a in agents}
+        if self.agent_train_samples == 'max':
+            self._max_train_size = min(
+                self._max_feasible_train_size(labels, pools[i]) for i in range(self.n_agents)
+            )
+        n_train, _ = self._agent_subset_sizes(min(len(p) for p in pools.values()))
+        train_draws: dict[int, list[int]] = {}
+        agent_classes: dict[int, list[int]] = {}
+        for i in range(self.n_agents):
+            gid = group_of_agent[i]
+            target = self.group_target_classes.get(gid)
+            draws, classes = sample_shifted_subsets(
+                labels=labels,
+                n_agents=1,
+                groups={0: [0]},
+                group_target_classes={0: target} if target else None,
+                num_samples=n_train,
+                shift_strength=self.shift_strength,
+                pool_indices=pools[i],
+                seed=self.seed + i,
+                return_agent_classes=True,
+            )
+            train_draws[i], agent_classes[i] = draws[0], classes[0]
+        self.writer_counts = {i: sum(1 for g in group_of.values() if g == i) for i in range(-1, self.n_agents)}
+        return train_draws, sorted(test_rows), pilot_indices, agent_classes
+
     def _swap_labels(self, rows, label_key: str, client_idx: int):
         """Swap the labels of a random fraction of the rows of two classes
         (one_way: relabel a random fraction of the class-a rows as b)."""
@@ -467,57 +555,10 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             rows = rows.add_column(f'{label_key}_clean', clean, feature=feature)
         return rows.remove_columns(label_key).add_column(label_key, labels, feature=feature)
 
-    def _setup_overlapping_shift(self) -> None:
-        """Split-first pipeline with overlapping, label-shifted agent draws.
-
-        ::
-
-            D  ──  test_split  ──▶  TEST pool ──▶ agent i draws n_test ~ P_i
-               └── remainder   ──▶  TRAIN pool ─┬▶ pilots: pilot_split, uniform
-                                                └▶ agent i draws n_train ~ P_i
-
-        with ``P_i(y) = s·Unif{C_i} + (1-s)·Unif{Y}``.  Agents draw
-        *independently*, so their subsets overlap each other and may include
-        pilot rows; only TRAIN and TEST stay disjoint, which is the invariant
-        the communication-accuracy evaluation depends on (maps are fit on
-        pilots, scored on test latents).
-
-        Two properties follow from dropping disjointness, neither of which
-        the ``grouped_non_iid`` partition can offer:
-
-        * every agent holds exactly the same number of rows at any
-          ``shift_strength``, and
-        * the realised label marginal equals ``P_i`` exactly, instead of the
-          contention-normalised ``P_i(k) / Σ_j P_j(k)`` a partition yields.
-
-        ``pilot_split`` is read as a fraction of the TRAIN pool here (not of
-        the whole corpus), so sweeping the pilot budget leaves every agent's
-        training rows untouched.
-        """
-        if not self.groups:
-            raise ValueError(
-                "split_strategy='overlapping_shift' requires a non-empty "
-                '"groups" mapping in the dataset config.'
-            )
-
-        ds = load_dataset(f'{self.repo}/{self.name}')
-        split_names = list(ds)
-        all_data = concatenate_datasets([ds[s] for s in split_names])
-        label_key = self.attributes[0]
-        labels = all_data[label_key]
-        total_size = len(all_data)
-
-        if self.n_agents is None:
-            self.n_agents = (
-                max(a for agents in self.groups.values() for a in agents) + 1
-            )
-
-        self.train_datasets: dict[int, ClassificationDataset] = {}
-        self.val_datasets: dict[int, ClassificationDataset] = {}
-        self.test_datasets: dict[int, ClassificationDataset] = {}
-        self.pilot_datasets: dict[int, ClassificationDataset] = {}
-        self.num_classes: dict[int, int] = {}
-
+    def _pool_draws(
+        self, ds, split_names: list[str], labels: list[int], total_size: int
+    ) -> tuple[dict[int, list[int]], dict[int, list[int]], list[int], dict[int, list[int]]]:
+        """Draw the test pool, the pilots and the shifted train rows (steps 1-3)."""
         # ── 1. Global train/test split ───────────────────────────────────────
         generator = torch.Generator().manual_seed(self.seed)
         if self.test_source == 'original':
@@ -605,6 +646,81 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             )
         else:
             test_draws = {i: [] for i in range(self.n_agents)}
+        return train_draws, test_draws, pilot_indices, agent_classes
+
+    def _setup_overlapping_shift(self) -> None:
+        """Split-first pipeline with overlapping, label-shifted agent draws.
+
+        ::
+
+            D  ──  test_split  ──▶  TEST pool ──▶ agent i draws n_test ~ P_i
+               └── remainder   ──▶  TRAIN pool ─┬▶ pilots: pilot_split, uniform
+                                                └▶ agent i draws n_train ~ P_i
+
+        with ``P_i(y) = s·Unif{C_i} + (1-s)·Unif{Y}``.  Agents draw
+        *independently*, so their subsets overlap each other and may include
+        pilot rows; only TRAIN and TEST stay disjoint, which is the invariant
+        the communication-accuracy evaluation depends on (maps are fit on
+        pilots, scored on test latents).
+
+        Two properties follow from dropping disjointness, neither of which
+        the ``grouped_non_iid`` partition can offer:
+
+        * every agent holds exactly the same number of rows at any
+          ``shift_strength``, and
+        * the realised label marginal equals ``P_i`` exactly, instead of the
+          contention-normalised ``P_i(k) / Σ_j P_j(k)`` a partition yields.
+
+        ``pilot_split`` is read as a fraction of the TRAIN pool here (not of
+        the whole corpus), so sweeping the pilot budget leaves every agent's
+        training rows untouched.
+        """
+        if not self.groups:
+            raise ValueError(
+                "split_strategy='overlapping_shift' requires a non-empty "
+                '"groups" mapping in the dataset config.'
+            )
+
+        ds = load_dataset(f'{self.repo}/{self.name}')
+        split_names = list(ds)
+        all_data = concatenate_datasets([ds[s] for s in split_names])
+        label_key = self.attributes[0]
+        labels = all_data[label_key]
+        total_size = len(all_data)
+
+        if self.n_agents is None:
+            self.n_agents = (
+                max(a for agents in self.groups.values() for a in agents) + 1
+            )
+
+        self.train_datasets: dict[int, ClassificationDataset] = {}
+        self.val_datasets: dict[int, ClassificationDataset] = {}
+        self.test_datasets: dict[int, ClassificationDataset] = {}
+        self.pilot_datasets: dict[int, ClassificationDataset] = {}
+        self.num_classes: dict[int, int] = {}
+
+        if self.label_subset is not None or self.writer_key is not None:
+            # plain lists: element-wise indexing of a lazy datasets Column is slow
+            labels = all_data[label_key][:]
+        if self.label_subset is not None:
+            wanted = set(self.label_subset)
+            keep = [k for k, y in enumerate(labels) if y in wanted]
+            all_data = all_data.select(keep)
+            labels = [labels[k] for k in keep]
+            total_size = len(all_data)
+
+        if self.writer_key is not None:
+            train_draws, test_pool, pilot_indices, agent_classes = (
+                self._writer_disjoint_draws(all_data, labels)
+            )
+            test_draws = {i: list(test_pool) for i in range(self.n_agents)}
+            self.shared_test_set = self.n_agents > 1
+            if pilot_indices and self.pilot_batch_size > len(pilot_indices):
+                self.pilot_batch_size = len(pilot_indices)
+        else:
+            train_draws, test_draws, pilot_indices, agent_classes = self._pool_draws(
+                ds, split_names, labels, total_size
+            )
         self.agent_classes = agent_classes
 
         # ── 4. Materialise the per-agent datasets ────────────────────────────

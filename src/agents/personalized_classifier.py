@@ -5,6 +5,8 @@ to carry a different architecture while sharing the same training
 interface as CNNClassifier.
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +24,8 @@ class CenterNorm(nn.Module):
     Like BatchNorm1d without the affine part and with a per-sample scale:
     mu is the batch mean in training and a running mean (same momentum
     convention as BatchNorm) in eval; each centred vector is then divided by
-    its own L2 norm, so every latent lies on the unit sphere.
+    its own L2 norm, so every latent lies on the unit sphere. Only the agent's
+    own task batches may move the running mean: see :func:`frozen_center_norm`.
     """
 
     def __init__(self, dim: int, momentum: float = 0.1, eps: float = 1e-6):
@@ -34,12 +37,31 @@ class CenterNorm(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         if self.training and z.shape[0] > 1:
             mu = z.mean(0)
-            with torch.no_grad():
-                self.running_mean.lerp_(mu.detach(), self.momentum)
+            if self.momentum > 0:  # 0 while frozen: no write at all
+                with torch.no_grad():
+                    self.running_mean.lerp_(mu.detach(), self.momentum)
         else:
             mu = self.running_mean
         z = z - mu
         return z / z.norm(dim=1, keepdim=True).clamp_min(self.eps)
+
+
+@contextlib.contextmanager
+def frozen_center_norm(module: nn.Module):
+    """Forwards inside this block cannot change any CenterNorm ``running_mean``.
+
+    For pilot batches: train-mode layers still centre on the batch mean, with
+    gradient, but the statistics used at evaluation come from task data only.
+    """
+    layers = [m for m in module.modules() if isinstance(m, CenterNorm)]
+    saved = [m.momentum for m in layers]
+    for m in layers:
+        m.momentum = 0.0
+    try:
+        yield
+    finally:
+        for m, momentum in zip(layers, saved, strict=True):
+            m.momentum = momentum
 
 
 class PersonalizedClassifier(BaseAgent):

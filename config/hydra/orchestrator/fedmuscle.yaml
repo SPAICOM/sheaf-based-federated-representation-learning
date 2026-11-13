@@ -8,6 +8,9 @@ E: 4
 T: 1
 
 alignment_mode: contrastive
+# Per-agent Linear(d_i -> proj_dim) before the cross-agent loss (src/communication/projectors.py).
+# null = the largest latent dim in the network (no projector if all dims are equal).
+proj_dim: null
 
 neighbors: {}
 

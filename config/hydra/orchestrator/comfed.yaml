@@ -3,13 +3,12 @@ _target_: src.orchestrators.ComFed
 max_lmb: 1.18e-3
 lambda_schedule: null
 
-proj_dim: 64
+# Common space of the per-agent maps P_i: R^{d_i} -> R^{proj_dim}.
+# null = the largest latent dim in the network.
+proj_dim: null
 
 neighbors: {}
-
-latent_dims:
-  0: 64
-  1: 64
+# latent_dims: filled in at runtime from the agents' encoders.
 
 # Information-theoretic PID logging (Liang et al. 2023).
 # Implemented in BaseOrchestrator → applies to *every* orchestrator that

@@ -1,3 +1,10 @@
+from .projectors import (
+    build_projectors,
+    common_dim,
+    latent_dim,
+    project,
+    retarget_input,
+)
 from .whitening import (
     WhiteningOp,
     color,
@@ -18,4 +25,9 @@ __all__ = [
     'color',
     'fit_alignment',
     'extract_latents',
+    'build_projectors',
+    'common_dim',
+    'latent_dim',
+    'project',
+    'retarget_input',
 ]

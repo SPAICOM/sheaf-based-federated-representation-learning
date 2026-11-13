@@ -8,6 +8,7 @@ Learning via Latent-Space Consensus", IEEE Wireless Communications Letters, 2026
 import torch
 import torch.nn as nn
 from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
 
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 
@@ -48,8 +49,9 @@ class ComFed(BaseOrchestrator):
         Regularization weight λ.
     latent_dims : dict
         Mapping from agent index to local encoder output dimension d_i.
-    proj_dim : int
-        Shared latent space dimension d.
+    proj_dim : int or None
+        Shared latent space dimension d. ``None`` (default) uses the largest
+        latent dim in the network, ``max_i d_i``.
     lambda_schedule : str or None
         Scheduling strategy: None (constant), 'cosine', or 'exp'.
     """
@@ -61,7 +63,7 @@ class ComFed(BaseOrchestrator):
         optimizer,
         max_lmb: float,
         latent_dims: dict,
-        proj_dim: int,
+        proj_dim: int | None = None,
         lambda_schedule: str | None = None,
         **kwargs,
     ):
@@ -75,11 +77,16 @@ class ComFed(BaseOrchestrator):
         self.automatic_optimization = False
 
         latent_dims_int = {int(k): int(v) for k, v in latent_dims.items()}
+        if proj_dim is None:
+            proj_dim = max(latent_dims_int.values())
+        if int(proj_dim) < 1:
+            raise ValueError(f'proj_dim must be at least 1, got {proj_dim}')
+        self.proj_dim = int(proj_dim)
 
         # Per-agent projection matrices Pi: R^{proj_dim × d_i}
         self.projection_matrices = nn.ParameterDict()
         for i, d_i in latent_dims_int.items():
-            Pi = torch.empty(proj_dim, d_i)
+            Pi = torch.empty(self.proj_dim, d_i)
             nn.init.xavier_uniform_(Pi)
             self.projection_matrices[str(i)] = nn.Parameter(Pi)
 
@@ -87,18 +94,45 @@ class ComFed(BaseOrchestrator):
     # Optimizers — separate for wi and Pi so each step only touches one
     # ------------------------------------------------------------------
 
-    def configure_optimizers(self) -> list:
-        model_opt = instantiate(
-            self.hparams.optimizer,
-            params=self.agents.parameters(),
-        )
-        proj_opt = instantiate(
-            self.hparams.optimizer,
-            params=self.projection_matrices.parameters(),
-        )
-        return [model_opt, proj_opt]
+    def configure_optimizers(self) -> tuple[list, list]:
+        """One optimizer for the encoders, one for the projections.
+
+        The optional ``scheduler: cosine`` key of the optimizer config (see
+        BaseOrchestrator.configure_optimizers) gives each optimizer a cosine
+        schedule over trainer.max_epochs, stepped at epoch end (manual
+        optimization: Lightning does not step it).
+        """
+        opt_cfg = self.hparams.optimizer
+        if isinstance(opt_cfg, DictConfig):
+            opt_cfg = OmegaConf.to_container(opt_cfg, resolve=True)
+        opt_cfg = dict(opt_cfg)
+        scheduler = opt_cfg.pop('scheduler', None)
+        if scheduler not in (None, 'cosine'):
+            raise ValueError(
+                f"Unknown optimizer.scheduler {scheduler!r}; expected 'cosine'"
+            )
+        optimizers = [
+            instantiate(opt_cfg, params=self.agents.parameters()),
+            instantiate(opt_cfg, params=self.projection_matrices.parameters()),
+        ]
+        if scheduler is None:
+            return optimizers, []
+        epochs = max(int(self.trainer.max_epochs), 1)
+        return optimizers, [
+            torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+            for opt in optimizers
+        ]
 
     def on_train_epoch_end(self) -> None:
+        schedulers = self.lr_schedulers()
+        for sched in (
+            schedulers
+            if isinstance(schedulers, list)
+            else [schedulers]
+            if schedulers
+            else []
+        ):
+            sched.step()
         self._finalize_train_epoch_communication()
         self._log_train_comm_task_perf()
 
@@ -227,7 +261,7 @@ class ComFed(BaseOrchestrator):
 
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
-            x, y = batch[_resolve_key(idx)]
+            x, y, _mask = self._unpack_task_batch(batch[_resolve_key(idx)])
 
             z = agent.encode(x)
             y_hat = agent.decoder(z)
@@ -286,7 +320,6 @@ class ComFed(BaseOrchestrator):
 
         return outputs, total_loss
 
-
     # ── Communication accuracy evaluation ─────────────────────────────────────
 
     @torch.no_grad()
@@ -327,7 +360,9 @@ class ComFed(BaseOrchestrator):
         """
         dev = Z_sender.device
         P_sender = self.projection_matrices[str(sender_idx)].to(dev).float()
-        P_receiver = self.projection_matrices[str(receiver_idx)].to(dev).float()
+        P_receiver = (
+            self.projection_matrices[str(receiver_idx)].to(dev).float()
+        )
 
         Z_shared = Z_sender.float() @ P_sender.T
 

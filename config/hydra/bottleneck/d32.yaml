@@ -1,0 +1,12 @@
+# @package model
+# Latent dims d=32 (agent 0) and d/2=16 (agent 1): full backbones, then stride-1
+# residual stages halving the width down to the bottleneck.
+agents:
+  0:   # ResNet-10 backbone (1 block per stage)
+    encoder_hidden_dims: [64, 128, 256, 512, 256, 128, 64, 32]
+    blocks_per_stage: [1, 1, 1, 1, 1, 1, 1, 1]
+    stage_strides: [1, 2, 2, 2, 1, 1, 1, 1]
+  1:   # ResNet with 2 blocks per stage, 3 stages
+    encoder_hidden_dims: [64, 128, 256, 128, 64, 32, 16]
+    blocks_per_stage: [2, 2, 2, 1, 1, 1, 1]
+    stage_strides: [1, 2, 2, 1, 1, 1, 1]
