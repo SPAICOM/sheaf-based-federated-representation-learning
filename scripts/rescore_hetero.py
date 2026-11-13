@@ -13,6 +13,7 @@ is built for it (no tv / lmin).
     private_seen     same, only the classes the agent trained on
     comm             receiver's decoder on the sender's mapped test latents
                      (pooled over the directed edges)
+    comm_both_seen   comm on classes both the sender and the receiver trained on
     comm_rx_seen     comm on classes the receiver trained on, whether the
                      sender did or not (sender-only classes excluded)
     comm_rx_only     comm on classes only the receiver trained on (the
@@ -92,6 +93,7 @@ COLUMNS = {
     'private': 'private',
     'private_seen': 'private seen',
     'comm': 'comm',
+    'comm_both_seen': 'comm TX+RX seen',
     'comm_rx_seen': 'comm RX seen',
     'comm_rx_only': 'comm only RX seen',
     'mrr': 'MRR',
@@ -102,7 +104,7 @@ COLUMNS = {
     'lmin_learned': 'λ_min learned',
 }
 PERCENT = {
-    'private', 'private_seen', 'comm', 'comm_rx_seen', 'comm_rx_only', 'mrr',
+    'private', 'private_seen', 'comm', 'comm_both_seen', 'comm_rx_seen', 'comm_rx_only', 'mrr',
 }
 POSTHOC = SheafFRL._POSTHOC_METHODS  # the mixin methods that make up the pipeline
 
@@ -228,6 +230,7 @@ def score(run, project: str, device: str) -> dict[str, float]:
             private=(seen[0] + unseen[0]) / (seen[1] + unseen[1]),
             private_seen=acc['test/scope/private_seen'],
             comm=acc['test/scope/comm_all'],
+            comm_both_seen=acc['test/scope/comm_both_seen'],
             comm_rx_seen=sum(scope.counts[k][0] for k in rx_seen)
             / sum(scope.counts[k][1] for k in rx_seen),
             comm_rx_only=acc['test/scope/comm_tx_unseen_rx_seen'],
@@ -277,8 +280,10 @@ def table(rows: pd.DataFrame) -> pd.DataFrame:
                 line[head] = ''
                 continue
             v = sub[col].dropna() * (100 if col in PERCENT else 1)
-            fmt = '{:.1f} ± {:.1f}' if col in PERCENT else '{:.3g} ± {:.2g}'
-            line[head] = fmt.format(v.mean(), v.std(ddof=1) if len(v) > 1 else 0.0)
+            mean = ('{:.1f}' if col in PERCENT else '{:.3g}').format(v.mean())
+            if len(v) > 1:  # sample SD over seeds; none for a single seed
+                mean += (' ± {:.2f}' if col in PERCENT else ' ± {:.2g}').format(v.std(ddof=1))
+            line[head] = mean
         lines.append(line)
     return pd.DataFrame(lines)
 

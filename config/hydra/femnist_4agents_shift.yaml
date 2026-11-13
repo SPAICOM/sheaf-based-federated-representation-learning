@@ -17,11 +17,11 @@ sheaf_fmtl_gamma: 1e-3   # SheafFMTL compression, largest that fits RAM: d_ij 12
 
 tuned_lmb:   # untuned: the MNIST values
   non_cooperative: 0.0
-  sheaf_frl: 0.01
-  di_sheaf_frl: 0.01
-  comfed: 1.18e-3
+  sheaf_frl: 0.03
+  di_sheaf_frl: 0.1
+  comfed: 0.03
   sheaf_fmtl: 0.01
-  fedproto: 0.1
+  fedproto: 0.01
   fedmuscle: 0.1
   fedre: 0.0
 
