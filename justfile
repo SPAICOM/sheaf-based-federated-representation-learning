@@ -79,6 +79,13 @@ mnist-ablation-lambda *args="":
         orchestrator=di_sheaf_frl orchestrator.max_lmb=0.003,0.01,0.03,0.1,0.3,1 \
         'study_name=mnist4_di_clean_bs256_lambda4096_${orchestrator.max_lmb}' {{args}}
 
+# MNIST ablation: share of communication epochs of DiSheafFRL (lambda 0.01), 20..80% of 100 epochs
+# (0% = non_cooperative, 100% = di_sheaf_frl). Hydra runs them in sequence; one per process to parallelise.
+mnist-ablation-comm *args="":
+    uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift \
+        orchestrator=ce_di_sheaf_frl orchestrator.comm_percentage=20,40,60,80 \
+        'study_name=mnist4_ce_di_comm${orchestrator.comm_percentage}' {{args}}
+
 # MNIST ablation: restriction maps (method = zca | ols) over the pilot budget (lambda sweep: see README).
 mnist-ablation-maps method *args="":
     uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift_{{method}} \
@@ -142,12 +149,14 @@ launch sweep total cmd:
     mkdir -p "$root/logs/status/$s" "$root/logs/console"
     printf '{"total": %s, "cmd": %s, "started": "%s", "commit": "%s"}\n' \
         "{{total}}" "$(printf '%s' '{{cmd}}' | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')" \
-        "$(date -Is)" "$(git -C "$root" rev-parse --short HEAD)$(git -C "$root" diff --quiet || echo -dirty)" \
+        "$(date +%Y-%m-%dT%H:%M:%S%z)" "$(git -C "$root" rev-parse --short HEAD)$(git -C "$root" diff --quiet || echo -dirty)" \
         > "$root/logs/status/$s/_sweep.json"
     tmux new-session -d -s "$s" -n run -c "$root"
-    tmux send-keys -t "$s:run" "export SWEEP=$s; {{cmd}} 2>&1 | tee logs/console/$s.log; echo '[sweep finished]'" C-m
+    # macOS tmux shells inherit launchd's 256 open-file soft limit, which the spawned
+    # DataLoader workers exhaust at the first validation (Errno 24): raise it
+    tmux send-keys -t "$s:run" "ulimit -n 65536 2>/dev/null; export SWEEP=$s; {{cmd}} 2>&1 | tee logs/console/$s.log; echo '[sweep finished]'" C-m
     tmux split-window -h -t "$s:run" -c "$root" "uv run python scripts/runs_dashboard.py $s"
-    tmux select-pane -t "$s:run.0"
+    tmux select-pane -t "$s:run.{left}"   # not .0: pane-base-index may be 1
     echo "launched '$s' → attach: just attach $s   |   overview: just dash"
 
 # Attach to (or switch to) a launched sweep's tmux session

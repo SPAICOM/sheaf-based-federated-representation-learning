@@ -13,7 +13,7 @@ defaults:
 logger:
   project: femnist_4agents_shift
 
-sheaf_fmtl_gamma: 1e-3   # SheafFMTL compression, largest that fits RAM: d_ij 129, ~7.8 GB/run
+sheaf_fmtl_gamma: 3e-4   # SheafFMTL compression: P_ij (fp16 + fp32 update) within 10% of a 48 GB machine: d_ij 38, 1.7 GB (1e-3: d_ij 129, 5.8 GB)
 
 tuned_lmb:   # untuned: the MNIST values
   non_cooperative: 0.0

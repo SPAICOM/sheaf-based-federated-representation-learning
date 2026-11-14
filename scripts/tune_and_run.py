@@ -18,6 +18,7 @@ stopped pipeline resumes where it was. Console output: ``logs/console/<sweep>_<j
     just hetero-pipeline cifar10                              # every method of the config
     just hetero-pipeline cifar10 fedproto,fedre               # only these
     just hetero-pipeline mnist fedproto,comfed --dry-run    # list the jobs, train nothing
+    just hetero-pipeline cifar10 sheaf_fmtl --override dataset.num_workers=0   # macOS: no spawn workers
 """
 
 import argparse
@@ -39,6 +40,9 @@ CONFIG_DIR = ROOT / 'config' / 'hydra'
 METRIC = 'test/avg_comm_task_perf'
 POLL_S = 300
 STALE_S = 900  # a 'running' run without a heartbeat for this long is dead (killed job)
+START_GAP_S = 30  # min seconds between job starts (simultaneous wandb inits: "Failed to read port info")
+SETUP_FAIL_S = 600  # a job failing sooner than this (setup, wandb init) is retried...
+ATTEMPTS = 3  # ...up to this many starts in all: on macOS wandb-core sometimes hangs at launch
 _print_lock = threading.Lock()
 
 
@@ -199,7 +203,10 @@ class Pipeline:
         self.dry = args.dry_run
         self.sweep = os.environ.get('SWEEP', f'hetero_pipeline_{args.dataset}')
         self.jobs = args.jobs
+        self.overrides = args.override
         self.write_lock = threading.Lock()
+        self.start_lock = threading.Lock()
+        self.last_start = float('-inf')
         self.launched: list[str] = []
         log(
             f'{self.config} (wandb {cfg.logger.project}): seeds {self.seeds}, '
@@ -215,7 +222,7 @@ class Pipeline:
         ]  # fmt: skip
         if job.lmb is not None:
             cmd.append(f'orchestrator.max_lmb={job.lmb!r}')
-        return cmd
+        return cmd + self.overrides
 
     def run(self, job: Job) -> bool:
         """Train one job unless wandb already has it; True if its run is finished."""
@@ -242,10 +249,21 @@ class Pipeline:
             parents=True, exist_ok=True
         )  # git-ignored: absent in a fresh clone
         log(f'{job.name}: start  (log {console.relative_to(ROOT)})')
-        with console.open('a') as f:
-            rc = subprocess.run(
-                self.cmd(job), cwd=ROOT, stdout=f, stderr=subprocess.STDOUT
-            ).returncode
+        for attempt in range(1, ATTEMPTS + 1):
+            with self.start_lock:  # stagger starts: jobs started together can hang wandb init
+                time.sleep(
+                    max(0.0, self.last_start + START_GAP_S - time.monotonic())
+                )
+                self.last_start = time.monotonic()
+            t0 = time.monotonic()
+            with console.open('a') as f:
+                rc = subprocess.run(
+                    self.cmd(job), cwd=ROOT, stdout=f, stderr=subprocess.STDOUT
+                ).returncode
+            took = time.monotonic() - t0
+            if rc == 0 or attempt == ATTEMPTS or took > SETUP_FAIL_S:
+                break
+            log(f'{job.name}: failed during setup ({took:.0f} s, exit {rc}), retrying')
         log(f'{job.name}: ' + ('done' if rc == 0 else f'FAILED (exit {rc})'))
         return rc == 0
 
@@ -364,6 +382,13 @@ def main() -> int:
     p.add_argument(
         '--grid',
         help='comma-separated lambda values (default: lmb_tuning.grid of the config)',
+    )
+    p.add_argument(
+        '--override',
+        action='append',
+        default=[],
+        help='extra Hydra override for every job, repeatable; runtime settings only '
+        '(not part of the wandb run identity), e.g. --override dataset.num_workers=0',
     )
     p.add_argument(
         '--dry-run',
