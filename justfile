@@ -62,6 +62,13 @@ hetero dataset *args="":
 hetero-pipeline dataset *args="":
     uv run python scripts/tune_and_run.py {{dataset}} {{args}}
 
+#   just bottleneck-pipeline femnist [non_cooperative,fedre] [--jobs N, default 1] [--dry-run]
+# Accuracy vs bottleneck dimension (femnist | cifar10), 2 agents with latent d / d/2, every method at its tuned_lmb
+# (the 4-agent pipeline's pick, no tuning): <dataset>_2agents_bottleneck, method x d x seed, first seed of every d first. Resumes from wandb.
+# Paper run: just launch femnist_bneck_pipeline 126 "just bottleneck-pipeline femnist non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre --jobs 4"
+bottleneck-pipeline dataset *args="":
+    uv run python scripts/tune_and_run.py {{dataset}} --study bottleneck {{args}}
+
 # SheafFMTL RAM per gamma (its P_ij matrices scale with the parameter count): pick sheaf_fmtl_gamma in the config
 #   just sheaf-fmtl-memory cifar10_4agents_full fashionmnist_4agents_shift
 sheaf-fmtl-memory *configs:
@@ -94,9 +101,11 @@ mnist-ablation-maps method *args="":
 
 # ── Paper figures and tables (read the wandb remote) ───────────────────────────
 
-# Accuracy vs bottleneck dimension → results/cifar10_2agents_bottleneck/
-plot-bottleneck:
-    uv run python scripts/plot_bottleneck.py
+# Accuracy vs bottleneck dimension (femnist | cifar10) → results/<dataset>_2agents_bottleneck/bottleneck{,_rx_scope}.{pdf,png} + bottleneck.md
+# Re-scores new ComFed checkpoints first (cached): ComFed logs no seen/unseen-class split in training.
+plot-bottleneck dataset="femnist":
+    uv run python scripts/rescore_hetero.py {{dataset}}_2agents_bottleneck --groups comfed
+    uv run python scripts/plot_bottleneck.py {{dataset}}
 
 # Heterogeneity table over MNIST, FMNIST, FEMNIST, CIFAR-10 (+ seen/unseen split) → results/paper/hetero_table{,_scope}.{md,tex}
 table-hetero:

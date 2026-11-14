@@ -29,7 +29,6 @@ from .data_partitioner import (
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
-from .sheaf_laplacian import min_eigenvalue, sheaf_laplacian, total_variation
 from .logging import (
     _extract_objective_metric,
     _filter_supported_init_kwargs,
@@ -40,6 +39,7 @@ from .logging import (
     _sanitize_instantiation_config,
     _update_logger_config,
 )
+from .sheaf_laplacian import min_eigenvalue, sheaf_laplacian, total_variation
 
 __all__ = [
     'ClassScopeAccuracy',

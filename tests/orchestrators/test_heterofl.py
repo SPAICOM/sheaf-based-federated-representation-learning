@@ -281,8 +281,8 @@ class TestHeteroFLAggregation:
 
     def test_uniform_rates_weighted_average_all_positions(self):
         """With identical rates, every position
-        receives the weighted average."""
-
+        receives the weighted average.
+        """
         agent0 = _make_agent(rate=1.0, hidden_dims=[4])
         agent1 = _make_agent(rate=1.0, hidden_dims=[4])
         _fill_module(agent0.encoder, 0.0)
@@ -306,7 +306,8 @@ class TestHeteroFLAggregation:
 
     def test_narrow_node_covered_positions_are_averaged(self):
         """Narrow node's positions are all in the intersection — averaged
-        correctly."""
+        correctly.
+        """
         agent0 = _make_agent(rate=1.0, hidden_dims=[4])  # 4 out-channels
         agent1 = _make_agent(rate=0.5, hidden_dims=[4])  # 2 out-channels
         _fill_module(agent0.encoder, 0.0)
@@ -329,7 +330,8 @@ class TestHeteroFLAggregation:
 
     def test_wide_node_partitioned_positions(self):
         """Wide node positions within intersection are averaged;
-        positions outside intersection retain only the wide node's value."""
+        positions outside intersection retain only the wide node's value.
+        """
         agent0 = _make_agent(rate=1.0, hidden_dims=[4])  # 4 out-channels
         agent1 = _make_agent(rate=0.5, hidden_dims=[4])  # 2 out-channels
         _fill_module(agent0.encoder, 2.0)
@@ -361,7 +363,8 @@ class TestHeteroFLAggregation:
 
     def test_no_neighbors_self_only_keeps_values_unchanged(self):
         """A node with no neighbors averages only itself
-        Parameters stay unchanged."""
+        Parameters stay unchanged.
+        """
         agent0 = _make_agent(rate=1.0, hidden_dims=[4])
         _fill_module(agent0.encoder, 5.0)
         original = {
@@ -848,7 +851,8 @@ class TestHeteroFLTrainerIntegration:
     @pytest.mark.slow
     def test_train_one_epoch_with_two_hetero_agents(self):
         """Full training epoch with heterogeneous agents
-        completes without error."""
+        completes without error.
+        """
         orc = HeteroFL(
             agents={
                 0: _make_agent(rate=1.0, hidden_dims=[8, 16]),

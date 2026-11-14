@@ -19,6 +19,12 @@ stopped pipeline resumes where it was. Console output: ``logs/console/<sweep>_<j
     just hetero-pipeline cifar10 fedproto,fedre               # only these
     just hetero-pipeline mnist fedproto,comfed --dry-run    # list the jobs, train nothing
     just hetero-pipeline cifar10 sheaf_fmtl --override dataset.num_workers=0   # macOS: no spawn workers
+
+``--study bottleneck`` (``just bottleneck-pipeline``) runs ``<dataset>_2agents_bottleneck``
+instead: its sweeper lists one more axis, the bottleneck config group (latent pair d, d/2),
+and every job is repeated at each of its options. Lambda is not tuned there: every method
+with a penalty must be in ``lmb_tuning.fixed``. A run's option is recovered from its config
+as ``d<latent width of agent 0>``.
 """
 
 import argparse
@@ -52,13 +58,21 @@ def log(msg: str) -> None:
         print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
 
 
-def experiment_config(dataset: str) -> str:
+def experiment_config(dataset: str, study: str = 'hetero') -> str:
     """Experiment config of a dataset (same rule as `just hetero`)."""
+    if study == 'bottleneck':
+        return f'{dataset}_2agents_bottleneck'
     return (
         'cifar10_4agents_full'
         if dataset == 'cifar10'
         else f'{dataset}_4agents_shift'
     )
+
+
+def bottleneck_option(cfg) -> str:
+    """Bottleneck group option of a run: ``d<latent width of agent 0>`` (wandb keys are str)."""
+    agents = cfg['model']['agents']
+    return f'd{int(agents.get("0", agents.get(0))["encoder_hidden_dims"][-1])}'
 
 
 def lmb_key(lmb: float | None) -> float | None:
@@ -74,6 +88,9 @@ class Job:
     seed: int
     lmb: float | None  # None: the method has no lambda
     stage: str  # 'grid' | 'final'
+    variant: str | None = (
+        None  # bottleneck group option, e.g. 'd8' (bottleneck study only)
+    )
 
     @property
     def group(self) -> str:
@@ -92,8 +109,11 @@ class Job:
     @property
     def name(self) -> str:
         """Short job id used in logs."""
-        return f'{self.method}_s{self.seed}' + (
-            '' if self.lmb is None else f'_l{self.lmb:g}'
+        return (
+            f'{self.method}'
+            + ('' if self.variant is None else f'_{self.variant}')
+            + f'_s{self.seed}'
+            + ('' if self.lmb is None else f'_l{self.lmb:g}')
         )
 
 
@@ -113,8 +133,13 @@ class Runs:
             self.exists = self.project in names
         return self.exists
 
-    def fetch(self, groups: tuple[str, ...], with_lmb: bool) -> dict:
-        """Return the runs of the given groups as {(seed, lambda): [runs]}."""
+    def fetch(
+        self,
+        groups: tuple[str, ...],
+        with_lmb: bool,
+        with_variant: bool = False,
+    ) -> dict:
+        """Return the runs of the given groups as {(seed, lambda[, variant]): [runs]}."""
         out: dict = {}
         if not self.project_exists():
             return out
@@ -130,14 +155,20 @@ class Runs:
                     if with_lmb
                     else None
                 )
-                out.setdefault((int(cfg['seed']), lmb), []).append(r)
+                key = (int(cfg['seed']), lmb)
+                if with_variant:
+                    key += (bottleneck_option(cfg),)
+                out.setdefault(key, []).append(r)
         return out
 
     def matching(self, job: Job) -> list:
         """Existing runs with the job's seed and lambda."""
-        return self.fetch(job.lookup, job.lmb is not None).get(
-            (job.seed, lmb_key(job.lmb)), []
-        )
+        key = (job.seed, lmb_key(job.lmb))
+        if job.variant is not None:
+            key += (job.variant,)
+        return self.fetch(
+            job.lookup, job.lmb is not None, job.variant is not None
+        ).get(key, [])
 
 
 def alive(run) -> bool:
@@ -179,7 +210,7 @@ class Pipeline:
     """Job scheduling, lambda selection and bookkeeping for one dataset."""
 
     def __init__(self, args):
-        self.config = experiment_config(args.dataset)
+        self.config = experiment_config(args.dataset, args.study)
         with initialize_config_dir(
             config_dir=str(CONFIG_DIR), version_base='1.3'
         ):
@@ -192,6 +223,20 @@ class Pipeline:
         self.grid = [float(x) for x in grid]
         self.no_lmb = set(cfg.lmb_tuning.no_lmb)
         self.fixed = {m: float(cfg.tuned_lmb[m]) for m in cfg.lmb_tuning.fixed}
+        # bottleneck study: the sweeper's extra axis (a config group of latent-dim pairs)
+        axes = [
+            k
+            for k in cfg.hydra.sweeper.params
+            if k not in ('orchestrator', 'seed')
+        ]
+        if len(axes) > 1:
+            sys.exit(f'{self.config}: more than one extra sweep axis {axes}')
+        self.axis = axes[0] if axes else None
+        self.variants = (
+            str(cfg.hydra.sweeper.params[self.axis]).split(',')
+            if self.axis
+            else [None]
+        )
         methods = args.orchestrators or str(
             cfg.hydra.sweeper.params.orchestrator
         )
@@ -199,9 +244,15 @@ class Pipeline:
         for m in self.methods:
             if not (CONFIG_DIR / 'orchestrator' / f'{m}.yaml').exists():
                 sys.exit(f'unknown orchestrator {m!r}')
+            if self.axis and m not in self.no_lmb and m not in self.fixed:
+                sys.exit(
+                    f'{m}: no lambda tuning in {self.config}, add it to lmb_tuning.fixed'
+                )
         self.runs = Runs(cfg.logger.project)
         self.dry = args.dry_run
-        self.sweep = os.environ.get('SWEEP', f'hetero_pipeline_{args.dataset}')
+        self.sweep = os.environ.get(
+            'SWEEP', f'{args.study}_pipeline_{args.dataset}'
+        )
         self.jobs = args.jobs
         self.overrides = args.override
         self.write_lock = threading.Lock()
@@ -210,7 +261,8 @@ class Pipeline:
         self.launched: list[str] = []
         log(
             f'{self.config} (wandb {cfg.logger.project}): seeds {self.seeds}, '
-            f'grid {[f"{x:g}" for x in self.grid]}, no lambda: {sorted(self.no_lmb)}, fixed lambda: {self.fixed}'
+            + (f'{self.axis} {self.variants}, ' if self.axis else '')
+            + f'grid {[f"{x:g}" for x in self.grid]}, no lambda: {sorted(self.no_lmb)}, fixed lambda: {self.fixed}'
         )
 
     def cmd(self, job: Job) -> list[str]:
@@ -222,6 +274,8 @@ class Pipeline:
         ]  # fmt: skip
         if job.lmb is not None:
             cmd.append(f'orchestrator.max_lmb={job.lmb!r}')
+        if job.variant is not None:
+            cmd.append(f'{self.axis}={job.variant}')
         return cmd + self.overrides
 
     def run(self, job: Job) -> bool:
@@ -310,7 +364,13 @@ class Pipeline:
         def submit(job: Job) -> None:
             pending[pool.submit(self.run, job)] = job
 
-        for m in self.methods:
+        if self.axis:  # no grid here: seed-major, so the first seed of every d finishes first
+            for s in self.seeds:
+                for v in self.variants:
+                    for m in self.methods:
+                        lmb = None if m in self.no_lmb else self.fixed[m]
+                        submit(Job(m, s, lmb, 'final', v))
+        for m in self.methods if not self.axis else []:
             if m in self.no_lmb:
                 for s in self.seeds:
                     submit(Job(m, s, None, 'final'))
@@ -368,6 +428,12 @@ def main() -> int:
     )
     p.add_argument('dataset', help='mnist | fashionmnist | femnist | cifar10')
     p.add_argument(
+        '--study',
+        choices=('hetero', 'bottleneck'),
+        default='hetero',
+        help='hetero: <dataset>_4agents_* (default); bottleneck: <dataset>_2agents_bottleneck',
+    )
+    p.add_argument(
         'orchestrators',
         nargs='?',
         help='comma-separated orchestrator configs, e.g. non_cooperative,fedproto '
@@ -395,7 +461,7 @@ def main() -> int:
         action='store_true',
         help='list the jobs and the selection, train nothing',
     )
-    return Pipeline(p.parse_args()).main()
+    return Pipeline(p.parse_intermixed_args()).main()
 
 
 if __name__ == '__main__':
