@@ -1,0 +1,12 @@
+# DiSheafFRL communicating on comm_percentage % of the epochs (src/orchestrators/ce_di_sheaf_frl.py):
+# the collaborative epochs are spread uniformly over trainer.max_epochs (the last one always
+# communicates) and are DiSheafFRL epochs; the others are non-cooperative epochs (task loss
+# only, no pilot pass). 100 = di_sheaf_frl; for 0 use non_cooperative.
+defaults:
+  - di_sheaf_frl
+  - _self_
+
+_target_: src.orchestrators.CEDiSheafFRL
+comm_percentage: 100
+total_epochs: null   # null = trainer.max_epochs
+local_reg: false     # not supported: local epochs skip the pilot pass

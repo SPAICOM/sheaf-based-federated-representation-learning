@@ -62,6 +62,7 @@ ORCHESTRATORS_WITH_LMB = {
     'SheafCFRL',
     'SheafFMTL',
     'CESheafFRL',
+    'CEDiSheafFRL',
     'ComFed',
     'FedProto',
     'FedMuscle',

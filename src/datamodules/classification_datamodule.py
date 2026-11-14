@@ -858,7 +858,10 @@ class ClassificationDataModule(l.LightningDataModule):
             dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
-            num_workers=self.num_workers,
+            # no workers for an empty split (val_split=0): under the spawn start
+            # method (macOS) each worker unpickles the dataset, and an empty HF
+            # table fails to unpickle ("Must pass at least one table")
+            num_workers=self.num_workers if len(dataset) else 0,
             collate_fn=_collate_fn,
             drop_last=shuffle,
             generator=generator,

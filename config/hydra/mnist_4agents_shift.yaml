@@ -20,6 +20,7 @@ tuned_lmb:   # lambda study, 3 seeds (results/mnist_4agents_shift/lambda)
   non_cooperative: 0.0
   sheaf_frl: 0.01
   di_sheaf_frl: 0.01
+  ce_di_sheaf_frl: 0.01   # = di_sheaf_frl (communication-epochs ablation)
   comfed: 1.18e-3
   sheaf_fmtl: 0.01
   fedproto: 0.1

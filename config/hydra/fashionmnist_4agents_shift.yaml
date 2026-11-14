@@ -13,7 +13,7 @@ defaults:
 logger:
   project: fashionmnist_4agents_shift
 
-sheaf_fmtl_gamma: 1e-4   # SheafFMTL compression, largest that fits RAM: d_ij 131, ~13 GB/run (2.5M-param agents); 3e-5 → 5.4 GB
+sheaf_fmtl_gamma: 3e-5   # SheafFMTL compression: P_ij (fp16 + fp32 update) within 10% of a 48 GB machine: d_ij 39, 3.4 GB (1e-4: d_ij 131, 11.3 GB)
 
 tuned_lmb:   # DiSheafFRL: 6-point log grid on [1e-4, 1], 2-agent version, 2048 pilots
   non_cooperative: 0.0
