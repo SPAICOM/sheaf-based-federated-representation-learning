@@ -17,12 +17,12 @@ sheaf_fmtl_gamma: 1e-4   # SheafFMTL compression, largest that fits RAM: d_ij 13
 
 tuned_lmb:   # DiSheafFRL: 6-point log grid on [1e-4, 1], 2-agent version, 2048 pilots
   non_cooperative: 0.0
-  sheaf_frl: 3.981071705534973e-3
-  di_sheaf_frl: 3.981071705534973e-3
-  comfed: 1.18e-3
+  sheaf_frl: 0.01
+  di_sheaf_frl: 0.1
+  comfed: 0.01
   sheaf_fmtl: 0.01
-  fedproto: 0.1
-  fedmuscle: 0.1
+  fedproto: 0.01
+  fedmuscle: 1
   fedre: 0.0
 
 trainer:

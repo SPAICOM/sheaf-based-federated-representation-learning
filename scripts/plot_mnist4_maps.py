@@ -123,12 +123,56 @@ assert all(
     )
     + '\n'
 )
+# Learnable SWBN whitening instead of CenterNorm (pilot study only, lambda .01),
+# scored through the learned SWBN + saved Stiefel maps (eval_alignment=learned).
+swbn_runs = [
+    api.run(f'{api.default_entity}/mnist_4agents_mapstudy_swbn/{r.id}')
+    for r in api.runs(
+        f'{api.default_entity}/mnist_4agents_mapstudy_swbn',
+        filters={
+            'group': {
+                '$in': [
+                    f'swbn_p{p}_l.01' for p in (384, 768, 1536, 2048, 4096)
+                ]
+            }
+        },
+    )
+    if r.state == 'finished'  # a first, stopped launch left killed entries
+]
+assert len(swbn_runs) == 15, len(swbn_runs)
+assert all(
+    r.config['orchestrator']['eval_alignment'] == 'learned' for r in swbn_runs
+)
+swbn = pd.DataFrame(
+    [
+        {
+            'run': r.id,
+            'seed': r.config['seed'],
+            'pilots': r.config['dataset']['pilot_num_samples'],
+            'comm': r.summary['test/avg_comm_task_perf'],
+            'private': r.summary['test/avg_private_task_perf'],
+        }
+        for r in swbn_runs
+    ]
+)
+assert all(sorted(g.seed) == [42, 43, 44] for _, g in swbn.groupby('pilots'))
+(OUT / 'swbn_provenance.md').write_text(
+    'Project: mnist_4agents_mapstudy_swbn, groups swbn_p<pilots>_l.01. Learnable '
+    'SWBN whitening (no CenterNorm), lambda 0.01, scored through the learned SWBN '
+    'and saved Stiefel maps (eval_alignment=learned). Three seeds per point.\n\n'
+    + '\n'.join(
+        f'- pilots {r.pilots}, seed {r.seed}: {r.run}'
+        for r in swbn.sort_values(['pilots', 'seed']).itertuples()
+    )
+    + '\n'
+)
 labels = [
     'Non cooperative',
     'DiSheafFRL + CenterNorm',
     'DiSheafFRL + ZCA',
     'DiSheafFRL + CenterNorm + OLS (posthoc)',
     'DiSheafFRL + CenterNorm + OLS',
+    'DiSheafFRL + SWBN',
 ]
 for study, directory, x in [
     ('lambda', 'lambda', 'weight'),
@@ -162,6 +206,8 @@ for study, directory, x in [
             else learned[learned.weight == 0.01]
         )
         series.append(d.groupby(x)[kind].agg(['mean', 'std']) * 100)
+        if study == 'pilot':
+            series.append(swbn.groupby(x)[kind].agg(['mean', 'std']) * 100)
         values = sorted(set().union(*(set(d.index) for d in series[1:])))
         if study == 'lambda':
             series[0] = pd.DataFrame(
@@ -169,7 +215,14 @@ for study, directory, x in [
             )
         for label, color, d in zip(
             labels,
-            ['tab:orange', 'tab:blue', 'tab:green', 'tab:purple', 'tab:red'],
+            [
+                'tab:orange',
+                'tab:blue',
+                'tab:green',
+                'tab:purple',
+                'tab:red',
+                'tab:brown',
+            ],
             series,
         ):
             # The posthoc OLS stays in the tables but not in the figure.
@@ -198,8 +251,9 @@ for study, directory, x in [
     if study == 'lambda':
         fig.suptitle('4096 pilots; mean ± sample SD, seeds 42/43/44')
     fig.tight_layout()
-    for ext in ['png', 'pdf']:
-        fig.savefig(OUT / f'{study}_study.{ext}', dpi=180)
+    # The figures are drawn by scripts/plot_mnist4_swbn_scopes.py (lambda_study.*: --study lambda;
+    # pilot_study.*: default study) with the standard (a)/(b)/(c) class-scope panels; this script
+    # only writes the summary tables below.
     plt.close(fig)
     result = pd.DataFrame(table).sort_index().fillna('—')
     result.index.name = 'Lambda' if study == 'lambda' else 'Pilots'

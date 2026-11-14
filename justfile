@@ -216,6 +216,18 @@ mnist4-lambda-summary:
 mnist4-map-summary:
     uv run python scripts/plot_mnist4_maps.py
 
+# Redraw the topology gap figure (DiSheafFRL - Non-coop, star/ring/full) from the retained rescore; pass "" to rescore checkpoints.
+mnist4-topology-summary *args="--plot-only":
+    uv run python scripts/plot_mnist4_topology.py {{args}}
+
+# Redraw the pilot study figure (maps/pilot_study) from the retained class-scope rescore; pass "" to rescore checkpoints (CUDA).
+mnist4-swbn-scopes-summary *args="--plot-only":
+    uv run python scripts/plot_mnist4_swbn_scopes.py {{args}}
+
+# Lambda study by class scope (private / sender-unseen receiver-seen / receiver-seen) -> maps/lambda_study.*; pass "" to rescore checkpoints (CUDA).
+mnist4-lambda-scopes-summary *args="--plot-only":
+    uv run python scripts/plot_mnist4_swbn_scopes.py --study lambda {{args}}
+
 # Queued MNIST4 pilot-BN-update .
 mnist4-bn-update:
     just launch mnist4_bn_update 3 "bash tmp/2026-11-10_mnist4_bn_update.sh"
@@ -235,3 +247,19 @@ mnist4-ols-sanity-audit *args="":
 # Topology study (ring + star, noncoop vs DiSheafFRL, 3 seeds); launcher tmp/2026-11-12_mnist4_topology.sh.
 mnist4-topology:
     just launch mnist4_topology 12 "bash tmp/2026-11-12_mnist4_topology.sh"
+
+# Topology study report: rescoring of saved checkpoints (comm / sender-unseen / receiver-seen) -> table + plot in tmp/.
+mnist4-topology-report *args="":
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}" uv run python tmp/2026-11-12_mnist4_topology_report.py {{args}}
+
+# SWBN-vs-ZCA pilot ablation (15 runs: 5 pilot counts x 3 seeds, learned eval); launcher tmp/2026-11-12_mnist4_swbn.sh.
+mnist4-swbn:
+    just launch mnist4_swbn 15 "bash tmp/2026-11-12_mnist4_swbn.sh"
+
+# Method summary (lambda + pilot map study) rescored by class scope from saved checkpoints on GPU0 -> tmp/2026-11-13_mnist4_method_scopes/.
+mnist4-method-scopes *args="":
+    just launch mnist4_method_scopes 1 "CUDA_VISIBLE_DEVICES=0 uv run python tmp/2026-11-13_mnist4_method_scopes.py {{args}}"
+
+# SWBN lambda ablation (15 runs: lambda .003/.03/.1/.3/1 x 3 seeds at 4096 pilots; .01 reused); launcher tmp/2026-11-14_mnist4_swbn_lambda.sh.
+mnist4-swbn-lambda:
+    just launch mnist4_swbn_lambda 15 "bash tmp/2026-11-14_mnist4_swbn_lambda.sh"
