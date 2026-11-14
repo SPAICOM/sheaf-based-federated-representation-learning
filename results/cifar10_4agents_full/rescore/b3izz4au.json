@@ -2,6 +2,7 @@
  "private": 0.6897,
  "private_seen": 0.9196,
  "comm": 0.5466,
+ "comm_both_seen": 0.9098166666666667,
  "comm_rx_seen": 0.7288,
  "comm_rx_only": 0.3667666666666667,
  "mrr": 0.011007996819292506,

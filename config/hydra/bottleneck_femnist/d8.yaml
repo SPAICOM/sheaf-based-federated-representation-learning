@@ -1,0 +1,6 @@
+# @package model
+# Latent dims d=8 (agent 0) and d/2=4 (agent 1): the FEMNIST backbones of agents 0 and 2
+# of femnist_4agents_shift plus one bottleneck conv block of width d (resp. d/2).
+agents:
+  0: {encoder_hidden_dims: [32, 64, 128, 8]}
+  1: {encoder_hidden_dims: [32, 96, 256, 4]}

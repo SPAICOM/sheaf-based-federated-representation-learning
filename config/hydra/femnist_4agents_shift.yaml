@@ -22,7 +22,7 @@ tuned_lmb:   # untuned: the MNIST values
   comfed: 0.03
   sheaf_fmtl: 0.01
   fedproto: 0.01
-  fedmuscle: 0.1
+  fedmuscle: 0.3
   fedre: 0.0
 
 dataset:

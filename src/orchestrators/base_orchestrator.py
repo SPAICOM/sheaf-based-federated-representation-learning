@@ -2177,7 +2177,8 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def _local_simclr_loss(self, agent, batch, idx):
         """SimCLR (NT-Xent) on two augmented views of this step's task batch
         and/or pilot batch (``simclr_sources``), through the agent's encoder and
-        its projection head. Running BN/CenterNorm stats are not updated."""
+        its projection head. Running BN/CenterNorm stats are not updated.
+        """
         if self.simclr_heads is None:
             return 0.0
         if isinstance(batch, tuple):

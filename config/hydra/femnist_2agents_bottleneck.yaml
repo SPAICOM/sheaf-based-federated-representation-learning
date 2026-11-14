@@ -1,0 +1,44 @@
+# FEMNIST digits, 2 agents, label shift 1.0 AND style shift: performance vs bottleneck
+# dimension. Agent 0 trains on digits 0-6, agent 1 on 3-9, each written by its own
+# writers only; the 4096 shared pilots come from a third, disjoint writer group. Two
+# different CNNs whose latent widths are d and d/2; the pair is picked with the
+# bottleneck_femnist group: d8 (8/4), d16 (16/8), ..., d256 (256/128).
+# `just bottleneck-pipeline femnist` trains every method x d x seed at tuned_lmb.
+defaults:
+  - paper_base
+  - bottleneck_femnist: d64
+  - override dataset: femnist
+  - override model: cnn_classifier
+  - _self_
+
+logger:
+  project: femnist_2agents_bottleneck
+
+tuned_lmb:   # best lambda of the femnist_4agents_shift pipeline (seed-42 grid, K4 graph)
+  non_cooperative: 0.0
+  sheaf_frl: 0.03
+  di_sheaf_frl: 0.1
+  comfed: 0.03
+  sheaf_fmtl: 0.01
+  fedproto: 0.01
+  fedmuscle: 0.3
+  fedre: 0.0
+
+lmb_tuning:
+  fixed: [sheaf_frl, di_sheaf_frl, comfed, sheaf_fmtl, fedproto, fedmuscle]
+
+dataset:
+  n_agents: 2
+  test_source: pool             # FEMNIST has no official test split
+  batch_size: 256
+  num_workers: 2
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6]}
+    1: {agents: [1], target_classes: [3, 4, 5, 6, 7, 8, 9]}
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre
+      bottleneck_femnist: d8,d16,d32,d64,d128,d256
+      seed: 42,43,44
