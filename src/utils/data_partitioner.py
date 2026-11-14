@@ -128,7 +128,6 @@ def _draw_dirichlet_proportions(
     switches to the bounded uniform heuristic used by the heterogeneity
     experiments.
     """
-
     # If alpha is negative, use the exact pFedHN logic
     # to guarantee the tight sample bounds [1325, 2000]
     if alpha < 0:

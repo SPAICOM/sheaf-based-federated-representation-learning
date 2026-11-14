@@ -521,7 +521,8 @@ class HeteroClassificationDataModule(ClassificationDataModule):
 
     def _swap_labels(self, rows, label_key: str, client_idx: int):
         """Swap the labels of a random fraction of the rows of two classes
-        (one_way: relabel a random fraction of the class-a rows as b)."""
+        (one_way: relabel a random fraction of the class-a rows as b).
+        """
         (a, b), frac, direction = self.agent_label_noise[client_idx]
         labels = [int(y) for y in rows[label_key]]
         src = (a,) if direction == 'one_way' else (a, b)

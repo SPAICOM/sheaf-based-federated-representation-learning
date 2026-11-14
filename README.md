@@ -52,7 +52,8 @@ wandb remote, so they can be rebuilt on any machine.
 
 | Study | Config | Train | Result |
 |---|---|---|---|
-| Accuracy vs bottleneck dimension (2 CIFAR-10 agents) | `cifar10_2agents_bottleneck` | `just bottleneck` | `just plot-bottleneck` |
+| Accuracy vs bottleneck dimension (2 FEMNIST agents) | `femnist_2agents_bottleneck` | `just bottleneck-pipeline femnist` | `just plot-bottleneck femnist` |
+| Accuracy vs bottleneck dimension (2 CIFAR-10 agents) | `cifar10_2agents_bottleneck` | `just bottleneck-pipeline cifar10` | `just plot-bottleneck cifar10` |
 | Heterogeneity table, MNIST | `mnist_4agents_shift` | `just hetero mnist` | `just table-hetero` |
 | Heterogeneity table, FashionMNIST | `fashionmnist_4agents_shift` | `just hetero fashionmnist` | `just table-hetero` |
 | Heterogeneity table, FEMNIST | `femnist_4agents_shift` | `just hetero femnist` | `just table-hetero` |
@@ -128,7 +129,8 @@ just rescore-class-scope cifar10_4agents_full 3mgkbida # older runs: recompute f
 ```
 
 `just table-hetero` also writes `hetero_table_scope.{md,tex}`, and
-`just plot-bottleneck` has a third panel for the receiver-only classes.
+`just plot-bottleneck <dataset>` also draws `bottleneck_rx_scope` (communication accuracy on
+the classes the receiver trained on, and on those only the receiver trained on).
 
 ### Retained results
 

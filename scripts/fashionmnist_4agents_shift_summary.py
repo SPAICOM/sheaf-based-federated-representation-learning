@@ -46,7 +46,8 @@ OUT_DIR = ROOT / 'results/fashionmnist_4agents_shift'
 
 def _config_value(config: dict, key: str):
     """Dotted-key lookup into a wandb config, whatever way Hydra's dict was
-    flattened ('a.b.c', 'a/b/c', or nested)."""
+    flattened ('a.b.c', 'a/b/c', or nested).
+    """
     for k in (key, key.replace('.', '/')):
         if k in config:
             return config[k]
@@ -103,7 +104,8 @@ def _mean_std(s: pd.Series) -> str:
 
 def build_main_table(df: pd.DataFrame) -> pd.DataFrame:
     """Rows: pilot budget. Columns: method. Cells: mean+-std over seeds of
-    avg_private / avg_comm, plus the DiSheafFRL - non-coop comm gap and n."""
+    avg_private / avg_comm, plus the DiSheafFRL - non-coop comm gap and n.
+    """
     rows = []
     for pilots in PILOTS:
         row = {'pilots': pilots}

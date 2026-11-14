@@ -133,7 +133,7 @@ class TestDeepSenseDataModule:
         assert (tmp_path / f'scenario{SCENARIO}.csv').exists()
 
     def test_prepare_data_skips_download_if_zip_exists(self, tmp_path):
-        """gdown is not called when the zip is already on disk."""
+        """Gdown is not called when the zip is already on disk."""
         import zipfile as zf_mod
 
         zip_path = tmp_path / f'scenario{SCENARIO}.zip'

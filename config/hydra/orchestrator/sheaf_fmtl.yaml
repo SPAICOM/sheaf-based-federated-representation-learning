@@ -4,7 +4,9 @@ _target_: src.orchestrators.sheaf_fmtl.SheafFMTL
 # none | union | intersection
 align_class_filter: none
 
-gamma: 0.01
+# compression of P_ij (d_ij = gamma * min param count): RAM grows ~gamma * d^2, so the
+# experiment config sets sheaf_fmtl_gamma (just sheaf-fmtl-memory <config>)
+gamma: ${oc.select:sheaf_fmtl_gamma,0.01}
 max_lmb: 1e-02
 lambda_schedule: null
 eta: 0.01

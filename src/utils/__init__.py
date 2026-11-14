@@ -39,6 +39,7 @@ from .logging import (
     _sanitize_instantiation_config,
     _update_logger_config,
 )
+from .sheaf_laplacian import min_eigenvalue, sheaf_laplacian, total_variation
 
 __all__ = [
     'ClassScopeAccuracy',
@@ -56,6 +57,9 @@ __all__ = [
     'partition_non_iid_with_margin',
     'remove_non_empty_dir',
     'shared_anchor_rows',
+    'sheaf_laplacian',
+    'total_variation',
+    'min_eigenvalue',
     #'supported_anchor_strategy',
     '_extract_objective_metric',
     '_filter_supported_init_kwargs',

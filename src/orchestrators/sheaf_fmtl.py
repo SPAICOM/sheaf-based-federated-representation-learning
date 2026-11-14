@@ -401,7 +401,7 @@ class SheafFMTL(PostTrainingAlignmentMixin, BaseOrchestrator):
         agent_performances = {}
 
         for idx, agent in self.agents.items():
-            y_hat, y = outputs[idx]
+            y_hat, y, *_ = outputs[idx]  # outputs may also carry an eval mask
 
             loss = agent.compute_loss(y_hat, y)
             performance = agent.task_performance(y_hat, y)

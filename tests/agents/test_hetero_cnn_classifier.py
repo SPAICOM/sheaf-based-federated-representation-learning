@@ -28,7 +28,8 @@ class TestHeteroCNNClassifier:
 
     def test_default_encoder_hidden_dims(self):
         """Default encoder uses [32, 64, 128];
-        Rate is 0.5, out_features is 64."""
+        Rate is 0.5, out_features is 64.
+        """
         agent = self._make()
         assert agent.encoder.out_features == 64
 

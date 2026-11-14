@@ -103,6 +103,9 @@ orchestrator:
   anchor_selection: all
   align_on_intersection: false
   log_latent_diagnostics: true
+  # train-time comm curve (monitoring only: re-encodes the test split + pilots and refits
+  # the maps, ~58 s/epoch on FEMNIST's 36k test pool); always also on the last epoch
+  train_comm_eval_every_n_epochs: 10
   pid_logging: false
 
 optimization:

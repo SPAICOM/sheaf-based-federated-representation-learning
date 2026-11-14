@@ -14,14 +14,16 @@ defaults:
 logger:
   project: cifar10_4agents_full
 
+sheaf_fmtl_gamma: 1e-3   # SheafFMTL compression, largest that fits RAM: d_ij 154, measured peak 6.9 GB/run
+
 tuned_lmb:   # SheafFRL / DiSheafFRL: best of the phase-1 grid, confirmed on 3 seeds (STATUS)
   non_cooperative: 0.0
   sheaf_frl: 3e-2
   di_sheaf_frl: 1.2e-1
-  comfed: 1.18e-3
+  comfed: 0.03
   sheaf_fmtl: 0.01
   fedproto: 0.1
-  fedmuscle: 0.1
+  fedmuscle: 1
   fedre: 0.0
 
 lmb_tuning:

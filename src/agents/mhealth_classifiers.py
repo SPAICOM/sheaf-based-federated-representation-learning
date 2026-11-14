@@ -98,6 +98,7 @@ class MHealthGyroscopeClassifier(PersonalizedClassifier):
         L2 regularization strength (default: 0.0).
     l1_reg : float, optional
         L1 regularization strength (default: 0.0) for embedding sparsification.
+
     Notes
     -----
     Expects inputs of shape ``(B, 3)`` (point-wise) or ``(B, T, 3)`` (windowed).

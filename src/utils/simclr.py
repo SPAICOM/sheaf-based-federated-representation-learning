@@ -93,7 +93,8 @@ def frozen_running_stats(module: nn.Module):
     (BatchNorm and CenterNorm), so augmented SimCLR views do not shift the
     statistics the encoder is evaluated with. Momentum 0 rather than restoring
     copies: a ``copy_`` would bump the buffers' version counter and break any
-    graph that saved them (eval-mode BN on the pilots)."""
+    graph that saved them (eval-mode BN on the pilots).
+    """
     mods = [m for m in module.modules()
             if m.training and hasattr(m, 'running_mean') and hasattr(m, 'momentum')]
     saved = [m.momentum for m in mods]

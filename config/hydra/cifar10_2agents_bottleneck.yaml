@@ -3,6 +3,7 @@
 # Two different ResNets whose latent widths are d and d/2; the pair is picked
 # with the bottleneck group: d8 (8/4), d16 (16/8), ..., d256 (256/128).
 # 1024 shared pilots over all classes.
+# `just bottleneck-pipeline cifar10` trains every method x d x seed at tuned_lmb.
 defaults:
   - paper_base
   - bottleneck: d64
@@ -13,15 +14,18 @@ defaults:
 logger:
   project: cifar10_2agents_bottleneck
 
-tuned_lmb:   # SheafFRL family: lambda of the grayscale/blur bottleneck study
+tuned_lmb:   # best lambda of the cifar10_4agents_full pipeline (seed-42 grid, K4 graph)
   non_cooperative: 0.0
-  sheaf_frl: 1e-2
-  di_sheaf_frl: 1e-2
-  comfed: 1.18e-3
+  sheaf_frl: 3e-2
+  di_sheaf_frl: 1.2e-1
+  comfed: 0.03
   sheaf_fmtl: 0.01
   fedproto: 0.1
-  fedmuscle: 0.1
+  fedmuscle: 1
   fedre: 0.0
+
+lmb_tuning:
+  fixed: [sheaf_frl, di_sheaf_frl, comfed, sheaf_fmtl, fedproto, fedmuscle]
 
 dataset:
   n_agents: 2
