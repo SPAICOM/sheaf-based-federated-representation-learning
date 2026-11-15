@@ -1,7 +1,8 @@
 # CIFAR-10, 2 agents, label shift 1.0: performance vs bottleneck dimension.
 # Agent 0 trains on classes 0-6, agent 1 on 3-9 (clean images, private cap 0.7).
 # Two different ResNets whose latent widths are d and d/2; the pair is picked
-# with the bottleneck group: d8 (8/4), d16 (16/8), ..., d256 (256/128).
+# with the bottleneck group: d8 (8/4), d16 (16/8), d32 (32/16), d64 (64/32)
+# (d128 / d256 exist but are not swept: d <= 64 is enough).
 # 1024 shared pilots over all classes.
 # `just bottleneck-pipeline cifar10` trains every method x d x seed at tuned_lmb.
 defaults:
@@ -38,5 +39,5 @@ hydra:
   sweeper:
     params:
       orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
-      bottleneck: d8,d16,d32,d64,d128,d256
+      bottleneck: d8,d16,d32,d64
       seed: 42,43,44

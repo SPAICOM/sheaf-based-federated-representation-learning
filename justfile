@@ -65,7 +65,7 @@ hetero-pipeline dataset *args="":
 #   just bottleneck-pipeline femnist [non_cooperative,fedre] [--jobs N, default 1] [--dry-run]
 # Accuracy vs bottleneck dimension (femnist | cifar10), 2 agents with latent d / d/2, every method at its tuned_lmb
 # (the 4-agent pipeline's pick, no tuning): <dataset>_2agents_bottleneck, method x d x seed, first seed of every d first. Resumes from wandb.
-# Paper run: just launch femnist_bneck_pipeline 126 "just bottleneck-pipeline femnist non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre --jobs 4"
+# Paper run: just launch femnist_bneck_pipeline 126 "just bottleneck-pipeline femnist non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre --jobs 4" (SheafFMTL: just bottleneck-pipeline femnist sheaf_fmtl)
 bottleneck-pipeline dataset *args="":
     uv run python scripts/tune_and_run.py {{dataset}} --study bottleneck {{args}}
 
