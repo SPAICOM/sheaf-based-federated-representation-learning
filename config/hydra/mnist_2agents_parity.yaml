@@ -1,0 +1,96 @@
+# Task heterogeneity on MNIST: same images, different label granularity.
+#   agent 0: CNN, d=40, the 10 digit classes
+#   agent 1: CNN, d=8 (ratio 5), even vs odd (label map y -> y % 2)
+# Both latents go through CenterNorm, (z - mean) / ||z - mean||, and nothing is
+# whitened, as in the CIFAR-10 CenterNorm studies.
+#
+# Data (overlapping_shift, shift 0): each agent draws its training rows uniformly
+# from the official train split; the draws overlap. The pilots are
+# pilot_num_samples rows of the same split, excluded from both agents' training
+# rows and unlabelled for every method. Test = the full official test split, the
+# same 10k rows for both agents, with the true 10-class labels.
+#
+# Agent 1 keeps 10 outputs and only targets 0/1 are trained. Its logged
+# private/comm numbers use the 10-class labels and are NOT meaningful; use
+# scripts/mnist_parity_knn.py, which scores parity and the k-NN probe.
+#
+# Orchestrators: non_cooperative (default; post-hoc Procrustes on the pilots at
+# test time) | di_sheaf_frl.
+defaults:
+  - dataset: hetero_mnist
+  - model: cnn_classifier
+  - orchestrator: non_cooperative
+  - optimizer: sgd
+  - _self_
+
+seed: 42
+study_name: "MNIST 2 agents, 10 classes vs even/odd"
+
+graph:
+  neighbors_mode: "fully_connected"   # 2 agents -> 1 edge
+
+logger:
+  _target_: lightning.pytorch.loggers.WandbLogger
+  project: mnist_2agents_parity
+  group: ${study_name}
+  save_dir: logs/
+  log_model: false
+
+optimizer:
+  lr: 1e-2
+
+trainer:
+  max_epochs: 20
+  accelerator: auto
+  devices: 1
+  deterministic: true
+  num_sanity_val_steps: 0
+  log_every_n_steps: 25
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: norm
+  enable_checkpointing: false
+
+dataset:
+  split_strategy: overlapping_shift
+  n_agents: 2
+  shift_strength: 0.0
+  test_source: original
+  pilot_source: pool
+  pilot_exclusive: true      # pilots are never a training image of either agent
+  pilot_class_filter: false  # every agent gets every pilot
+  pilot_num_samples: 512
+  pilot_batch_size: 128
+  pilot_split: 0.0
+  agent_train_samples: 20000
+  val_split: 0.0
+  monitor_test_during_fit: false
+  batch_size: 64
+  num_workers: 0
+  mode: min_size
+  comm_data: shared_global_pilots
+  groups:       # target classes are irrelevant at shift 0
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    1: {agents: [1], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+  agent_label_map:
+    1: [0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
+
+model:
+  latent_norm: true
+  agents:
+    0:   # 28 -> 14 -> 7 -> 3 -> 1, d=40
+      encoder_hidden_dims: [32, 64, 128, 40]
+      decoder_hidden_dims: [256]
+    1:   # 28 -> 14 -> 7 -> 3, d=8
+      encoder_hidden_dims: [32, 64, 8]
+      decoder_hidden_dims: [120]
+
+orchestrator:
+  pid_logging: false
+  log_latent_diagnostics: false
+  train_comm_eval_every_n_epochs: 1000   # test-split monitoring only on the last epoch
+  alignment_method: procrustes
+  posthoc_whitening: false   # post-hoc map fitted on the raw (CenterNorm) latents
+  whitening: false           # di_sheaf_frl: penalty and maps on the raw latents
+  max_lmb: 4e-3              # di_sheaf_frl penalty weight (ignored by non_cooperative)
+  learn_lmb: false
+  comm_task_coeff: 0
