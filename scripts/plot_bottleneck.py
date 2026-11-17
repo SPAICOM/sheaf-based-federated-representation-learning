@@ -16,7 +16,8 @@ its own projections and logs no scopes in training: its scoped accuracies come
 from the re-scoring cache results/<project>/rescore/<run_id>.json, which
 ``just plot-bottleneck`` fills first (``just rescore-hetero <project> --groups comfed``).
 
-Writes everything plus the table bottleneck.md to results/<project>/.
+Only the latent dims the config still sweeps are plotted. Writes everything plus the
+table bottleneck.md to results/<project>/.
 
     uv run python scripts/plot_bottleneck.py femnist
 """
@@ -29,6 +30,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import wandb
+from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -87,6 +89,15 @@ def scoped(summary, cache: Path) -> dict[str, float]:
     return {'comm_rx_seen': float('nan'), 'comm_rx_only': float('nan')}
 
 
+def swept_dims(project: str) -> set[int]:
+    """Latent dims d the experiment config sweeps (its bottleneck axis, e.g. d8,d16,d32,d64)."""
+    params = OmegaConf.load(
+        ROOT / 'config' / 'hydra' / f'{project}.yaml'
+    ).hydra.sweeper.params
+    axis = next(k for k in params if k not in ('orchestrator', 'seed'))
+    return {int(v.lstrip('d')) for v in str(params[axis]).split(',')}
+
+
 def load_runs(project: str) -> pd.DataFrame:
     """One row per finished run: method, d, seed, accuracies in %."""
     api = wandb.Api()
@@ -126,6 +137,9 @@ def load_runs(project: str) -> pd.DataFrame:
     if not rows:
         raise SystemExit(f'no finished runs with a method group in {project}')
     runs = pd.DataFrame(rows)
+    runs = runs[
+        runs['d'].isin(swept_dims(project))
+    ]  # runs at dims dropped from the sweep
     # a re-run of the same cell replaces the older one
     return runs.sort_values('created').drop_duplicates(
         ['method', 'd', 'seed'], keep='last'
