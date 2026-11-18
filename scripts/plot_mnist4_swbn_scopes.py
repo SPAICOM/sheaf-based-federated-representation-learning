@@ -4,6 +4,7 @@ Scopes (pooled over the 12 directed edges within a seed):
   Comm                               - all test samples
   Comm sender unseen / receiver seen - class outside the sender's target classes, inside the receiver's
   Comm receiver seen                 - class inside the receiver's target classes
+  Comm sender seen / receiver seen   - class inside both target sets (shared classes; *_shared figures)
 Each method is rescored offline from its final checkpoint under the evaluation it reported remotely
 (posthoc Procrustes for non-coop / CenterNorm / ZCA, learned SWBN + saved Stiefel maps for SWBN) and the
 overall Comm is asserted against the remote test metric. SWBN is also scored posthoc as a like-for-like
@@ -17,10 +18,10 @@ No W&B writes. Resumable: (method, run) rows already in per_run.csv are skipped.
 Promoted from tmp/2026-11-12_mnist4_swbn_scopes.py; writes results/mnist_4agents_shift/swbn_scopes/.
 per_run.csv / summary.csv / table.md keep every method; the figure shows the methods listed in FIGURES.
 --plot-only redraws the figure from the retained summary.csv (no checkpoints / W&B needed):
-results/mnist_4agents_shift/maps/pilot_study.* with the standard panels (a) Private accuracy (target classes),
+results/mnist_4agents_shift/maps/pilot_study.* with the standard panels (a) Private accuracy on C_i,
 (b) Sender unseen, receiver seen, (c) Receiver seen (non-coop, CenterNorm, ZCA, CenterNorm + OLS, SWBN).
 --study lambda: same scoring on the 4096-pilot lambda study (lambda .003..1; non-coop, CenterNorm, ZCA,
-CenterNorm + OLS saved maps, i.e. the lines of the former maps/lambda_study figure); tables in
+CenterNorm + OLS saved maps, SWBN; the lines of the lambda_study figure); tables in
 results/mnist_4agents_shift/maps/lambda_scopes/, figure results/mnist_4agents_shift/maps/lambda_study.*
 (Private / sender unseen-receiver seen / receiver seen; non-coop is lambda-free, drawn flat).
 Usage: uv run python scripts/plot_mnist4_swbn_scopes.py [--study lambda] [--plot-only] [--methods ...] [--allow-partial]
@@ -39,6 +40,7 @@ import matplotlib
 
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 from omegaconf import OmegaConf
@@ -64,6 +66,9 @@ PILOTS = (384, 768, 1536, 2048, 4096)
 LAMBDAS = (0.003, 0.01, 0.03, 0.1, 0.3, 1.0)
 SEEDS = [42, 43, 44]
 SCOPES = ['Comm', 'Comm sender unseen / receiver seen', 'Comm receiver seen']
+# Class inside both the sender's and the receiver's target classes (C_i ∩ C_j); the "_shared" figures.
+SHARED = 'Comm sender seen / receiver seen'
+ALL_SCOPES = [*SCOPES, SHARED]
 # method -> (project, group(pilots), eval mode used for the remote metric)
 METHODS = {
     'Non-coop': ('mnist_4agents_shift', None, 'posthoc'),
@@ -120,6 +125,12 @@ LAMBDA_METHODS = {
         [f'ols_p4096_l{w:g}'.replace('l0.', 'l.') for w in LAMBDAS],
         'saved',
     ),
+    # learnable SWBN, scored through its learned SWBN + saved Stiefel maps (and posthoc, as in the pilot study)
+    'DiSheafFRL + SWBN': (
+        'mnist_4agents_mapstudy_swbn',
+        [f'swbn_p4096_l{w:g}'.replace('l0.', 'l.') for w in LAMBDAS],
+        'learned',
+    ),
 }
 # Colours of scripts/plot_mnist4_maps.py; SWBN posthoc is the extra reference here.
 COLORS = {
@@ -144,9 +155,17 @@ PRIV_SEEN = 'Private target classes'
 # Figures: file stem -> (methods, panel scopes, panel titles, line style per method).
 _V2_SCOPES = [PRIV_SEEN, *SCOPES[1:]]
 _V2_TITLES = [
-    '(a) Private accuracy (target classes)',
-    '(b) Sender unseen, receiver seen',
-    '(c) Receiver seen',
+    r'(a) Private accuracy on $\mathcal{C}_i$',
+    r'(b) Comm. accuracy on $\mathcal{C}_j\setminus\mathcal{C}_i$',
+    r'(c) Comm. accuracy on $\mathcal{C}_j$',
+]
+# Second version, i = receiver, j = sender: (a) Comm on C_i \ C_j, (b) Comm on C_i ∩ C_j, (c) private on C_i
+# (needs the SHARED rescore).
+_SHARED_SCOPES = [SCOPES[1], SHARED, PRIV_SEEN]
+_SHARED_TITLES = [
+    r'(a) Comm. accuracy on $\mathcal{C}_i\setminus\mathcal{C}_j$',
+    r'(b) Comm. accuracy on $\mathcal{C}_i\cap\mathcal{C}_j$',
+    r'(c) Private accuracy on $\mathcal{C}_i$',
 ]
 
 
@@ -170,12 +189,42 @@ FIGURES = {
             _V2_TITLES,
             _v2_style,
         ),
+        '../maps/pilot_study_shared': (
+            [
+                'Non-coop',
+                'DiSheafFRL + CenterNorm',
+                'DiSheafFRL + ZCA',
+                'DiSheafFRL + CenterNorm + OLS',
+                'DiSheafFRL + SWBN (posthoc)',
+            ],
+            _SHARED_SCOPES,
+            _SHARED_TITLES,
+            _v2_style,
+        ),
     },
     'lambda': {
         '../lambda_study': (
-            list(LAMBDA_METHODS),
+            [
+                'Non-coop',
+                'DiSheafFRL + CenterNorm',
+                'DiSheafFRL + ZCA',
+                'DiSheafFRL + CenterNorm + OLS',
+                'DiSheafFRL + SWBN (posthoc)',
+            ],
             _V2_SCOPES,
             _V2_TITLES,
+            _v2_style,
+        ),
+        '../lambda_study_shared': (
+            [
+                'Non-coop',
+                'DiSheafFRL + CenterNorm',
+                'DiSheafFRL + ZCA',
+                'DiSheafFRL + CenterNorm + OLS',
+                'DiSheafFRL + SWBN (posthoc)',
+            ],
+            _SHARED_SCOPES,
+            _SHARED_TITLES,
             _v2_style,
         ),
     },
@@ -200,6 +249,11 @@ parser.add_argument(
 parser.add_argument(
     '--out',
     help='default: swbn_scopes/ (pilots) or maps/lambda_scopes/ (lambda)',
+)
+parser.add_argument(
+    '--shard',
+    type=lambda v: tuple(map(int, v.split('/'))),
+    help='K/N: rescore only slice K of N of the missing SHARED rows (run N processes, then one unsharded run)',
 )
 parser.add_argument(
     '--plot-only',
@@ -353,7 +407,7 @@ def scope_counts(orch, dm, cfg, neighbors):
         i: torch.tensor(list(cfg.dataset.groups[str(i)].target_classes))
         for i in range(4)
     }
-    counts = {k: [0, 0] for k in SCOPES}
+    counts = {k: [0, 0] for k in ALL_SCOPES}
     priv = [0, 0]
     with torch.no_grad():
         for sender in range(4):
@@ -377,6 +431,7 @@ def scope_counts(orch, dm, cfg, neighbors):
                     ('Comm', torch.ones_like(ss)),
                     (SCOPES[1], ~ss & rs),
                     (SCOPES[2], rs),
+                    (SHARED, ss & rs),
                 ]:
                     counts[key][0] += int(((pred == y) & mask).sum())
                     counts[key][1] += int(mask.sum())
@@ -448,6 +503,53 @@ def fill_private_seen(frame):
         print('PRIVATE SEEN', rid, f'{priv:.4f} -> {seen:.4f}', flush=True)
         del orch
         torch.cuda.empty_cache()
+    return frame
+
+
+def fill_shared(frame):
+    """Add SHARED to rows that lack it: merge the shard files, then rescore what is still missing.
+
+    Rescoring runs score() (modes and asserts as in the original scoring). With --shard K/N only the
+    K-th of N slices of the missing (method, run) groups is rescored and written to
+    <out>/shared_shard<K>of<N>.csv (merged and deleted by the next unsharded run).
+    """
+    if SHARED not in frame:
+        frame[SHARED] = float('nan')
+    shard_files = sorted(OUT.glob('shared_shard*.csv'))
+    for f in shard_files:
+        part = pd.read_csv(f).set_index(['run', 'method'])[SHARED]
+        key = pd.MultiIndex.from_frame(frame[['run', 'method']])
+        known = pd.Series(part.reindex(key).values, index=frame.index)
+        frame[SHARED] = frame[SHARED].fillna(known)
+    todo = frame[frame[SHARED].isna()]
+    base = todo.method.where(
+        todo.method.isin(list(METHODS)), 'DiSheafFRL + SWBN'
+    )
+    groups = sorted(todo.groupby([base, todo.run]).groups.items())
+    if args.shard:
+        groups = groups[args.shard[0] :: args.shard[1]]
+    done = []
+    for (method, rid), idx in groups:
+        project = frame.loc[idx[0], 'project']
+        r = api.run(f'{entity}/{project}/{rid}')
+        for row in score(method, project, r):
+            sel = (frame.run == rid) & (frame.method == row['method'])
+            assert sel.sum() == 1, (rid, row['method'], sel.sum())
+            frame.loc[sel, SHARED] = row[SHARED]
+            done.append(
+                {'run': rid, 'method': row['method'], SHARED: row[SHARED]}
+            )
+        print('SHARED', method, rid, flush=True)
+        torch.cuda.empty_cache()
+    if args.shard:
+        k, n = args.shard
+        pd.DataFrame(done).to_csv(
+            OUT / f'shared_shard{k}of{n}.csv', index=False
+        )
+        sys.exit(0)
+    assert frame[SHARED].notna().all()
+    for f in shard_files:
+        f.unlink()
     return frame
 
 
@@ -540,7 +642,8 @@ def plot(summary):
                 ax.errorbar(
                     d[X],
                     d['mean'],
-                    yerr=d.sd,
+                    # Accuracies cannot exceed 100%: clip the upper whisker there.
+                    yerr=np.stack([d.sd, np.minimum(d.sd, 100 - d['mean'])]),
                     marker='o',
                     capsize=2,
                     color=COLORS[m],
@@ -562,9 +665,7 @@ def plot(summary):
                 title=title,
             )
             ax.grid(axis='y', alpha=0.3, linewidth=0.5)
-        axes[0].set_ylabel(
-            'Comm. accuracy (%)' if scopes[0] == 'Comm' else 'Accuracy (%)'
-        )
+        axes[0].set_ylabel('Accuracy (%)')
         handles, labels = axes[0].get_legend_handles_labels()
         fig.legend(
             handles,
@@ -617,6 +718,7 @@ for method in args.methods:
         print('VERIFIED', method, p, r.config['seed'], r.id, flush=True)
         torch.cuda.empty_cache()
 frame = fill_private_seen(frame)
+frame = fill_shared(frame)
 frame.to_csv(per_run, index=False)
 if args.allow_partial:
     print(frame.groupby(['method', X], dropna=False).size())
@@ -628,7 +730,7 @@ frame = frame[
 summary = []
 for (method, p), g in frame.groupby(['method', X], dropna=False):
     assert sorted(g.seed) == SEEDS, (method, p, sorted(g.seed))
-    for scope in ['Private', PRIV_SEEN, *SCOPES]:
+    for scope in ['Private', PRIV_SEEN, *ALL_SCOPES]:
         v = g[scope] * 100
         summary.append(
             {
@@ -667,13 +769,7 @@ lines = [
     f'{"pilot" if X == "pilots" else "lambda"}_summary.csv), seen scopes rescored from the checkpoints.',
     '',
 ]
-if X == 'lambda':  # no SWBN / learned CenterNorm in the lambda study
-    lines[1] = (
-        'Scopes pool the 12 directed edges within a seed. Eval: posthoc Procrustes for non-coop / CenterNorm / '
-        'ZCA (as reported remotely).'
-    )
-    lines[2] = lines[2][lines[2].index('CenterNorm + OLS') :]
-for scope in ['Private', PRIV_SEEN, *SCOPES]:
+for scope in ['Private', PRIV_SEEN, *ALL_SCOPES]:
     lines += [
         f'### {scope}',
         '',

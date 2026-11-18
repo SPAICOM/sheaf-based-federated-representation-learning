@@ -140,6 +140,10 @@ mnist-lambda-summary:
 mnist-maps-summary:
     uv run python scripts/plot_mnist4_maps.py
 
+# FashionMNIST heterogeneity table (final seeds + lambda grid, incl. non-coop) -> results/fashionmnist_4agents_shift/.
+fmnist-hetero-summary:
+    uv run python scripts/plot_fashionmnist_hetero.py
+
 # FashionMNIST pilot sweep, non-coop vs DiSheafFRL (retained runs)
 fmnist-pilots-summary *args="":
     uv run python scripts/fashionmnist_4agents_shift_summary.py {{args}}
@@ -237,6 +241,14 @@ mnist4-swbn-scopes-summary *args="--plot-only":
 mnist4-lambda-scopes-summary *args="--plot-only":
     uv run python scripts/plot_mnist4_swbn_scopes.py --study lambda {{args}}
 
+# Anchor-selection ablation (original vs k-means vs stratified): score runs by class scope (GPU, offline, no wandb writes; resumable)
+mnist4-anchors-score *args="":
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" OMP_NUM_THREADS=4 uv run python scripts/score_mnist4_anchors.py {{args}}
+
+# Anchor-selection ablation tables + figures (results/mnist_4agents_shift/anchors) from the cached scores
+mnist4-anchors-summary:
+    uv run python scripts/plot_mnist4_anchors.py
+
 # Queued MNIST4 pilot-BN-update .
 mnist4-bn-update:
     just launch mnist4_bn_update 3 "bash tmp/2026-11-10_mnist4_bn_update.sh"
@@ -261,6 +273,10 @@ mnist4-topology:
 mnist4-topology-report *args="":
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}" uv run python tmp/2026-11-12_mnist4_topology_report.py {{args}}
 
+# Anchor-selection ablation (proto_kmeans / stratified x K=128..1536 x 3 seeds, DiSheafFRL + non-coop p128 + non-coop rescore); launcher tmp/2026-11-16_mnist4_anchors.sh.
+mnist4-anchors:
+    just launch mnist4_anchors 27 "bash tmp/2026-11-16_mnist4_anchors.sh"
+
 # SWBN-vs-ZCA pilot ablation (15 runs: 5 pilot counts x 3 seeds, learned eval); launcher tmp/2026-11-12_mnist4_swbn.sh.
 mnist4-swbn:
     just launch mnist4_swbn 15 "bash tmp/2026-11-12_mnist4_swbn.sh"
@@ -272,3 +288,15 @@ mnist4-method-scopes *args="":
 # SWBN lambda ablation (15 runs: lambda .003/.03/.1/.3/1 x 3 seeds at 4096 pilots; .01 reused); launcher tmp/2026-11-14_mnist4_swbn_lambda.sh.
 mnist4-swbn-lambda:
     just launch mnist4_swbn_lambda 15 "bash tmp/2026-11-14_mnist4_swbn_lambda.sh"
+
+# MNIST parity study (10 classes vs even/odd): train noncoop + DiSheafFRL, 10-class k-NN probe -> wandb project mnist_2agents_parity_d40x8, latent cache + plot in results/mnist_2agents_parity_d40x8/. E.g. just mnist-parity --seeds 42 43 44 --lmb 1e-3 4e-3 1e-2 3e-2 (see scripts/mnist_parity_knn.md).
+mnist-parity *args="":
+    uv run python scripts/mnist_parity_knn.py {{args}}
+
+# MNIST parity study smoke run: wandb disabled, 1 epoch, small data, CPU, output in tmp/ (no results/ clutter).
+mnist-parity-smoke *args="":
+    WANDB_MODE=disabled uv run python scripts/mnist_parity_knn.py --epochs 1 --pilots 128 --train-samples 2000 --accelerator cpu --out tmp/mnist_parity_smoke {{args}}
+
+# MNIST parity study: within-parity and few-label k-NN probes on the cached latents (no training, no wandb). Pass --out tmp/mnist_parity_smoke after a smoke run.
+mnist-parity-probes *args="":
+    uv run python scripts/mnist_parity_probes.py {{args}}

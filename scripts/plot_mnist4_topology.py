@@ -46,6 +46,7 @@ FULLY_CONNECTED = {  # mnist_4agents_shift, 4096 pilots, lambda .01, bs256 (LEDG
     'DiSheafFRL': ['cndm7lcm', '7x9j9uyl', '7zvxszuc'],
 }
 PRIVATE = 'Private'  # private test accuracy on all 10 classes (W&B test/avg_private_task_perf)
+SHARED = 'Comm sender seen / receiver seen'  # class in both target sets, C_i ∩ C_j (the *_shared figure)
 PRIV_SEEN = 'Private target classes'  # private accuracy on the agent's own target classes (figure panel a)
 TABLE_SCOPES = {
     PRIVATE: 'Private accuracy (all classes)',
@@ -53,11 +54,13 @@ TABLE_SCOPES = {
     'Comm': 'Communication, all classes',
     'Comm sender unseen / receiver seen': 'Sender unseen / receiver seen',
     'Comm receiver seen': 'Receiver seen (its target classes)',
+    SHARED: 'Sender seen / receiver seen (shared classes)',
 }
 SCOPES = {
     'Comm': 'Communication, all classes',
     'Comm sender unseen / receiver seen': 'Sender unseen / receiver seen',
     'Comm receiver seen': 'Receiver seen (its target classes)',
+    SHARED: 'Sender seen / receiver seen (shared classes)',
 }
 TOPOLOGIES = {
     'star': 'Star',
@@ -179,6 +182,7 @@ def score(project, r, method):
                     ('Comm', torch.ones_like(ss)),
                     ('Comm sender unseen / receiver seen', ~ss & rs),
                     ('Comm receiver seen', rs),
+                    (SHARED, ss & rs),
                 ]:
                     counts[key, receiver][0] += int(((pred == y) & mask).sum())
                     counts[key, receiver][1] += int(mask.sum())
@@ -265,7 +269,26 @@ def fill_private_seen(frame):
     return frame
 
 
-def plot_gap(frame, order):
+def fill_shared(frame):
+    """Add SHARED to rows that lack it by rescoring their checkpoints (score() re-asserts every metric)."""
+    if SHARED in frame:
+        return frame
+    project = {t: f'mnist_4agents_shift_{t}' for t in TOPOLOGIES}
+    project['fully_connected'] = 'mnist_4agents_shift'
+    frame = frame.copy()
+    values = []
+    for r0 in frame.itertuples():
+        r = api.run(f'{entity}/{project[r0.topology]}/{r0.run}')
+        vals = score(project[r0.topology], r, r0.method)
+        assert abs(vals['Comm'] - r0.Comm) < 1e-9, (r0.run, vals['Comm'])
+        values.append(vals[SHARED])
+        print('SHARED', r0.topology, r0.method, r0.run, flush=True)
+        torch.cuda.empty_cache()
+    frame[SHARED] = values
+    return frame
+
+
+def plot_gap(frame, order, shared=False):
     """Paper figure: DiSheafFRL - Non-coop per seed (paired), mean ± sample SD, one panel per scope."""
     use_style()
     plt.rcParams.update(
@@ -285,13 +308,24 @@ def plot_gap(frame, order):
     short = {'star': 'Star', 'ring': 'Ring', 'fully_connected': 'Full'}
     # Same panels and titles as the lambda / pilot figures (the all-classes scope stays in the tables).
     panels = [
-        (PRIV_SEEN, '(a) Private accuracy (target classes)'),
+        (PRIV_SEEN, r'(a) Private accuracy on $\mathcal{C}_i$'),
         (
             'Comm sender unseen / receiver seen',
-            '(b) Sender unseen, receiver seen',
+            r'(b) Comm. gap on $\mathcal{C}_j\setminus\mathcal{C}_i$',
         ),
-        ('Comm receiver seen', '(c) Receiver seen'),
+        ('Comm receiver seen', r'(c) Comm. gap on $\mathcal{C}_j$'),
     ]
+    suffix = ''
+    if shared:  # second version, i = receiver, j = sender: Comm on C_i \ C_j, Comm on C_i ∩ C_j, private on C_i
+        panels = [
+            (
+                'Comm sender unseen / receiver seen',
+                r'(a) Comm. gap on $\mathcal{C}_i\setminus\mathcal{C}_j$',
+            ),
+            (SHARED, r'(b) Comm. gap on $\mathcal{C}_i\cap\mathcal{C}_j$'),
+            (PRIV_SEEN, r'(c) Private gap on $\mathcal{C}_i$'),
+        ]
+        suffix = '_shared'
     wide = frame.pivot_table(
         index=['topology', 'seed'],
         columns='method',
@@ -347,9 +381,11 @@ def plot_gap(frame, order):
     )
     fig.tight_layout(rect=(0, 0, 1, 0.88))
     for ext in ['png', 'pdf']:
-        fig.savefig(OUT / f'topology_gap.{ext}', dpi=300, bbox_inches='tight')
+        fig.savefig(
+            OUT / f'topology_gap{suffix}.{ext}', dpi=300, bbox_inches='tight'
+        )
     plt.close(fig)
-    (OUT / 'gap_table.md').write_text('\n'.join(lines[1:]) + '\n')
+    (OUT / f'gap_table{suffix}.md').write_text('\n'.join(lines[1:]) + '\n')
     print('\n'.join(lines))
 
 
@@ -406,10 +442,13 @@ def write_tables(frame, order):
 
 if args.plot_only:
     order = [t for t in TOPOLOGIES if t in args.topologies]
-    frame = fill_private_seen(fill_private(pd.read_csv(OUT / 'per_run.csv')))
+    frame = fill_shared(
+        fill_private_seen(fill_private(pd.read_csv(OUT / 'per_run.csv')))
+    )
     frame.to_csv(OUT / 'per_run.csv', index=False)
     write_tables(frame, order)
     plot_gap(frame, order)
+    plot_gap(frame, order, shared=True)
     sys.exit(0)
 
 records = []
@@ -431,3 +470,4 @@ frame.to_csv(OUT / 'per_run.csv', index=False)
 order = [t for t in TOPOLOGIES if t in args.topologies]
 write_tables(frame, order)
 plot_gap(frame, order)
+plot_gap(frame, order, shared=True)

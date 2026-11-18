@@ -8,6 +8,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import pandas as pd
+
 import wandb
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,23 +124,23 @@ assert all(
     )
     + '\n'
 )
-# Learnable SWBN whitening instead of CenterNorm (pilot study only, lambda .01),
+# Learnable SWBN whitening instead of CenterNorm: pilot study (lambda .01) and lambda study (4096 pilots),
 # scored through the learned SWBN + saved Stiefel maps (eval_alignment=learned).
+SWBN_GROUPS = [f'swbn_p{p}_l.01' for p in (384, 768, 1536, 2048, 4096)] + [
+    f'swbn_p4096_l{w:g}'.replace('l0.', 'l.')
+    for w in (0.003, 0.03, 0.1, 0.3, 1)
+]
 swbn_runs = [
     api.run(f'{api.default_entity}/mnist_4agents_mapstudy_swbn/{r.id}')
     for r in api.runs(
         f'{api.default_entity}/mnist_4agents_mapstudy_swbn',
-        filters={
-            'group': {
-                '$in': [
-                    f'swbn_p{p}_l.01' for p in (384, 768, 1536, 2048, 4096)
-                ]
-            }
-        },
+        filters={'group': {'$in': SWBN_GROUPS}},
     )
     if r.state == 'finished'  # a first, stopped launch left killed entries
 ]
-assert len(swbn_runs) == 15, len(swbn_runs)
+assert len(swbn_runs) == 30, len(
+    swbn_runs
+)  # 10 (pilots, lambda) points x 3 seeds, 4096/.01 shared
 assert all(
     r.config['orchestrator']['eval_alignment'] == 'learned' for r in swbn_runs
 )
@@ -149,20 +150,25 @@ swbn = pd.DataFrame(
             'run': r.id,
             'seed': r.config['seed'],
             'pilots': r.config['dataset']['pilot_num_samples'],
+            'weight': float(r.config['orchestrator']['max_lmb']),
             'comm': r.summary['test/avg_comm_task_perf'],
             'private': r.summary['test/avg_private_task_perf'],
         }
         for r in swbn_runs
     ]
 )
-assert all(sorted(g.seed) == [42, 43, 44] for _, g in swbn.groupby('pilots'))
+assert all(
+    sorted(g.seed) == [42, 43, 44]
+    for _, g in swbn.groupby(['pilots', 'weight'])
+)
 (OUT / 'swbn_provenance.md').write_text(
-    'Project: mnist_4agents_mapstudy_swbn, groups swbn_p<pilots>_l.01. Learnable '
-    'SWBN whitening (no CenterNorm), lambda 0.01, scored through the learned SWBN '
-    'and saved Stiefel maps (eval_alignment=learned). Three seeds per point.\n\n'
+    'Project: mnist_4agents_mapstudy_swbn, groups swbn_p<pilots>_l<lambda>. Learnable '
+    'SWBN whitening (no CenterNorm), scored through the learned SWBN and saved Stiefel '
+    'maps (eval_alignment=learned). Pilot study: lambda 0.01; lambda study: 4096 pilots; '
+    'three seeds per point.\n\n'
     + '\n'.join(
-        f'- pilots {r.pilots}, seed {r.seed}: {r.run}'
-        for r in swbn.sort_values(['pilots', 'seed']).itertuples()
+        f'- pilots {r.pilots}, lambda {r.weight:g}, seed {r.seed}: {r.run}'
+        for r in swbn.sort_values(['pilots', 'weight', 'seed']).itertuples()
     )
     + '\n'
 )
@@ -206,8 +212,12 @@ for study, directory, x in [
             else learned[learned.weight == 0.01]
         )
         series.append(d.groupby(x)[kind].agg(['mean', 'std']) * 100)
-        if study == 'pilot':
-            series.append(swbn.groupby(x)[kind].agg(['mean', 'std']) * 100)
+        d = (
+            swbn[swbn.pilots == 4096]
+            if study == 'lambda'
+            else swbn[swbn.weight == 0.01]
+        )
+        series.append(d.groupby(x)[kind].agg(['mean', 'std']) * 100)
         values = sorted(set().union(*(set(d.index) for d in series[1:])))
         if study == 'lambda':
             series[0] = pd.DataFrame(
