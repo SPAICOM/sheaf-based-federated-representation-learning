@@ -1,0 +1,32 @@
+Project: mnist_4agents_mapstudy_swbn, groups swbn_p<pilots>_l<lambda>. Learnable SWBN whitening (no CenterNorm), scored through the learned SWBN and saved Stiefel maps (eval_alignment=learned). Pilot study: lambda 0.01; lambda study: 4096 pilots; three seeds per point.
+
+- pilots 384, lambda 0.01, seed 42: 6fvz2uhq
+- pilots 384, lambda 0.01, seed 43: yky7whz2
+- pilots 384, lambda 0.01, seed 44: l2y3q5av
+- pilots 768, lambda 0.01, seed 42: y9ju88dv
+- pilots 768, lambda 0.01, seed 43: bkg1w8mh
+- pilots 768, lambda 0.01, seed 44: svtbhhpp
+- pilots 1536, lambda 0.01, seed 42: ze5kezu1
+- pilots 1536, lambda 0.01, seed 43: ztilv7h0
+- pilots 1536, lambda 0.01, seed 44: 6kdnwv44
+- pilots 2048, lambda 0.01, seed 42: 2a6uo96b
+- pilots 2048, lambda 0.01, seed 43: gtcrvpvq
+- pilots 2048, lambda 0.01, seed 44: 7yz1sqml
+- pilots 4096, lambda 0.003, seed 42: 5owu8oob
+- pilots 4096, lambda 0.003, seed 43: dnchyhej
+- pilots 4096, lambda 0.003, seed 44: 4ewdrour
+- pilots 4096, lambda 0.01, seed 42: 3n1cirhj
+- pilots 4096, lambda 0.01, seed 43: y1ui2qws
+- pilots 4096, lambda 0.01, seed 44: ahi7288n
+- pilots 4096, lambda 0.03, seed 42: 31k2ax63
+- pilots 4096, lambda 0.03, seed 43: pxsoygwy
+- pilots 4096, lambda 0.03, seed 44: v3krxnyi
+- pilots 4096, lambda 0.1, seed 42: ykc01lwx
+- pilots 4096, lambda 0.1, seed 43: dl677b70
+- pilots 4096, lambda 0.1, seed 44: fklk5jum
+- pilots 4096, lambda 0.3, seed 42: sxhnjpbg
+- pilots 4096, lambda 0.3, seed 43: 2eut5tk2
+- pilots 4096, lambda 0.3, seed 44: mtb2l4hr
+- pilots 4096, lambda 1, seed 42: 4wpd5ryj
+- pilots 4096, lambda 1, seed 43: pqqb8400
+- pilots 4096, lambda 1, seed 44: azu6d0sx

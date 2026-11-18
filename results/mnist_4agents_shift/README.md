@@ -10,8 +10,9 @@ standard deviations across seeds. Evaluation fits posthoc Procrustes maps.
 - [Lambda aggregates](lambda/summary.csv): 4096 pilots, lambda
   .003/.01/.03/.1/.3/1, private and communication scores by agent and average.
 - [Combined pilot comparison](maps/pilot_summary.md) and
-  [lambda comparison](maps/lambda_summary.md): noncoop, CenterNorm, ZCA, OLS (posthoc table column; figures show saved OLS maps).
-- [ZCA provenance](maps/zca_provenance.md),
+  [lambda comparison](maps/lambda_summary.md): noncoop, CenterNorm, ZCA, OLS (posthoc table column; figures show saved OLS maps) and learnable SWBN (learned eval in the tables; the figures draw its posthoc rescore).
+- [SWBN provenance](maps/swbn_provenance.md) (pilot and lambda runs),
+  [ZCA provenance](maps/zca_provenance.md),
   [OLS provenance](maps/ols_provenance.md) and
   [saved-OLS-map provenance](maps/saved_ols_provenance.md): remote run IDs and seeds.
   Saved-OLS curves are frozen-checkpoint evaluations through the maps learned in

@@ -1,0 +1,37 @@
+topology,method,scope,mean,sd,n
+fully_connected,DiSheafFRL,Private,69.57249840100606,0.0066143495691468705,3
+fully_connected,DiSheafFRL,Private target classes,99.60272011453115,0.009469403403959586,3
+fully_connected,DiSheafFRL,Comm,69.29277777777777,0.025239592648007663,3
+fully_connected,DiSheafFRL,Comm sender unseen / receiver seen,98.9851246431922,0.06896356348270895,3
+fully_connected,DiSheafFRL,Comm receiver seen,99.20082385748663,0.03630761734533233,3
+fully_connected,DiSheafFRL,Comm sender seen / receiver seen,99.33439768380917,0.027476966997335976,3
+fully_connected,Non-coop,Private,69.55583294232686,0.012331837052139827,3
+fully_connected,Non-coop,Private target classes,99.57885946074923,0.01765527151866165,3
+fully_connected,Non-coop,Comm,65.7786111111111,0.2859211883123105,3
+fully_connected,Non-coop,Comm sender unseen / receiver seen,85.682965012561,1.0553621960102721,3
+fully_connected,Non-coop,Comm receiver seen,94.1645945091649,0.41288507523592616,3
+fully_connected,Non-coop,Comm sender seen / receiver seen,99.41910755212972,0.027483804115582006,3
+ring,DiSheafFRL,Private,69.57000096638997,0.017501200950168907,3
+ring,DiSheafFRL,Private target classes,99.59914101646386,0.02505368647101542,3
+ring,DiSheafFRL,Comm,69.24208333333334,0.018970920729717143,3
+ring,DiSheafFRL,Comm sender unseen / receiver seen,98.79185627987867,0.04998275990920964,3
+ring,DiSheafFRL,Comm receiver seen,99.12781862968136,0.02752157383040631,3
+ring,DiSheafFRL,Comm sender seen / receiver seen,99.31450698014919,0.021869810146945702,3
+ring,Non-coop,Private,69.55583294232686,0.012331837052139827,3
+ring,Non-coop,Private target classes,99.57885946074923,0.01765527151866165,3
+ring,Non-coop,Comm,65.67541666666666,0.21833293575027718,3
+ring,Non-coop,Comm sender unseen / receiver seen,84.35302421036384,0.844667005742568,3
+ring,Non-coop,Comm receiver seen,94.02177237132891,0.31450313107169137,3
+ring,Non-coop,Comm sender seen / receiver seen,99.41172959149657,0.03861693711038082,3
+star,DiSheafFRL,Private,69.55416798591614,0.022547126187891408,3
+star,DiSheafFRL,Private target classes,99.57647339537105,0.032278094150482724,3
+star,DiSheafFRL,Comm,69.1875,0.02966245288426398,3
+star,DiSheafFRL,Comm sender unseen / receiver seen,98.54694101863173,0.028338501121664868,3
+star,DiSheafFRL,Comm receiver seen,99.0493011159324,0.042699438029609765,3
+star,DiSheafFRL,Comm sender seen / receiver seen,99.35702748766634,0.07945585226785126,3
+star,Non-coop,Private,69.55583294232686,0.012331837052139827,3
+star,Non-coop,Private target classes,99.57885946074923,0.01765527151866165,3
+star,Non-coop,Comm,65.19361111111112,0.3557019013058499,3
+star,Non-coop,Comm sender unseen / receiver seen,82.8787567864711,1.4467268424250623,3
+star,Non-coop,Comm receiver seen,93.32111254771365,0.509061108922262,3
+star,Non-coop,Comm sender seen / receiver seen,99.5649251962788,0.03242675509844128,3

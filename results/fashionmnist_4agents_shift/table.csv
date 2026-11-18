@@ -1,0 +1,8 @@
+method,lambda,comm_sd,comm,gain_vs_noncoop,gain_sd,both_seen,txU_rxS,private,priv_target,MRR,misal,MB,run_ids
+DiSheafFRL,0.1,0.082,55.449,12.707,0.812,94.316,90.515,57.168,95.279,0.076,0.079,5012.0,42:elaalpwu 43:aulug7vx 44:qa3ge59b
+SheafFRL,0.01,0.077,54.683,11.941,0.689,94.325,87.952,57.162,95.269,0.075,0.081,5012.0,42:lamz4dcs 43:ghefim5n 44:x6z6tc5f
+FedMuscle,1.0,0.672,46.219,3.477,0.354,88.854,65.209,57.134,95.224,0.046,0.503,3247.0,42:avksljum 43:f3acq57l 44:gelk00po
+NonCooperativeLearning,0.0,0.743,42.742,0.0,0.0,86.192,56.281,57.196,95.326,0.018,0.446,7.0,42:sdgzql7q 43:g2ff66vb 44:m5gbsehy
+FedProto,0.01,0.312,42.486,-0.256,0.457,85.81,55.808,57.184,95.307,0.018,0.443,260.125,42:u4f3rt33 43:f6ii1gjc 44:sg49r72l
+FedRE,0.0,0.43,42.206,-0.536,0.759,87.019,53.666,57.251,95.418,0.013,0.434,50.572,42:qwhbje7w 43:d0w9fygz 44:d1s88ftl
+ComFed,0.01,0.618,29.952,-12.79,1.182,,,57.197,,,,759.375,42:fy8uea0u 43:jdodnde0 44:zi8lddjb
