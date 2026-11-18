@@ -1,0 +1,18 @@
+# Tests whether digit identity survives in the latent space of the even/odd
+# agent when it is much narrower than the 10-class agent (d = 8 vs 40, ratio 5),
+# and whether DiSheafFRL puts more of it there than independent training.
+defaults:
+  - mnist_2agents_parity_base
+  - _self_
+
+study_name: mnist_2agents_parity_d40x8
+logger:
+  project: mnist_2agents_parity_d40x8
+model:
+  agents:
+    0:   # 28 -> 14 -> 7 -> 3 -> 1, d=40
+      encoder_hidden_dims: [32, 64, 128, 40]
+      decoder_hidden_dims: [256]
+    1:   # 28 -> 14 -> 7 -> 3, d=8
+      encoder_hidden_dims: [32, 64, 8]
+      decoder_hidden_dims: [120]
