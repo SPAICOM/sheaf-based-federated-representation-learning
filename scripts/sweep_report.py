@@ -1,6 +1,8 @@
 """Quick report of a finished sweep from the remote wandb project: one table + curves.
 
-    just report cifar10_2agents_grayblur_7v7 pilotsweep_cnorm_noncoop pilotsweep_cnorm_disheaf \
+Its helpers (``config_value``, ``row``) are also used by scripts/plot_mnist4_pilots.py.
+
+    uv run python scripts/sweep_report.py cifar10_2agents_grayblur_7v7 pilotsweep_cnorm_noncoop pilotsweep_cnorm_disheaf \
         --x dataset.pilot_num_samples --logx \
         --extra pilotsweep_cnorm_noncoop=qt7wgve3 --extra pilotsweep_cnorm_disheaf=utjhk1eb
 

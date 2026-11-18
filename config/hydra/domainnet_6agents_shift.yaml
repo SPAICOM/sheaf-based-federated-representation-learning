@@ -1,0 +1,20 @@
+# domainnet_6agents + label shift: every agent trains on 7 of the 10 classes of
+# its own domain (cyclic windows starting at 0, 2, 3, 5, 7, 8), so every class is
+# held by 4 or 5 agents and missing from the others, where it can only arrive
+# through another domain's agent. Test rows and pilots keep every class of every
+# agent's domain, as in femnist_4agents_shift.
+defaults:
+  - domainnet_6agents
+  - _self_
+
+logger:
+  project: domainnet_6agents_shift
+
+dataset:
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6]}
+    1: {agents: [1], target_classes: [2, 3, 4, 5, 6, 7, 8]}
+    2: {agents: [2], target_classes: [3, 4, 5, 6, 7, 8, 9]}
+    3: {agents: [3], target_classes: [5, 6, 7, 8, 9, 0, 1]}
+    4: {agents: [4], target_classes: [7, 8, 9, 0, 1, 2, 3]}
+    5: {agents: [5], target_classes: [8, 9, 0, 1, 2, 3, 4]}

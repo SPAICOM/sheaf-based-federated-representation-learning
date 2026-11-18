@@ -20,9 +20,9 @@ standard deviations across seeds. Evaluation fits posthoc Procrustes maps.
 
 | Promoted script | Original successful script | Recipe |
 |---|---|---|
-| `scripts/plot_mnist4_pilots.py` | `tmp/2026-11-08_mnist4_table.py` | `just mnist4-pilot-summary` |
-| `scripts/plot_mnist4_lambda.py` | `tmp/2026-11-09_mnist4_extension_report.py` | `just mnist4-lambda-summary` |
-| `scripts/plot_mnist4_maps.py` | `tmp/2026-11-11_mnist4_ols_overlay.py` (without p128) | `just mnist4-map-summary` |
+| `scripts/plot_mnist4_pilots.py` | `tmp/2026-11-08_mnist4_table.py` | `just figure-ablation-pilots` |
+| `scripts/plot_mnist4_lambda.py` | `tmp/2026-11-09_mnist4_extension_report.py` | `just figure-ablation-lambda` |
+| `scripts/plot_mnist4_maps.py` | `tmp/2026-11-11_mnist4_ols_overlay.py` (without p128) | `just figure-ablation-pilots` / `figure-ablation-lambda` |
 
 The pilot summary is the retained remote-verified checkpoint rescore; rerunning
 it requires the 30 saved final checkpoints and CUDA. Its overall totals were
@@ -31,11 +31,9 @@ recipes refresh remote W&B metrics; map plots read the retained baseline
 aggregates. The lambda baseline is now read directly from W&B instead of
 reusing the rounded checkpoint-derived pilot totals.
 
-Training configs: `mnist_2agents_7v7.yaml` (shared inherited protocol),
-`mnist_4agents_shift.yaml`, and `mnist_4agents_mapstudy_{base,zca,ols}.yaml`.
-Training entry point: `scripts/multi_agent_experiment.py`; use the direct
-`just mnist-4agents` / `just mnist4-mapstudy` commands documented in the root
-README. No parallel queue or shell wrapper is required.
+Training configs: `mnist_4agents_shift.yaml` (non-coop and CenterNorm DiSheafFRL) and
+`mnist_4agents_shift_{zca,ols}.yaml` (the map ablation); training routines
+`just train-ablation-pilots` and `just train-ablation-lambda` (see the root README).
 
 The CenterNorm lambda sweep (18 trained settings/seeds plus three baseline
 runs) and both 30-run map sweeps were rechecked remotely on 2026-11-11.

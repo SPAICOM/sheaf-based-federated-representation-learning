@@ -33,8 +33,9 @@ is built for it (no tv / lmin).
 Recomputed ``private`` / ``comm`` are checked against the logged
 ``test/avg_*_task_perf`` (|Δ| reported).
 Per-run results are cached in results/<project>/rescore/<run_id>.json
-(``--force`` recomputes); the table (mean ± std over seeds, in %) goes to
-results/<project>/rescore/table.{md,csv}.
+(``--force`` recomputes); the per-run values go to results/<project>/rescore/runs.csv
+(read by scripts/table_main.py and scripts/table_comm_epochs.py) and the table (mean ± std
+over seeds, in %) to results/<project>/rescore/table.{md,csv}.
 
     uv run python scripts/rescore_hetero.py cifar10_4agents_full
     uv run python scripts/rescore_hetero.py cifar10_4agents_full --groups comfed,sheaf_frl --force
@@ -203,7 +204,11 @@ def score(run, project: str, device: str) -> dict[str, float]:
     out: dict[str, float] = {}
     agents = {int(k): a for k, a in orch.agents.items()}
     neighbors = {int(k): {int(n) for n in v} for k, v in orch.hparams.neighbors.items()}
-    native = hasattr(orch, 'projection_matrices')  # ComFed: its own projections
+    # ComFed: its own projections. SheafFMTL also has projection_matrices (its P_ij act on
+    # parameters, not latents) but communicates through the post-hoc maps of the mixin.
+    native = hasattr(orch, 'projection_matrices') and not isinstance(
+        orch, PostTrainingAlignmentMixin
+    )
     if not native:
         bind_posthoc(orch)
         if not orch._fit_alignment_maps(dm):
@@ -325,7 +330,14 @@ def main() -> None:
             print(f'{group:16s} {run.id} seed {seed}: comm {res["comm"]:.4f} ({deltas})', flush=True)
             rows.append({'group': group, 'run_id': run.id, 'seed': seed, **res})
 
-    df = table(pd.DataFrame(rows))
+    # per-run values, merged with the groups re-scored earlier (the paper tables rank on these)
+    runs = pd.DataFrame(rows)
+    if (out_dir / 'runs.csv').exists():
+        old = pd.read_csv(out_dir / 'runs.csv')
+        runs = pd.concat([old[~old.run_id.isin(runs.run_id)], runs], ignore_index=True)
+    runs = runs.sort_values(['group', 'seed'], kind='stable')
+    runs.to_csv(out_dir / 'runs.csv', index=False)
+    df = table(runs)
     df.to_csv(out_dir / 'table.csv', index=False)
     (out_dir / 'table.md').write_text(markdown(df))
     print(markdown(df))

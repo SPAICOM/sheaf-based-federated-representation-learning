@@ -174,3 +174,54 @@ def test_writer_disjoint_overlapping_shift() -> None:
     for i in range(3):
         assert test_ids.isdisjoint(_dataset_ids(dm.train_datasets[i].dataset))
         assert writers(dm.test_datasets[0].dataset) & train_writers[i]
+
+
+def _explicit_writer_dm(pilot_writers: list[str], seed: int = 3) -> tuple[HeteroClassificationDataModule, list[str]]:
+    data = _build_mock_writer_dataset(n_writers=6, rows_per_writer=200)
+    groups = {i: {'agents': [i], 'target_classes': list(range(10))} for i in range(3)}
+    with patch('src.datamodules.hetero_datamodule.load_dataset', return_value=data):
+        dm = HeteroClassificationDataModule(
+            repo='test', name='toy', data_key='image', attributes=['character'],
+            n_agents=3, split_strategy='overlapping_shift', groups=groups,
+            shift_strength=1.0, agent_train_samples='max', label_subset=list(range(10)),
+            writer_key='writer_id', writer_groups={0: ['w0'], 1: ['w1', 'w2'], 2: ['w4']},
+            pilot_writers=pilot_writers, pilot_num_samples=30, pilot_batch_size=16,
+            pilot_class_filter=False, val_split=0.0, test_split=0.2, seed=seed,
+        )
+        dm.setup()
+    return dm, data['train']['writer_id']
+
+
+def test_explicit_writer_groups_with_pilot_writer() -> None:
+    """writer_groups fixes each agent's writers; pilots come from pilot_writers; others dropped."""
+    dm, writer_of = _explicit_writer_dm(['w5'])
+
+    def writers(ds: Dataset) -> set[str]:
+        return {writer_of[int(row[0])] for row in ds['image']}
+
+    assert writers(dm.train_datasets[0].dataset) == {'w0'}
+    assert writers(dm.train_datasets[1].dataset) <= {'w1', 'w2'}
+    assert writers(dm.train_datasets[2].dataset) == {'w4'}
+    assert writers(dm.pilot_datasets[0].dataset) == {'w5'}
+    assert len(dm.pilot_datasets[0]) == 30
+    assert writers(dm.test_datasets[0].dataset) == {'w0', 'w1', 'w2', 'w4'}  # w3 dropped
+    test_ids = dm.test_datasets[0].sample_ids
+    assert [dm.row_writers[k] for k in test_ids] == [writer_of[int(r[0])] for r in dm.test_datasets[0].dataset['image']]
+
+
+def test_explicit_writer_groups_pilots_from_agent_pools() -> None:
+    """Without pilot writers the pilots are an equal share of every agent's pool, never trained on."""
+    dm, writer_of = _explicit_writer_dm([])
+    pilot_rows = [int(r[0]) for r in dm.pilot_datasets[0].dataset['image']]
+    assert len(pilot_rows) == 30
+    per_writer = {}
+    for r in pilot_rows:
+        per_writer[writer_of[r]] = per_writer.get(writer_of[r], 0) + 1
+    assert sum(per_writer.get(w, 0) for w in ('w1', 'w2')) == 10
+    assert per_writer['w0'] == 10 and per_writer['w4'] == 10
+    test_ids = _dataset_ids(dm.test_datasets[0].dataset)
+    for i in range(3):
+        train_ids = _dataset_ids(dm.train_datasets[i].dataset)
+        assert train_ids.isdisjoint(pilot_rows)
+        assert train_ids.isdisjoint(test_ids)
+    assert test_ids.isdisjoint(pilot_rows)

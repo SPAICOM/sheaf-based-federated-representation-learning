@@ -38,10 +38,13 @@ OUT.mkdir(parents=True, exist_ok=True)
 frames = {}
 for method in ('zca', 'ols'):
     project = f'mnist_4agents_mapstudy_{method}'
+    # `just train-ablation-*` names the groups <method>_p<K>_l<lambda> with lambda as Hydra
+    # prints it (0.01); the retained runs drop the leading zero (.01): accept both
     groups = {f'{method}_p{p}_l.01' for p in (384, 768, 1536, 2048, 4096)}
     groups |= {
         f'{method}_p4096_l{w}' for w in ('.003', '.03', '.1', '.3', '1')
     }
+    groups |= {g.replace('_l.', '_l0.') for g in groups}
     runs = [
         api.run(f'{api.default_entity}/{project}/{r.id}')
         for r in api.runs(f'{api.default_entity}/{project}')

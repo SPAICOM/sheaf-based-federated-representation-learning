@@ -14,6 +14,7 @@ Features:
 
 import copy
 from collections.abc import Callable
+from pathlib import Path
 
 import lightning as l
 import torch
@@ -35,6 +36,22 @@ from src.utils.data_partitioner import (
     partition_non_iid,
     partition_non_iid_with_margin,
 )
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def dataset_path(repo: str, name: str) -> str:
+    """Return the source to pass to ``load_dataset``.
+
+    ``<repo>/<name>`` as a local dataset folder when it exists (a relative path
+    is taken from the project root, e.g. ``data/domainnet/dn64_k20_d6``), else
+    the Hub repo id ``<repo>/<name>``.
+    """
+    local = Path(repo) / name
+    if not local.is_absolute():
+        local = _PROJECT_ROOT / local
+    return str(local) if local.is_dir() else f'{repo}/{name}'
 
 
 def _collate_fn(batch):
@@ -283,6 +300,10 @@ class ClassificationDataModule(l.LightningDataModule):
         starve_clients: bool = False,
         seed: int = 42,
         augment_train: bool = True,
+        train_crop_size: int | None = None,
+        train_crop_padding: int = 4,
+        train_crop_scale: list[float] | None = None,
+        train_color_jitter: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -329,18 +350,25 @@ class ClassificationDataModule(l.LightningDataModule):
         self.comm_data = comm_data
         self.starve_clients = starve_clients
         self.seed = seed
-        # Augment only CIFAR-10 training images. Validation, test, and pilot
-        # datasets intentionally retain the unmodified inputs.
-        self.train_transform = (
-            transforms.Compose(
-                [
-                    transforms.RandomCrop(32, padding=4),
-                    transforms.RandomHorizontalFlip(),
-                ]
+        # Augment only CIFAR-10 training images (32 px, padding 4), or any
+        # dataset given train_crop_size: a padded random crop of that size, or
+        # with train_crop_scale=[lo, hi] a random-resized crop (area fraction
+        # in [lo, hi]), + horizontal flip, + color jitter of strength
+        # train_color_jitter (brightness, contrast, saturation; 0 = off).
+        # Validation, test, and pilot datasets keep the unmodified inputs.
+        crop = train_crop_size or (32 if self.name.lower() == 'cifar10' else None)
+        steps = []
+        if augment_train and crop is not None:
+            steps.append(
+                transforms.RandomResizedCrop(crop, scale=tuple(train_crop_scale))
+                if train_crop_scale is not None
+                else transforms.RandomCrop(crop, padding=train_crop_padding)
             )
-            if augment_train and self.name.lower() == 'cifar10'
-            else None
-        )
+            steps.append(transforms.RandomHorizontalFlip())
+            if train_color_jitter:
+                j = float(train_color_jitter)
+                steps.append(transforms.ColorJitter(brightness=j, contrast=j, saturation=j))
+        self.train_transform = transforms.Compose(steps) if steps else None
 
     def _starve_training_datasets(self, label_key: str) -> None:
         """Reduce train data by 80% for a deterministic half of clients."""
@@ -724,7 +752,7 @@ class ClassificationDataModule(l.LightningDataModule):
 
     def prepare_data(self) -> None:
         """Download dataset from HuggingFace."""
-        load_dataset(f'{self.repo}/{self.name}')
+        load_dataset(dataset_path(self.repo, self.name))
 
     def setup(self, stage: str | None = None) -> None:
         """Load and split the dataset across agents.
@@ -735,7 +763,7 @@ class ClassificationDataModule(l.LightningDataModule):
             Current stage ('fit', 'validate', 'test', or None for all).
         """
         # Load dataset from HuggingFace using repo/name combination
-        ds = load_dataset(f'{self.repo}/{self.name}')
+        ds = load_dataset(dataset_path(self.repo, self.name))
 
         # Merge all splits to maximize data before re-splitting
         # according to custom ratios.

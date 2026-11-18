@@ -25,7 +25,11 @@ from .di_sheaf_frl import DiSheafFRL
 
 
 class CEDiSheafFRL(CESheafFRL, DiSheafFRL):
-    # MRO: CESheafFRL (schedule) -> DiSheafFRL (gated penalty) -> SheafFRL
+    """DiSheafFRL on the communication schedule of :class:`CESheafFRL`.
+
+    MRO: CESheafFRL (schedule) -> DiSheafFRL (gated penalty) -> SheafFRL.
+    """
+
     def __init__(self, **kwargs):
         if kwargs.get('local_reg'):
             raise ValueError(

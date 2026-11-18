@@ -22,6 +22,7 @@ from torchvision import transforms
 from src.datamodules.classification_datamodule import (
     ClassificationDataModule,
     ClassificationDataset,
+    dataset_path,
 )
 from src.datamodules.utils import compute_split_indices
 from src.utils.data_partitioner import (
@@ -70,6 +71,8 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         label_subset: list[int] | None = None,
         writer_key: str | None = None,
         pilot_writer_frac: float = 0.1,
+        writer_groups: dict | None = None,
+        pilot_writers: list | None = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -85,6 +88,20 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         if not 0.0 < float(pilot_writer_frac) < 1.0:
             raise ValueError(f'pilot_writer_frac must be in (0, 1), got {pilot_writer_frac}')
         self.pilot_writer_frac = float(pilot_writer_frac)
+        # Explicit writer assignment instead of the random split above, e.g.
+        # one DomainNet domain per agent: {agent: [writer, ...]} (names of a
+        # ClassLabel column or raw values). Writers of no agent and not in
+        # pilot_writers are dropped. pilot_writers: writers that supply the
+        # pilots (pilot_writer_frac ignored); null/empty draws the pilots from
+        # the agents' own pools instead, an equal share per agent, removed
+        # from its training rows.
+        self.writer_groups = (
+            None if writer_groups is None
+            else {int(k): list(v) for k, v in writer_groups.items()}
+        )
+        self.pilot_writers = list(pilot_writers or [])
+        if self.writer_groups is not None and writer_key is None:
+            raise ValueError('writer_groups needs writer_key')
         # {agent: {classes: [a, b], fraction: p}}: in that agent's TRAINING rows
         # (overlapping_shift only), round(p * n) of the n rows labelled a or b
         # get the other label (a <-> b). With direction: one_way, round(p * n_a)
@@ -461,22 +478,33 @@ class HeteroClassificationDataModule(ClassificationDataModule):
         Every agent draws n_train rows from its OWN writers only, with the usual
         label shift P_i. The test set is the union of the agents' held-out rows:
         the same rows, all classes and every agent's styles, for every agent.
-        The pilots come from writers no agent trains on.
+        The pilots come from writers no agent trains on. With ``writer_groups``
+        the agents' writers are given (and ``pilot_writers`` the pilots'); when
+        no pilot writer is given, the pilots are an equal share of every
+        agent's TRAIN pool, removed from it (``_explicit_writer_groups``).
         """
         gen = torch.Generator().manual_seed(self.seed)
         writer_of = all_data[self.writer_key][:]
-        writers = sorted(set(writer_of))
-        order = [writers[k] for k in torch.randperm(len(writers), generator=gen).tolist()]
-        n_pilot_writers = max(1, int(round(len(writers) * self.pilot_writer_frac)))
-        if len(writers) - n_pilot_writers < self.n_agents:
-            raise ValueError(f'{len(writers)} writers cannot give {self.n_agents} agents one each')
-        group_of = dict.fromkeys(order[:n_pilot_writers], -1)
-        for k, w in enumerate(order[n_pilot_writers:]):
-            group_of[w] = k % self.n_agents
+        # writer of every row (test sample_ids index these rows), for
+        # per-writer (e.g. per-domain) scoring after training
+        self.row_writers = writer_of
+        if self.writer_groups is not None:
+            group_of = self._explicit_writer_groups(all_data)
+        else:
+            writers = sorted(set(writer_of))
+            order = [writers[k] for k in torch.randperm(len(writers), generator=gen).tolist()]
+            n_pilot_writers = max(1, int(round(len(writers) * self.pilot_writer_frac)))
+            if len(writers) - n_pilot_writers < self.n_agents:
+                raise ValueError(f'{len(writers)} writers cannot give {self.n_agents} agents one each')
+            group_of = dict.fromkeys(order[:n_pilot_writers], -1)
+            for k, w in enumerate(order[n_pilot_writers:]):
+                group_of[w] = k % self.n_agents
 
         rows: dict[int, list[int]] = {g: [] for g in range(-1, self.n_agents)}
         for idx, w in enumerate(writer_of):
-            rows[group_of[w]].append(idx)
+            g = group_of.get(w)
+            if g is not None:
+                rows[g].append(idx)
 
         pilot_pool = rows[-1]
         n_pilots = min(int(self.pilot_num_samples or 0), len(pilot_pool))
@@ -492,6 +520,18 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             )
             pools[i] = [own[k] for k in keep]
             test_rows.extend(own[k] for k in held)
+
+        if self.writer_groups is not None and not pilot_pool and self.pilot_num_samples:
+            # pilots from the agents' own pools: an equal share per agent
+            # (remainder to the first agents), uniform within the pool
+            want = int(self.pilot_num_samples)
+            for i in range(self.n_agents):
+                share = want // self.n_agents + (1 if i < want % self.n_agents else 0)
+                order_i = torch.randperm(len(pools[i]), generator=gen).tolist()
+                taken = set(order_i[:share])
+                pilot_indices.extend(pools[i][k] for k in taken)
+                pools[i] = [r for k, r in enumerate(pools[i]) if k not in taken]
+            pilot_indices.sort()
 
         group_of_agent = {a: gid for gid, agents in self.groups.items() for a in agents}
         if self.agent_train_samples == 'max':
@@ -518,6 +558,28 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             train_draws[i], agent_classes[i] = draws[0], classes[0]
         self.writer_counts = {i: sum(1 for g in group_of.values() if g == i) for i in range(-1, self.n_agents)}
         return train_draws, sorted(test_rows), pilot_indices, agent_classes
+
+    def _explicit_writer_groups(self, all_data) -> dict:
+        """{writer value: agent, or -1 for the pilot writers} from ``writer_groups``."""
+        feature = all_data.features[self.writer_key]
+
+        def value(w):
+            return feature.str2int(w) if isinstance(w, str) and hasattr(feature, 'str2int') else w
+
+        if sorted(self.writer_groups) != list(range(self.n_agents)):
+            raise ValueError(
+                f'writer_groups must list agents 0..{self.n_agents - 1}, got {sorted(self.writer_groups)}'
+            )
+        group_of: dict = {}
+        named = [(-1, w) for w in self.pilot_writers] + [
+            (i, w) for i, ws in self.writer_groups.items() for w in ws
+        ]
+        for g, w in named:
+            v = value(w)
+            if v in group_of:
+                raise ValueError(f'writer {w!r} assigned twice (writer_groups / pilot_writers)')
+            group_of[v] = g
+        return group_of
 
     def _swap_labels(self, rows, label_key: str, client_idx: int):
         """Swap the labels of a random fraction of the rows of two classes
@@ -682,7 +744,7 @@ class HeteroClassificationDataModule(ClassificationDataModule):
                 '"groups" mapping in the dataset config.'
             )
 
-        ds = load_dataset(f'{self.repo}/{self.name}')
+        ds = load_dataset(dataset_path(self.repo, self.name))
         split_names = list(ds)
         all_data = concatenate_datasets([ds[s] for s in split_names])
         label_key = self.attributes[0]
@@ -871,7 +933,7 @@ class HeteroClassificationDataModule(ClassificationDataModule):
             super().setup(stage=stage)
             return
 
-        ds = load_dataset(f'{self.repo}/{self.name}')
+        ds = load_dataset(dataset_path(self.repo, self.name))
         splits = [ds[s] for s in ds]
         all_data = concatenate_datasets(splits)
 

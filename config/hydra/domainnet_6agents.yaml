@@ -1,0 +1,99 @@
+# DomainNet, 6 agents, one visual domain each (all six DomainNet domains),
+# fully connected graph (15 edges). Every agent trains on its own domain only
+# (no image of a domain is seen by another agent) with a different encoder
+# family and latent width:
+#   0 real       ResNet-18                     d=64
+#   1 painting   ResNet-10                     d=48
+#   2 sketch     VGG-style CNN                 d=32
+#   3 quickdraw  plain 4-block CNN             d=16
+#   4 clipart    5-block CNN, one unpooled     d=40
+#   5 infograph  3-stage ResNet, strided stem  d=24
+# Classes: the 10 best covered over all six domains (labels 0..9 of the
+# dn64_k20_d6 cache, `just domainnet-data`): tiger whale feather windmill zebra
+# teapot bird circle strawberry bread; 64x64 RGB. No label shift: every agent
+# has all 10 classes (domainnet_6agents_shift adds it). The train draw is
+# class-balanced and the same size for every agent, set by the scarcest
+# (domain, class) pair (clipart bread, 195 images): ~145 images per class.
+# Test rows: test_split of every agent's domain, shared by all agents (scored
+# per domain by scripts/domain_scope.py). Pilots: 1024, an equal share of every
+# agent's pool (pilot_writers: []), never trained on.
+#
+#   just domainnet                      # NC + DiSheafFRL lambda grid, 3 seeds
+#   just domainnet-report               # per-domain tables + figures
+defaults:
+  - paper_base
+  - override dataset: domainnet
+  - override model: resnet_classifier
+  - _self_
+
+logger:
+  project: domainnet_6agents
+
+trainer:
+  max_epochs: 150
+
+# `just domainnet` sweeps DiSheafFRL over lambda in {0.01, 0.03, 0.1, 0.3}
+# (orchestrator.max_lmb); 0.1 has the best test comm in both setups.
+tuned_lmb:
+  non_cooperative: 0.0
+  di_sheaf_frl: 0.1
+
+dataset:
+  n_agents: 6
+  label_subset: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  test_source: pool
+  test_split: 0.2
+  writer_groups:
+    0: [real]
+    1: [painting]
+    2: [sketch]
+    3: [quickdraw]
+    4: [clipart]
+    5: [infograph]
+  pilot_writers: []
+  pilot_num_samples: 1024       # ~171 per agent
+  num_workers: 2
+  groups:
+    0: {agents: [0], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    1: {agents: [1], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    2: {agents: [2], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    3: {agents: [3], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    4: {agents: [4], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+    5: {agents: [5], target_classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}
+
+model:
+  agents:
+    0:   # real: ResNet-18, 2 blocks per stage, 64 -> 8 px
+      encoder_hidden_dims: [32, 64, 128, 64]
+      blocks_per_stage: [2, 2, 2, 2]
+      stage_strides: [1, 2, 2, 2]
+    1:   # painting: ResNet-10, 1 block per stage
+      encoder_hidden_dims: [32, 64, 128, 48]
+      blocks_per_stage: [1, 1, 1, 1]
+      stage_strides: [1, 2, 2, 2]
+    2:   # sketch: VGG-style CNN, 2 convs per stage, 3 pooled stages
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 32, 64, 64, 128, 32]
+      pool_blocks: [false, true, false, true, false, true]
+      use_batchnorm: true
+    3:   # quickdraw: plain CNN, every block pooled, 64 -> 4 px
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 128, 16]
+      pool_blocks: [true, true, true, true]
+      use_batchnorm: true
+    4:   # clipart: 5-block CNN, the third block unpooled, 64 -> 4 px
+      _target_: src.agents.CNNClassifier
+      encoder_hidden_dims: [32, 64, 64, 128, 40]
+      pool_blocks: [true, true, false, true, true]
+      use_batchnorm: true
+    5:   # infograph: 3-stage ResNet, stride-2 stem, 64 -> 8 px
+      encoder_hidden_dims: [48, 96, 24]
+      blocks_per_stage: [2, 2, 2]
+      stage_strides: [1, 2, 2]
+      stem_stride: 2
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: non_cooperative,di_sheaf_frl
+      seed: 42,43,44

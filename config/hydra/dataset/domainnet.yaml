@@ -1,0 +1,33 @@
+# DomainNet class subset cached by scripts/prepare_domainnet.py under
+# data/domainnet/<name>/ (square RGB crops; label = the kept classes, domain =
+# clipart | infograph | painting | quickdraw | real | sketch). With writer_key
+# the agents train on disjoint domains, set by the experiment's writer_groups;
+# the test rows are test_split of every agent's domain, shared by all agents.
+_target_: src.datamodules.HeteroClassificationDataModule
+
+repo: data/domainnet          # local folder, relative to the project root
+name: dn64_k20_d6          # `just domainnet-data` builds it
+data_key: image
+
+attributes:
+  - label
+
+writer_key: domain
+writer_groups: ???            # {agent: [domain, ...]}
+pilot_writers: []             # [] = pilots from the agents' own pools
+
+split_strategy: overlapping_shift
+train_crop_size: 64           # train rows only: random-resized crop (area 35-100%),
+train_crop_scale: [0.35, 1.0] #   horizontal flip and color jitter 0.3; test rows and
+train_color_jitter: 0.3       #   pilots keep the plain 64 px image
+
+batch_size: 128
+num_workers: 4
+mode: min_size
+
+val_split: 0.0
+test_split: 0.2
+pilot_split: 0.0
+pilot_num_samples: null
+comm_data: shared_global_pilots
+seed: ${seed}

@@ -2,8 +2,8 @@
 # dimension. Agent 0 trains on digits 0-6, agent 1 on 3-9, each written by its own
 # writers only; the 4096 shared pilots come from a third, disjoint writer group. Two
 # different CNNs whose latent widths are d and d/2; the pair is picked with the
-# bottleneck_femnist group: d8 (8/4), d16 (16/8), ..., d256 (256/128).
-# `just bottleneck-pipeline femnist` trains every method x d x seed at tuned_lmb.
+# bottleneck_femnist group: d8 (8/4), d16 (16/8), d32 (32/16), d64 (64/32), the paper's sweep.
+# `just train-compression` trains every method x d x seed at tuned_lmb.
 defaults:
   - paper_base
   - bottleneck_femnist: d64
@@ -40,5 +40,5 @@ hydra:
   sweeper:
     params:
       orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre
-      bottleneck_femnist: d8,d16,d32,d64,d128,d256
+      bottleneck_femnist: d8,d16,d32,d64
       seed: 42,43,44

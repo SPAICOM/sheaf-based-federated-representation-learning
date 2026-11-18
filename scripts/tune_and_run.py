@@ -15,12 +15,12 @@ a method's final seeds start as soon as its grid is done. A job whose run alread
 wandb (same group, seed, lambda) is skipped and one still running there is waited for, so a
 stopped pipeline resumes where it was. Console output: ``logs/console/<sweep>_<job>.log``.
 
-    just hetero-pipeline cifar10                              # every method of the config
-    just hetero-pipeline cifar10 fedproto,fedre               # only these
-    just hetero-pipeline mnist fedproto,comfed --dry-run    # list the jobs, train nothing
-    just hetero-pipeline cifar10 sheaf_fmtl --override dataset.num_workers=0   # macOS: no spawn workers
+    just train-benchmark cifar10                            # every method of the config
+    just train-benchmark cifar10 fedproto,fedre             # only these
+    just train-benchmark mnist fedproto,comfed --dry-run  # list the jobs, train nothing
+    just train-benchmark cifar10 sheaf_fmtl --override dataset.num_workers=0   # macOS: no spawn workers
 
-``--study bottleneck`` (``just bottleneck-pipeline``) runs ``<dataset>_2agents_bottleneck``
+``--study bottleneck`` (``just train-compression``) runs ``<dataset>_2agents_bottleneck``
 instead: its sweeper lists one more axis, the bottleneck config group (latent pair d, d/2),
 and every job is repeated at each of its options. Lambda is not tuned there: every method
 with a penalty must be in ``lmb_tuning.fixed``. A run's option is recovered from its config
@@ -59,7 +59,7 @@ def log(msg: str) -> None:
 
 
 def experiment_config(dataset: str, study: str = 'hetero') -> str:
-    """Experiment config of a dataset (same rule as `just hetero`)."""
+    """Experiment config of a dataset: its 4-agent benchmark, or the 2-agent bottleneck sweep."""
     if study == 'bottleneck':
         return f'{dataset}_2agents_bottleneck'
     return (
