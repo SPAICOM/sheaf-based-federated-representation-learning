@@ -44,65 +44,129 @@ After the command completes, the development environment will be ready to use. �
 
 ## Reproducing the paper
 
-Every result of the paper has two `just` routines: a **train** routine, which
-runs the experiment (Hydra multirun of `scripts/multi_agent_experiment.py`;
-metrics and configs to Weights & Biases, checkpoints to `logs/`), and a
-**table/figure** routine, which rebuilds the result into `results/` from wandb
-(`wandb login` once) and, where the paper re-scores runs, from the
-checkpoints. `just --list` prints them all. Runs logged to a team entity are
-read with `WANDB_ENTITY=<entity> just <routine>`.
+Every study is produced by a short sequence of `just` routines: the `train-*`
+routines run the experiments (metrics and configs go to Weights & Biases,
+`wandb login` once), and the last routine rebuilds the table or figure from
+wandb and, where the paper re-scores runs, from the checkpoints. Run the
+commands in the order given; `just --list` describes every routine. Runs logged
+to a team entity are read with `WANDB_ENTITY=<entity> just <routine>`.
 
-| Paper result | Train | Table / figure | Output | Status |
-|---|---|---|---|---|
-| Tab. `tab:main`: private and comm accuracy, 4 benchmarks × 8 methods (Sec. 6) | `just train-benchmark <dataset>`, dataset ∈ `mnist`, `fashionmnist`, `femnist`, `cifar10` | `just tables-benchmarks` | `results/paper/tab_main.{tex,md}` | ✅ ¹ |
-| Tab. `tab:geom`: MRR, TV, μ_min (App. Alignment) | same runs | `just tables-benchmarks` | `results/paper/tab_geom.{tex,md}` | ✅ ¹ |
-| Fig. `fig:compression`: FEMNIST, 2 agents, d ∈ {8, 16, 32, 64} (App. Compression) | `just train-compression` | `just figure-compression` | `results/femnist_2agents_bottleneck/bottleneck_split.pdf` | ✅ |
-| Fig. `fig:ablation-pilots`: pilot budget K, CenterNorm / ZCA / OLS / SWBN (App. Ablation) | `just train-ablation-pilots` | `just figure-ablation-pilots` | `results/mnist_4agents_shift/maps/pilot_study_shared.pdf` | ✅ ³ |
-| Fig. `fig:ablation-lambda`: penalty weight λ (App. Ablation) | `just train-ablation-lambda` | `just figure-ablation-lambda` | `results/mnist_4agents_shift/maps/lambda_study_shared.pdf` | ✅ ³ |
-| Fig. `fig:ablation-topology`: star / ring / full graph (App. Ablation) | `just train-ablation-topology` | `just figure-ablation-topology` | `results/mnist_4agents_shift/topology/topology_gap_shared.pdf` | ✅ ³ |
-| Tab. `tab:comm-epochs`: communication epochs ρ = 2–80 % (App. Ablation) | `just train-ablation-comm-epochs` | `just table-comm-epochs` | `results/mnist_4agents_shift/comm_epochs/rows.tex` | ✅ ² |
-| Figs. `fig:spectrum`, `fig:tv_normalized`, `fig:low_energy` (App. Global sections) | – | – | – | ❌ ⁴ |
-| Sheaf-FMTL compression factor γ (App. Experimental details) | – | `just sheaf-fmtl-gamma <configs>` | printed | ✅ |
-| Tab. `tab:setups`: agents of the benchmarks (App. Experimental details) | – | – | the experiment configs | descriptive |
+### Paper results
 
-New experiments, not in the paper yet:
+**Task accuracy on the four benchmarks (Tab. `tab:main`) and alignment
+diagnostics (Tab. `tab:geom`).** Train every method on each benchmark (λ grid on
+the first seed, then the other seeds at the best λ), then re-score all runs
+and rank the methods:
 
-| Experiment | Train | Table / figure | Output | Status |
-|---|---|---|---|---|
-| Anchor selection: k-means prototypes vs class-stratified anchors vs the original pilots, MNIST, K = 128–1536 | `just train-anchors` | `just figure-anchors` | `results/mnist_4agents_shift/anchors/anchors_study_shared.pdf` | ✅ ³ |
-| MNIST parity: 2 agents on the same images, 10 digits (d = 40) vs even/odd (d = 8); k-NN probes of digit identity in the even/odd agent ([doc](scripts/mnist_parity_knn.md)) | `just train-parity` | `just figure-parity` | `results/mnist_2agents_parity_d40x8/` | ⚠️ ⁵ |
-| DomainNet, 6 agents × 6 domains | `just domainnet-data`, then `just train-domainnet [domainnet_6agents\|domainnet_6agents_shift]` | `just report-domainnet` | `results/domainnet_6agents{,_shift}/domain_scope_report.md`, `results/domainnet_6agents_figures/` | ✅ |
+```bash
+just train-benchmark mnist
+just train-benchmark fashionmnist
+just train-benchmark femnist
+just train-benchmark cifar10
+just tables-benchmarks
+```
 
-¹ Rebuilt and checked against the paper for CIFAR-10, the benchmark whose
-checkpoints are on the development machine: every cell and rank group of
-`tab:geom`, and of `tab:main` except the Sheaf-FMTL row, whose printed s.d.
-are rounded (.20/.20/.70/.20 against .16/.19/.66/.17 from the runs; with the
-exact values its shared-class cell falls in the second rank group).
-`tables-benchmarks` re-scores every run from its checkpoint
-(`logs/<project>/<run_id>/checkpoints/`), so it needs the checkpoints of all
-four benchmarks. The Fashion-MNIST λ grid and a wandb-summary version of its
-block are written by `uv run python scripts/plot_fashionmnist_hetero.py`
-(`results/fashionmnist_4agents_shift/`).
-² Rebuilt rows identical to the paper's. The ρ = 0 % and 100 % rows are the
-non-cooperative and DiSheafFRL runs of `tab:main`; when they are not re-scored
-on the machine, the script uses the values printed in `tab:main`/`tab:geom` and
-says so.
-³ By default the figure routine redraws from the per-run class-scope scores
-kept in `results/mnist_4agents_shift/` (rebuilt here: identical tables, same
-figures); `just figure-<name> rescore` re-scores every checkpoint first (CUDA,
-the runs' wandb entity). The train routine writes every run to the wandb project
-and group its figure script reads (`mnist4_di_clean_bs256_{pilots,check}_*`,
-`{zca,ols,swbn}_p<K>_l<λ>`, `<method>_p4096`, `K<K>[_warm]`). The non-coop and
-CenterNorm runs at K = 4096 (`..._check_..._p4096`) serve the pilot, λ and
-topology figures, the anchors study and rows 0 % / 100 % of `tab:comm-epochs`;
-the topology script pins their run ids (`FULLY_CONNECTED`), so new runs replace
-them there. The "CenterNorm + OLS" curves score the OLS runs through the maps
-saved in training (wandb groups `pilot_saved_ols_eval`, `lambda_saved_ols_eval`),
-an evaluation made by a script that is not in this repository
-(`tmp/2026-11-12_mnist4_ols_learned.py`).
-⁴ No config or routine in this repository.
-⁵ Routines smoke-tested (`just smoke-parity`); the study's runs and latent
-cache are not in this repository yet.
+**Robustness to semantic compression (Fig. `fig:compression`).** FEMNIST, two
+agents with latent dimensions d and d/2:
+
+```bash
+just train-compression
+just figure-compression
+```
+
+**Number of pilots (Fig. `fig:ablation-pilots`).** MNIST, non-cooperative and
+DiSheafFRL with CenterNorm, ZCA, unconstrained (OLS) maps and SWBN:
+
+```bash
+just train-ablation-pilots
+just figure-ablation-pilots
+```
+
+**Regularization coefficient (Fig. `fig:ablation-lambda`).** The λ = 0.01 points
+are runs of the pilot study:
+
+```bash
+just train-ablation-pilots
+just train-ablation-lambda
+just figure-ablation-lambda
+```
+
+**Topology (Fig. `fig:ablation-topology`).** Star and ring; the fully
+connected graph is the pilot study at 4096 pilots:
+
+```bash
+just train-ablation-pilots
+just train-ablation-topology
+just figure-ablation-topology
+```
+
+**Number of communication epochs (Tab. `tab:comm-epochs`).** The 0 % and 100 %
+rows are the MNIST non-cooperative and DiSheafFRL runs of `tab:main`:
+
+```bash
+just train-benchmark mnist
+just train-ablation-comm-epochs
+just tables-benchmarks
+just table-comm-epochs
+```
+
+**Compression factor of Sheaf-FMTL (App. Experimental details):**
+
+```bash
+just sheaf-fmtl-gamma mnist_4agents_shift fashionmnist_4agents_shift femnist_4agents_shift cifar10_4agents_full
+```
+
+**Emergence of global agreement (App. Global sections: `fig:spectrum`,
+`fig:tv_normalized`, `fig:low_energy`).** No routine yet: the code of this
+study is not in the repository.
+
+### New experiments (not in the paper yet)
+
+**Anchor selection.** MNIST, k-means and class-stratified anchors against the
+original pilots; the original arm and the non-cooperative runs come from the
+pilot study:
+
+```bash
+just train-ablation-pilots
+just train-anchors
+just figure-anchors
+```
+
+**MNIST parity: 10 digits vs even/odd.** Two agents on the same images, k-NN
+probes of digit identity in the even/odd agent (see
+`scripts/mnist_parity_knn.md`):
+
+```bash
+just train-parity
+just figure-parity
+```
+
+**DomainNet, 6 agents × 6 domains,** without and with label shift:
+
+```bash
+just domainnet-data
+just train-domainnet domainnet_6agents
+just train-domainnet domainnet_6agents_shift
+just report-domainnet
+```
+
+### Notes
+
+- The figure routines of the MNIST ablations and of the anchor study redraw
+  from the per-run scores kept in the repository; add `rescore` (e.g.
+  `just figure-ablation-pilots rescore`) to re-score every checkpoint first
+  (CUDA). `tables-benchmarks` and `table-comm-epochs` always re-score from the
+  checkpoints (cached after the first time).
+- Checked against the paper: `tables-benchmarks` reproduces every cell and
+  rank group of the CIFAR-10 block of `tab:geom`, and of `tab:main` except the
+  Sheaf-FMTL row, whose printed s.d. are rounded; `table-comm-epochs`
+  reproduces the rows of `tab:comm-epochs` exactly.
+- The "CenterNorm + OLS" curves of the pilot and λ figures score the OLS runs
+  through the maps saved in training; that evaluation was made by a script
+  that is not in the repository (`tmp/2026-11-12_mnist4_ols_learned.py`), so
+  `rescore` reuses its logged results.
+- The parity study's runs are not in the repository yet; its routines are
+  smoke-tested (`just smoke-parity`).
 
 ### Experiments
 
