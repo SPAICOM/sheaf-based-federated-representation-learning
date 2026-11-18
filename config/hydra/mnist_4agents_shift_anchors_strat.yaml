@@ -1,0 +1,11 @@
+# Tests stratified anchors: K raw pilots per edge, drawn once for the whole run from
+# the 4096-pilot pool, 70% from the edge's symmetric class difference C_i Δ C_j.
+defaults:
+  - mnist_4agents_shift_anchors_base
+  - _self_
+study_name: mnist_4agents_shift_anchors_strat
+logger:
+  project: mnist_4agents_shift_anchors_strat
+orchestrator:
+  anchor_selection: stratified
+  stratified_bias: 0.7

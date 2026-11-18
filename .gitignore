@@ -259,7 +259,22 @@ results/mnist_4agents_shift/*
 !results/mnist_4agents_shift/pilots/
 !results/mnist_4agents_shift/lambda/
 !results/mnist_4agents_shift/maps/
+# Class-scope rescoring caches behind the standard figures (topology, SWBN pilot scopes) and their PDFs.
+!results/mnist_4agents_shift/topology/
+!results/mnist_4agents_shift/swbn_scopes/
+!results/mnist_4agents_shift/topology/*.pdf
+!results/mnist_4agents_shift/maps/*.pdf
+# Anchor-selection ablation: scored runs, tables, figures (scripts/plot_mnist4_anchors.py).
+!results/mnist_4agents_shift/anchors/
+!results/mnist_4agents_shift/anchors/*.pdf
 results/mnist_4agents_shift/pilots/progress.txt
+
+# Promoted Fashion-MNIST heterogeneity table (summary tables only).
+!results/fashionmnist_4agents_shift/
+results/fashionmnist_4agents_shift/*
+!results/fashionmnist_4agents_shift/README.md
+!results/fashionmnist_4agents_shift/*.csv
+!results/fashionmnist_4agents_shift/table.md
 !results/mnist_2agents_7v7/main/*.pdf
 !results/mnist_4agents_shift/pilots/*.pdf
 !results/mnist_4agents_shift/lambda/*.pdf

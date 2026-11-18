@@ -135,7 +135,133 @@ def parseval_normalize(
     return (F @ S_pinv_sqrt).to(dtype=original_dtype)
 
 
-VALID_PAIRED_ANCHOR_SELECTIONS = ('all', 'random', 'proto_class', 'proto_kmeans')
+VALID_PAIRED_ANCHOR_SELECTIONS = (
+    'all',
+    'random',
+    'stratified',
+    'proto_class',
+    'proto_kmeans',
+)
+
+
+def stratified_focus_classes(
+    agent_target_classes: dict[int, set[int]] | None, i: int, j: int
+) -> frozenset[int]:
+    """Symmetric difference ``C_i Δ C_j`` of two agents' target classes (empty if unknown)."""
+    if not agent_target_classes:
+        return frozenset()
+    ci = agent_target_classes.get(int(i))
+    cj = agent_target_classes.get(int(j))
+    if ci is None or cj is None:
+        return frozenset()
+    return frozenset(int(c) for c in set(ci) ^ set(cj))
+
+
+def stratified_edge_seed(i: int, j: int) -> int:
+    """Seed of an edge's stratified draw: run seed x canonical (sender, receiver)."""
+    return (torch.initial_seed() + 1_000_003 * int(i) + 7_919 * int(j)) % (
+        2**31
+    )
+
+
+def stratified_row_indices(
+    labels: torch.Tensor,
+    num_anchors: int,
+    focus_classes: set[int] | frozenset[int] | None,
+    bias: float,
+    *,
+    keys: torch.Tensor | None = None,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Pick ``num_anchors`` rows, biased towards the ``focus_classes``.
+
+    A deterministic function of (row identities, labels, focus classes, bias,
+    seed): the same pool always yields the same rows, so the selection is
+    fixed once per run and the train-time and post-hoc picks coincide.
+    ``keys`` (sample ids) make the pick independent of row order.
+
+    ``round(bias * budget)`` rows come from the focus classes, split equally per
+    class (a class with too few rows hands its share to the others); the rest
+    are drawn uniformly from the remaining rows.  If either side lacks rows
+    the shortfall is filled from the other, so exactly ``min(budget, n)`` rows are
+    returned.  Indices are into ``labels`` and sorted ascending.
+    """
+    n = int(labels.shape[0])
+    budget = int(num_anchors)
+    if budget >= n:
+        return torch.arange(n)
+    if not (0.0 <= float(bias) <= 1.0):
+        raise ValueError(f'stratified bias must be in [0, 1]; got {bias}')
+    gen = torch.Generator().manual_seed(int(seed) % (2**63 - 1))
+    order = (
+        torch.argsort(keys.cpu(), stable=True)
+        if keys is not None
+        else torch.arange(n)
+    )
+    lab = labels.cpu()
+    focus = sorted(int(c) for c in (focus_classes or ()))
+    in_focus = (
+        torch.isin(lab, torch.tensor(focus, dtype=lab.dtype))
+        if focus
+        else torch.zeros(n, dtype=torch.bool)
+    )
+    n_focus_target = min(int(round(float(bias) * budget)), int(in_focus.sum()))
+    chosen: list[torch.Tensor] = []
+    if n_focus_target > 0:
+        pools = {}
+        for c in focus:
+            rows = order[(lab[order] == c)]
+            if rows.numel():
+                pools[c] = rows[torch.randperm(rows.numel(), generator=gen)]
+        take = dict.fromkeys(pools, 0)
+        left = n_focus_target
+        active = sorted(pools)
+        while left > 0 and active:
+            share, extra = divmod(left, len(active))
+            bonus = {
+                active[i]
+                for i in torch.randperm(len(active), generator=gen)[
+                    :extra
+                ].tolist()
+            }
+            progressed = 0
+            for c in list(active):
+                want = share + (1 if c in bonus else 0)
+                got = min(want, pools[c].numel() - take[c])
+                take[c] += got
+                progressed += got
+                if take[c] >= pools[c].numel():
+                    active.remove(c)
+            left -= progressed
+            if progressed == 0:
+                break
+        chosen += [pools[c][: take[c]] for c in pools]
+    picked = torch.cat(chosen) if chosen else torch.empty(0, dtype=torch.long)
+    n_rest = budget - picked.numel()
+    if n_rest > 0:
+        mask = torch.ones(n, dtype=torch.bool)
+        mask[picked] = False
+        rest_focus_free = order[mask[order] & ~in_focus[order]]
+        rest = rest_focus_free[
+            torch.randperm(rest_focus_free.numel(), generator=gen)
+        ][:n_rest]
+        picked = torch.cat([picked, rest])
+        n_rest = budget - picked.numel()
+    if (
+        n_rest > 0
+    ):  # not enough non-focus rows: top up from leftover focus rows
+        mask = torch.ones(n, dtype=torch.bool)
+        mask[picked] = False
+        left_rows = order[mask[order]]
+        picked = torch.cat(
+            [
+                picked,
+                left_rows[torch.randperm(left_rows.numel(), generator=gen)][
+                    :n_rest
+                ],
+            ]
+        )
+    return picked.sort().values
 
 
 def select_paired_anchors(
@@ -147,6 +273,10 @@ def select_paired_anchors(
     num_anchors: int = 128,
     protos_per_class: int = 1,
     parseval: bool = True,
+    keys: torch.Tensor | None = None,
+    focus_classes: set[int] | frozenset[int] | None = None,
+    stratified_bias: float = 0.7,
+    seed: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce matched pilot rows to a paired anchor set for relative alignment.
 
@@ -158,6 +288,10 @@ def select_paired_anchors(
 
     * ``'all'`` — the full matched pool (``num_anchors`` ignored);
     * ``'random'`` — ``num_anchors`` rows subsampled once;
+    * ``'stratified'`` — ``num_anchors`` raw rows, a share ``stratified_bias``
+      of them from ``focus_classes`` (an edge's symmetric class difference),
+      equally per class; deterministic given ``seed`` (see
+      :func:`stratified_row_indices`);
     * ``'proto_class'`` — one (or ``protos_per_class``, via within-class
       k-means on the ``X_i`` rows) prototype pair per class in ``labels``;
     * ``'proto_kmeans'`` — unsupervised: k-means (``K=num_anchors``) fit on
@@ -188,6 +322,18 @@ def select_paired_anchors(
     n = X_i.shape[0]
     if selection == 'random' and n > num_anchors:
         sel = torch.randperm(n, device=X_i.device)[:num_anchors]
+        X_i, X_j = X_i[sel], X_j[sel]
+    elif selection == 'stratified' and n > num_anchors:
+        if labels is None:
+            raise ValueError("selection='stratified' requires labels")
+        sel = stratified_row_indices(
+            labels,
+            num_anchors,
+            focus_classes,
+            stratified_bias,
+            keys=keys,
+            seed=seed,
+        ).to(X_i.device)
         X_i, X_j = X_i[sel], X_j[sel]
     elif selection == 'proto_class' and n > 0:
         if labels is None:
@@ -789,6 +935,9 @@ __all__ = [
 __all__ = [
     'AnchorConfig',
     'VALID_PAIRED_ANCHOR_SELECTIONS',
+    'stratified_edge_seed',
+    'stratified_focus_classes',
+    'stratified_row_indices',
     'l2_normalize',
     'normalize_anchor_matrix',
     'parseval_normalize',

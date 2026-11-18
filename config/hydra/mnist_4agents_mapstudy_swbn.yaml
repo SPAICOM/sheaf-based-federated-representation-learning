@@ -1,0 +1,26 @@
+# Tests learnable SWBN whitening in place of CenterNorm (ablation vs closed-form ZCA,
+# mnist_4agents_mapstudy_zca); scored through the learned SWBN + saved Stiefel maps.
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+
+study_name: mnist_4agents_mapstudy_swbn
+
+logger:
+  project: mnist_4agents_mapstudy_swbn
+
+model:
+  latent_norm: false
+
+orchestrator:
+  whitening: true
+  learn_whitening: true
+  swbn_fit_source: pilots
+  eval_alignment: learned
+  pilot_bn_mode: running   # as in the finished pilot-study runs (the orchestrator default became `update` on 2026-11-11)
+
+hydra:
+  sweeper:
+    params:
+      orchestrator: di_sheaf_frl

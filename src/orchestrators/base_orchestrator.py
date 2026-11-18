@@ -32,13 +32,25 @@ from src.communication.whitening import (
     whiten,
 )
 from src.utils import calculate_communication_cost
-from src.utils.anchors import select_paired_anchors
+from src.utils.anchors import (
+    select_paired_anchors,
+    stratified_edge_seed,
+    stratified_focus_classes,
+)
 from src.utils.simclr import (
     frozen_running_stats,
     nt_xent,
     projection_head,
     simclr_augment,
 )
+
+
+def _matched_sample_ids(dataset: Any, idx: Any) -> torch.Tensor | None:
+    """Sample ids of ``dataset`` at positions ``idx`` (None if it has no ids)."""
+    ids = getattr(dataset, 'sample_ids', None)
+    if ids is None:
+        return None
+    return torch.as_tensor([int(ids[k]) for k in idx], dtype=torch.long)
 
 
 class BaseOrchestrator(l.LightningModule, ABC):
@@ -122,8 +134,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
             {str(idx): agent for idx, agent in agents.items()}
         )
         self._init_simclr(
-            simclr_weight, simclr_temperature, simclr_sources,
-            simclr_proj_dim, simclr_hidden_dim,
+            simclr_weight,
+            simclr_temperature,
+            simclr_sources,
+            simclr_proj_dim,
+            simclr_hidden_dim,
         )
         self._validation_prefixes_seen: set[str] = set()
         self._latent_buffer: dict[int, list[torch.Tensor]] = {}
@@ -156,7 +171,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
         return agent_tc if agent_tc else None
 
     def _resolve_agent_target_classes(self) -> dict[int, set[int]] | None:
-        """Cached ``_agent_target_classes`` (set by SheafFRL at train start), else build fresh."""
+        """Return cached ``_agent_target_classes`` (set by SheafFRL at train start), else build fresh."""
         cached = getattr(self, '_agent_target_classes', None)
         if cached is not None:
             return cached
@@ -1111,6 +1126,33 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 getattr(self.hparams, 'protos_per_class', 1)
             ),
             'parseval': bool(parseval),
+            'stratified_bias': float(
+                getattr(self.hparams, 'stratified_bias', 0.7)
+            ),
+        }
+
+    def _stratified_edge_kwargs(
+        self, i: int, j: int, dataset: Any, idx: Any
+    ) -> dict[str, Any]:
+        """Edge-specific inputs of ``anchor_selection='stratified'`` (else ``{}``).
+
+        ``focus_classes`` is the symmetric difference of the endpoints' target
+        classes; ``keys`` the matched rows' sample ids (order-independent
+        pick); ``seed`` derives from the run seed and the canonical edge, so
+        the rows are fixed for the whole run and identical to the ones
+        SheafFRL trained on.
+        """
+        if (
+            str(getattr(self.hparams, 'anchor_selection', 'all'))
+            != 'stratified'
+        ):
+            return {}
+        return {
+            'focus_classes': stratified_focus_classes(
+                self._resolve_agent_target_classes(), i, j
+            ),
+            'keys': _matched_sample_ids(dataset, idx),
+            'seed': stratified_edge_seed(i, j),
         }
 
     @torch.no_grad()
@@ -1272,6 +1314,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     X_j,
                     labels=pilot_y[sender_idx][idx_i],
                     **self._alignment_anchor_kwargs(method),
+                    **self._stratified_edge_kwargs(
+                        sender_idx, receiver_idx, pi, idx_i
+                    ),
                 )
                 if method == 'relative':
                     # Zero-shot anchor frames (see fit_relative_alignment):
@@ -1404,7 +1449,11 @@ class BaseOrchestrator(l.LightningModule, ABC):
         # the last one.
         every = int(getattr(self.hparams, 'train_comm_eval_every_n_epochs', 1))
         epoch = int(self.current_epoch) + 1
-        if every > 1 and epoch % every and epoch != int(self.trainer.max_epochs):
+        if (
+            every > 1
+            and epoch % every
+            and epoch != int(self.trainer.max_epochs)
+        ):
             return
         logs = self.evaluate_communication_accuracy(dm, prefix='train')
         keep = {
@@ -1438,7 +1487,7 @@ class BaseOrchestrator(l.LightningModule, ABC):
     def _directed_alignment_map(
         self, sender_idx: int, receiver_idx: int
     ) -> torch.Tensor | None:
-        """The map fitted/learned for exactly the sender → receiver direction.
+        """Return the map fitted/learned for exactly the sender → receiver direction.
 
         Returns ``None`` when no map exists in that exact orientation — in
         particular, this must *never* fall back to a transpose or
@@ -1530,7 +1579,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             and bool(getattr(dm, 'test_datasets', None))
         )
         pilot_datasets = (
-            dm.test_datasets if shared_test else getattr(dm, 'pilot_datasets', None)
+            dm.test_datasets
+            if shared_test
+            else getattr(dm, 'pilot_datasets', None)
         )
         if not pilot_datasets:
             return {}
@@ -1699,8 +1750,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 # being optimised.  Logging both keeps the headline metric
                 # comparable while making the optimised one visible.
                 energy = float(
-                    (X.pow(2).sum(dim=1).mean()
-                     + AY.pow(2).sum(dim=1).mean()).item()
+                    (
+                        X.pow(2).sum(dim=1).mean()
+                        + AY.pow(2).sum(dim=1).mean()
+                    ).item()
                 )
                 if energy > 1e-12:
                     normed_e = float(raw.item()) / energy
@@ -1708,9 +1761,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                         f'{prefix}/misalignment_energy_edge_'
                         f'{sender_idx}_{receiver_idx}'
                     ] = normed_e
-                    per_receiver_energy.setdefault(
-                        receiver_idx, []
-                    ).append(normed_e)
+                    per_receiver_energy.setdefault(receiver_idx, []).append(
+                        normed_e
+                    )
 
                 # Instance-identity retrieval MRR on the pilot samples common to
                 # both agents (matched by id): rank every receiver row by cosine
@@ -1722,15 +1775,15 @@ class BaseOrchestrator(l.LightningModule, ABC):
                 # the decoder-floored comm accuracy it tracks the coboundary.
                 n_rows = int(diff.shape[0])
                 if n_rows >= 2 and compute_mrr:
-                    a = torch.nn.functional.normalize(
-                        X.to(self.device), dim=1
+                    a = torch.nn.functional.normalize(X.to(self.device), dim=1)
+                    b = torch.nn.functional.normalize(
+                        AY.to(self.device), dim=1
                     )
-                    b = torch.nn.functional.normalize(AY.to(self.device), dim=1)
                     # Chunked over sender rows so a 10k-row shared test set
                     # never materialises the full (n, n) similarity matrix.
                     ranks = []
                     for start in range(0, n_rows, 1024):
-                        sim = a[start:start + 1024] @ b.T
+                        sim = a[start : start + 1024] @ b.T
                         rows = torch.arange(sim.shape[0], device=sim.device)
                         correct = sim[rows, rows + start].unsqueeze(1)
                         # rank = 1 + #{receiver rows strictly more similar than the match}
@@ -1739,7 +1792,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
                     mrr = float((1.0 / ranks.float()).mean().item())
                     # Namespaced by the data it is measured on: 'pilots/' for
                     # the pilot set, the {prefix} group for the shared test set.
-                    logs[f'{mrr_group}/mrr_edge_{sender_idx}_{receiver_idx}'] = mrr
+                    logs[
+                        f'{mrr_group}/mrr_edge_{sender_idx}_{receiver_idx}'
+                    ] = mrr
                     per_edge_mrr.append(mrr)
 
         all_vals = [v for vs in per_receiver.values() for v in vs]
@@ -1751,9 +1806,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
             # compare THIS against the training penalty, not the line above.
             logs[f'{prefix}/misalignment_energy'] = sum(all_e) / len(all_e)
         if per_edge_mrr:
-            logs[f'{mrr_group}/mean_reciprocal_rank'] = sum(per_edge_mrr) / len(
+            logs[f'{mrr_group}/mean_reciprocal_rank'] = sum(
                 per_edge_mrr
-            )
+            ) / len(per_edge_mrr)
 
         return logs
 
@@ -1849,14 +1904,10 @@ class BaseOrchestrator(l.LightningModule, ABC):
             )
             was_training = agent.training
             agent.eval()
-            Zs = []
-            for x_batch in loader:
-                Zs.append(
-                    agent.encode(x_batch.to(self.device))
-                    .detach()
-                    .cpu()
-                    .float()
-                )
+            Zs = [
+                agent.encode(x_batch.to(self.device)).detach().cpu().float()
+                for x_batch in loader
+            ]
             agent.train(was_training)
             if not Zs:
                 continue
@@ -2155,29 +2206,42 @@ class BaseOrchestrator(l.LightningModule, ABC):
         heads = {}
         for idx, agent in self.agents.items():
             first = next(
-                (m for m in agent.decoder.modules() if isinstance(m, nn.Linear)), None
+                (
+                    m
+                    for m in agent.decoder.modules()
+                    if isinstance(m, nn.Linear)
+                ),
+                None,
             )
             if first is None:
                 raise ValueError(
                     f'SimCLR: cannot infer latent dim of agent {idx} (no nn.Linear in decoder)'
                 )
-            heads[idx] = projection_head(first.in_features, hidden_dim, proj_dim)
+            heads[idx] = projection_head(
+                first.in_features, hidden_dim, proj_dim
+            )
         self.simclr_heads = nn.ModuleDict(heads)
 
     def _pilot_key(self, batch, idx):
         return next(
             (
                 k
-                for k in (f'global_pilot_{idx}', f'pilot_{idx}', 'global_pilot')
+                for k in (
+                    f'global_pilot_{idx}',
+                    f'pilot_{idx}',
+                    'global_pilot',
+                )
                 if k in batch
             ),
             None,
         )
 
     def _local_simclr_loss(self, agent, batch, idx):
-        """SimCLR (NT-Xent) on two augmented views of this step's task batch
-        and/or pilot batch (``simclr_sources``), through the agent's encoder and
-        its projection head. Running BN/CenterNorm stats are not updated.
+        """Compute SimCLR (NT-Xent) on two augmented views of this step's batches.
+
+        Views come from the task batch and/or pilot batch (``simclr_sources``),
+        through the agent's encoder and its projection head. Running
+        BN/CenterNorm stats are not updated.
         """
         if self.simclr_heads is None:
             return 0.0
@@ -2190,7 +2254,9 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if 'pilots' in self._simclr_sources:
             key = self._pilot_key(batch, idx)
             if key is None:
-                raise ValueError('simclr_sources includes pilots but the batch has none')
+                raise ValueError(
+                    'simclr_sources includes pilots but the batch has none'
+                )
             xs.append(self._unpack_task_batch(batch[key])[0])
         x = torch.cat([t.to(self.device) for t in xs])
         v1, v2 = simclr_augment(x), simclr_augment(x)
@@ -2200,13 +2266,20 @@ class BaseOrchestrator(l.LightningModule, ABC):
         if last is not None:
             agent._last_latent = last
         p = self.simclr_heads[str(idx)](z)
-        loss = nt_xent(p[: x.shape[0]], p[x.shape[0]:], self._simclr_temperature)
-        self.log(f'train/simclr_loss_{idx}', loss.detach(), on_step=False,
-                 on_epoch=True, batch_size=x.shape[0])
+        loss = nt_xent(
+            p[: x.shape[0]], p[x.shape[0] :], self._simclr_temperature
+        )
+        self.log(
+            f'train/simclr_loss_{idx}',
+            loss.detach(),
+            on_step=False,
+            on_epoch=True,
+            batch_size=x.shape[0],
+        )
         return self._simclr_weight * loss
 
     def _local_pilot_loss(self, agent, batch, idx):
-        """Same local pilot supervision in cooperative and independent training."""
+        """Apply the same local pilot supervision in cooperative and independent training."""
         weight = getattr(agent, 'pilot_loss_weight', 0.0)
         if not weight:
             return 0.0

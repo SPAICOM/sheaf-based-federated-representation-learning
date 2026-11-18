@@ -29,6 +29,7 @@ from .data_partitioner import (
 )
 from .graph_generator import generate_neighbors
 from .io import remove_non_empty_dir
+from .knn_probes import few_label, knn_probe, stratified_halves, within_parity
 from .logging import (
     _extract_objective_metric,
     _filter_supported_init_kwargs,
@@ -55,8 +56,12 @@ __all__ = [
     'partition_non_iid',
     'partition_non_iid_fair',
     'partition_non_iid_with_margin',
+    'few_label',
+    'knn_probe',
     'remove_non_empty_dir',
     'shared_anchor_rows',
+    'stratified_halves',
+    'within_parity',
     'sheaf_laplacian',
     'total_variation',
     'min_eigenvalue',

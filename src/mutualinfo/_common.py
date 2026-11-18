@@ -106,6 +106,40 @@ def kmeans_cluster(
         return _numpy_kmeans(x, n_clusters, seed=seed, max_iter=max_iter)
 
 
+def kmeans_cluster_warm(
+    x: np.ndarray,
+    n_clusters: int,
+    init_centers: np.ndarray | None = None,
+    seed: int = 0,
+    max_iter: int = 100,
+) -> tuple[np.ndarray, np.ndarray]:
+    """K-means labels and centres, warm-started from ``init_centers``.
+
+    With ``init_centers`` the single run starts from them (``n_init=1``, no
+    k-means++ seeding), so a refit of a slowly drifting point cloud converges
+    in a few iterations; without them it is a cold fit.  Returns
+    ``(labels, centers)``, ``centers`` being the next call's warm start.
+    Needs scikit-learn (no NumPy fallback).
+    """
+    from sklearn.cluster import MiniBatchKMeans
+
+    n_clusters = max(2, min(int(n_clusters), x.shape[0]))
+    warm = init_centers is not None and init_centers.shape == (
+        n_clusters,
+        x.shape[1],
+    )
+    km = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        random_state=int(seed),
+        batch_size=max(256, n_clusters * 4),
+        init=init_centers if warm else 'k-means++',
+        n_init=1 if warm else 3,
+        max_iter=max_iter,
+    )
+    labels = km.fit_predict(x).astype(np.int64)
+    return labels, km.cluster_centers_.astype(x.dtype, copy=False)
+
+
 def _numpy_kmeans(
     x: np.ndarray, k: int, *, seed: int = 0, max_iter: int = 100
 ) -> np.ndarray:
@@ -154,16 +188,20 @@ def mi_2d(p_xy: np.ndarray) -> float:
     p_y = p_xy.sum(axis=0, keepdims=True)
     outer = p_x @ p_y
     mask = p_xy > 0
-    return float(np.sum(p_xy[mask] * (_safe_log(p_xy[mask]) - _safe_log(outer[mask]))))
+    return float(
+        np.sum(p_xy[mask] * (_safe_log(p_xy[mask]) - _safe_log(outer[mask])))
+    )
 
 
 def coinfo(p_xyz: np.ndarray) -> float:
     """Co-information ``I(Y;X1) + I(Y;X2) - I(Y;X1,X2)``."""
     p_x1y = p_xyz.sum(axis=1)
     p_x2y = p_xyz.sum(axis=0)
-    p_x12y = p_xyz.transpose(2, 0, 1).reshape(
-        p_xyz.shape[2], p_xyz.shape[0] * p_xyz.shape[1]
-    ).T
+    p_x12y = (
+        p_xyz.transpose(2, 0, 1)
+        .reshape(p_xyz.shape[2], p_xyz.shape[0] * p_xyz.shape[1])
+        .T
+    )
     return mi_2d(p_x1y) + mi_2d(p_x2y) - mi_2d(p_x12y)
 
 

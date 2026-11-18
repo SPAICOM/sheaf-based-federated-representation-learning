@@ -124,7 +124,7 @@ class PostTrainingAlignmentMixin:
             return torch.stack(xs)
 
         def _collate_xy(batch):
-            xs, ys, masks = [], [], []
+            xs, ys = [], []
             for item in batch:
                 x = item[0]
                 if isinstance(x, _PILImg.Image):
@@ -198,13 +198,13 @@ class PostTrainingAlignmentMixin:
             agent.eval()
             Zs = []
             try:
-                for x_batch in loader:
-                    Zs.append(
-                        agent.encode(x_batch.to(self.device))
-                        .detach()
-                        .cpu()
-                        .float()
-                    )
+                Zs.extend(
+                    agent.encode(x_batch.to(self.device))
+                    .detach()
+                    .cpu()
+                    .float()
+                    for x_batch in loader
+                )
             finally:
                 agent.train(was_training)
                 for d, t in zip(parts, saved_transforms):
@@ -385,6 +385,9 @@ class PostTrainingAlignmentMixin:
                     X_j,
                     labels=pilot_y[sender_idx][idx_i],
                     **self._alignment_anchor_kwargs(method),
+                    **self._stratified_edge_kwargs(
+                        sender_idx, receiver_idx, pi, idx_i
+                    ),
                 )
 
                 if method == 'relative':
@@ -435,10 +438,7 @@ class PostTrainingAlignmentMixin:
         value = getattr(self.hparams, 'posthoc_whitening_shrinkage', 'auto')
         if value is None:
             return 0.0
-        if str(value) == 'auto':
-            g = ledoit_wolf_shrinkage(Z)
-        else:
-            g = float(value)
+        g = ledoit_wolf_shrinkage(Z) if str(value) == 'auto' else float(value)
         # whitening_from_moments requires an intensity strictly below 1.
         return min(max(g, 0.0), 0.999)
 
@@ -533,7 +533,7 @@ class PostTrainingAlignmentMixin:
     def _directed_alignment_map(
         self, sender_idx: int, receiver_idx: int
     ) -> torch.Tensor | None:
-        """The map fitted for exactly sender_idx -> receiver_idx.
+        """Return the map fitted for exactly sender_idx -> receiver_idx.
 
         ``_fit_alignment_maps`` fits exactly one map per undirected edge, in
         the canonical orientation described there (mirroring SheafFRL's
@@ -814,7 +814,9 @@ class PostTrainingAlignmentMixin:
         # Accuracy split by whether sender / receiver trained on the class
         # (logged under {prefix}/scope/, see src/utils/class_scope.py).
         agent_classes = getattr(dm, 'agent_classes', None) or {}
-        scope_acc = ClassScopeAccuracy(agent_classes) if agent_classes else None
+        scope_acc = (
+            ClassScopeAccuracy(agent_classes) if agent_classes else None
+        )
         for idx_str, agent in self.agents.items():
             idx = int(idx_str)
             if not hasattr(agent, 'decoder') or idx not in test_Z:
@@ -831,7 +833,11 @@ class PostTrainingAlignmentMixin:
                 test_y[idx],
             )
             logs[f'{prefix}/private_task_perf_agent_{idx}'] = self_accs[idx]
-            if scope_acc is not None and _is_classifier(agent) and scope_acc.covers(idx):
+            if (
+                scope_acc is not None
+                and _is_classifier(agent)
+                and scope_acc.covers(idx)
+            ):
                 scope_acc.add_private(idx, y_hat, test_y[idx])
             if lpips_metric is not None and _is_reconstruction(agent):
                 logs[f'{prefix}/private_lpips_full_agent_{idx}'] = (

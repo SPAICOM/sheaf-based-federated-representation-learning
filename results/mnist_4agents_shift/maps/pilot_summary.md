@@ -1,9 +1,9 @@
 Communication test accuracy (%), mean ± sample SD across runs. Lambda study: 4096 pilots; pilot study: lambda=0.01. Non-cooperative baseline is repeated across lambda.
 
-| Pilots | Non cooperative | DiSheafFRL + CenterNorm | DiSheafFRL + ZCA | DiSheafFRL + CenterNorm + OLS |
-| --- | --- | --- | --- | --- |
-| 384 | 64.78 ± 0.24 | 68.79 ± 0.21 | 62.81 ± 2.32 | 67.60 ± 0.08 |
-| 768 | 65.21 ± 0.17 | 69.15 ± 0.01 | 59.74 ± 3.13 | 68.45 ± 0.09 |
-| 1536 | 65.60 ± 0.38 | 69.27 ± 0.01 | 60.48 ± 1.06 | 68.91 ± 0.03 |
-| 2048 | 65.58 ± 0.44 | 69.28 ± 0.03 | 62.26 ± 1.22 | 68.95 ± 0.03 |
-| 4096 | 65.78 ± 0.29 | 69.29 ± 0.03 | 60.89 ± 4.68 | 69.05 ± 0.03 |
+| Pilots | Non cooperative | DiSheafFRL + CenterNorm | DiSheafFRL + ZCA | DiSheafFRL + CenterNorm + OLS (posthoc) | DiSheafFRL + CenterNorm + OLS | DiSheafFRL + SWBN |
+| --- | --- | --- | --- | --- | --- | --- |
+| 384 | 64.78 ± 0.24 | 68.79 ± 0.21 | 62.81 ± 2.32 | 67.60 ± 0.08 | 52.08 ± 0.87 | 68.70 ± 0.14 |
+| 768 | 65.21 ± 0.17 | 69.15 ± 0.01 | 59.74 ± 3.13 | 68.45 ± 0.09 | 58.85 ± 0.13 | 69.11 ± 0.02 |
+| 1536 | 65.60 ± 0.38 | 69.27 ± 0.01 | 60.48 ± 1.06 | 68.91 ± 0.03 | 62.36 ± 5.32 | 68.37 ± 1.12 |
+| 2048 | 65.58 ± 0.44 | 69.28 ± 0.03 | 62.26 ± 1.22 | 68.95 ± 0.03 | 59.31 ± 0.02 | 69.15 ± 0.19 |
+| 4096 | 65.78 ± 0.29 | 69.29 ± 0.03 | 60.89 ± 4.68 | 69.05 ± 0.03 | 65.49 ± 4.65 | 68.21 ± 0.87 |

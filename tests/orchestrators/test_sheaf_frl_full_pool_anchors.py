@@ -56,7 +56,7 @@ class _ToyPilotDataset:
         return self.x[i], self.y[i], self.sample_ids[i]
 
 
-def _build(anchor_selection: str, num_anchors: int = 4) -> SheafFRL:
+def _build(anchor_selection: str, num_anchors: int = 4, **kwargs) -> SheafFRL:
     orchestrator = SheafFRL(
         agents={0: _ToyAgent(), 1: _ToyAgent()},
         neighbors={0: {1}, 1: {0}},
@@ -65,6 +65,7 @@ def _build(anchor_selection: str, num_anchors: int = 4) -> SheafFRL:
         latent_dims={0: LATENT_DIM, 1: LATENT_DIM},
         anchor_selection=anchor_selection,
         num_anchors=num_anchors,
+        **kwargs,
     )
     pool = _ToyPilotDataset()
     dm = SimpleNamespace(
@@ -184,9 +185,7 @@ def test_proto_kmeans_assignment_refits_every_refresh() -> None:
     # produce a different assignment (same sample-id key set either way).
     for agent in orchestrator.agents.values():
         with torch.no_grad():
-            agent.encoder.weight.add_(
-                torch.randn_like(agent.encoder.weight)
-            )
+            agent.encoder.weight.add_(torch.randn_like(agent.encoder.weight))
     orchestrator._rebuild_edge_anchor_caches()
     second = orchestrator._edge_kmeans_assign[pair]
 
@@ -265,3 +264,47 @@ def test_step_exchange_recorded_for_all_strategy() -> None:
 
     after = orchestrator._communication_by_split['train']['kilobytes']
     assert after > before
+
+
+def test_stratified_is_fixed_once_biased_and_trains() -> None:
+    """Same K rows at every refresh, biased to C_i Δ C_j, gradients reach both encoders."""
+    orchestrator = _build('stratified', num_anchors=10, stratified_bias=0.7)
+    orchestrator._agent_target_classes = {0: {0, 1, 2}, 1: {2, 3}}
+    pool_y = _ToyPilotDataset().y
+
+    orchestrator._rebuild_edge_anchor_caches()
+    pair = _edge_key(orchestrator)
+    first = orchestrator._edge_anchor_cache[pair]['sample_ids'].clone()
+    assert first.shape[0] == 10
+    # every refresh re-selects the very same samples (fixed once for the run)
+    orchestrator._rebuild_edge_anchor_caches()
+    assert torch.equal(
+        first, orchestrator._edge_anchor_cache[pair]['sample_ids']
+    )
+    # focus classes {0, 1, 3} supply up to 7 of the 10 rows (pool has enough)
+    n_focus = int(torch.isin(pool_y[first], torch.tensor([0, 1, 3])).sum())
+    assert n_focus >= 7
+
+    node_i, node_j = pair
+    Z_i, _, Z_j, _ = orchestrator._edge_step_anchors(node_i, node_j)
+    assert Z_i.shape[0] == PILOT_BATCH_SIZE  # per-step re-encode is bounded
+    loss = (Z_i - Z_j @ torch.ones(LATENT_DIM, LATENT_DIM)).pow(2).mean()
+    loss.backward()
+    for agent in orchestrator.agents.values():
+        assert agent.encoder.weight.grad is not None
+
+
+def test_proto_kmeans_warm_start_reuses_centres() -> None:
+    """Warm start stores per-edge centres at refresh 1 and reuses them at refresh 2."""
+    orchestrator = _build(
+        'proto_kmeans', num_anchors=4, kmeans_warm_start=True
+    )
+    orchestrator._rebuild_edge_anchor_caches()
+    pair = _edge_key(orchestrator)
+    centers = orchestrator._edge_kmeans_centers[pair]
+    assert centers.shape == (4, LATENT_DIM)
+    assert len(orchestrator._edge_kmeans_assign[pair]) == POOL_SIZE
+
+    orchestrator._rebuild_edge_anchor_caches()  # warm refit from stored centres
+    assert orchestrator._edge_kmeans_centers[pair].shape == (4, LATENT_DIM)
+    assert len(orchestrator._edge_kmeans_assign[pair]) == POOL_SIZE

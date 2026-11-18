@@ -12,8 +12,6 @@ d/2), mean and standard deviation over seeds:
   bottleneck_rx_scope.{pdf,png}  communication on every class the receiver trained on,
                                  and on the classes only the receiver trained on
 
-Only the paper's latent dimensions d in {8, 16, 32, 64} (DIMS) are plotted.
-
 Class scopes are the ones of src/utils/class_scope.py (micro-averaged over the
 two directed edges). "Seen by Rx" pools the scopes both_seen and
 tx_unseen_rx_seen with their logged sample counts. ComFed communicates through
@@ -21,7 +19,8 @@ its own projections and logs no scopes in training: its scoped accuracies come
 from the re-scoring cache results/<project>/rescore/<run_id>.json, which
 ``just figure-compression`` fills first (``rescore_hetero.py <project> --groups comfed``).
 
-Writes everything plus the table bottleneck.md to results/<project>/.
+Only the latent dims the config still sweeps are plotted. Writes everything plus the
+table bottleneck.md to results/<project>/.
 
     uv run python scripts/plot_bottleneck.py femnist
 """
@@ -34,6 +33,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import wandb
+from omegaconf import OmegaConf
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -58,7 +58,6 @@ TITLES = {
     'comm_both_seen': 'Comm., classes seen by both',
     'private_seen': 'Private accuracy, own classes',
 }
-DIMS = (8, 16, 32, 64)  # latent dimension d of agent 0 in the paper (agent 1: d/2)
 FIGURES = {
     'bottleneck_split': ('comm_rx_only', 'comm_both_seen', 'private_seen'),
     'bottleneck': ('comm', 'private', 'comm_rx_only'),
@@ -97,6 +96,15 @@ def scoped(summary, cache: Path) -> dict[str, float]:
         res = json.loads(cache.read_text())
         return {k: res.get(k, float('nan')) for k in keys}
     return dict.fromkeys(keys, float('nan'))
+
+
+def swept_dims(project: str) -> set[int]:
+    """Latent dims d the experiment config sweeps (its bottleneck axis, e.g. d8,d16,d32,d64)."""
+    params = OmegaConf.load(
+        ROOT / 'config' / 'hydra' / f'{project}.yaml'
+    ).hydra.sweeper.params
+    axis = next(k for k in params if k not in ('orchestrator', 'seed'))
+    return {int(v.lstrip('d')) for v in str(params[axis]).split(',')}
 
 
 def load_runs(project: str) -> pd.DataFrame:
@@ -138,6 +146,9 @@ def load_runs(project: str) -> pd.DataFrame:
     if not rows:
         raise SystemExit(f'no finished runs with a method group in {project}')
     runs = pd.DataFrame(rows)
+    runs = runs[
+        runs['d'].isin(swept_dims(project))
+    ]  # runs at dims dropped from the sweep
     # a re-run of the same cell replaces the older one
     return runs.sort_values('created').drop_duplicates(
         ['method', 'd', 'seed'], keep='last'
@@ -182,7 +193,6 @@ def main() -> None:
     project = f'{dataset}_2agents_bottleneck'
     out = ROOT / 'results' / project
     runs = load_runs(project)
-    runs = runs[runs['d'].isin(DIMS)]
     stats = runs.groupby(['method', 'd'])[list(TITLES)].agg(
         ['mean', 'std', 'count']
     )

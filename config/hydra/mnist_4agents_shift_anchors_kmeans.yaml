@@ -1,0 +1,10 @@
+# Tests proto_kmeans anchors: K cluster prototypes per edge (k-means refit at every
+# refresh on the 4096-pilot pool) vs the original K-pilot pool.
+defaults:
+  - mnist_4agents_shift_anchors_base
+  - _self_
+study_name: mnist_4agents_shift_anchors_kmeans
+logger:
+  project: mnist_4agents_shift_anchors_kmeans
+orchestrator:
+  anchor_selection: proto_kmeans

@@ -14,6 +14,8 @@ defaults:
 logger:
   project: femnist_2agents_bottleneck
 
+sheaf_fmtl_gamma: 3e-4   # SheafFMTL P_ij compression, as femnist_4agents_shift
+
 tuned_lmb:   # best lambda of the femnist_4agents_shift pipeline (seed-42 grid, K4 graph)
   non_cooperative: 0.0
   sheaf_frl: 0.03
@@ -39,6 +41,6 @@ dataset:
 hydra:
   sweeper:
     params:
-      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,fedproto,fedmuscle,fedre
+      orchestrator: non_cooperative,sheaf_frl,di_sheaf_frl,comfed,sheaf_fmtl,fedproto,fedmuscle,fedre
       bottleneck_femnist: d8,d16,d32,d64
       seed: 42,43,44

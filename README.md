@@ -57,14 +57,21 @@ read with `WANDB_ENTITY=<entity> just <routine>`.
 | Tab. `tab:main`: private and comm accuracy, 4 benchmarks × 8 methods (Sec. 6) | `just train-benchmark <dataset>`, dataset ∈ `mnist`, `fashionmnist`, `femnist`, `cifar10` | `just tables-benchmarks` | `results/paper/tab_main.{tex,md}` | ✅ ¹ |
 | Tab. `tab:geom`: MRR, TV, μ_min (App. Alignment) | same runs | `just tables-benchmarks` | `results/paper/tab_geom.{tex,md}` | ✅ ¹ |
 | Fig. `fig:compression`: FEMNIST, 2 agents, d ∈ {8, 16, 32, 64} (App. Compression) | `just train-compression` | `just figure-compression` | `results/femnist_2agents_bottleneck/bottleneck_split.pdf` | ✅ |
+| Fig. `fig:ablation-pilots`: pilot budget K, CenterNorm / ZCA / OLS / SWBN (App. Ablation) | `just train-ablation-pilots` | `just figure-ablation-pilots` | `results/mnist_4agents_shift/maps/pilot_study_shared.pdf` | ✅ ³ |
+| Fig. `fig:ablation-lambda`: penalty weight λ (App. Ablation) | `just train-ablation-lambda` | `just figure-ablation-lambda` | `results/mnist_4agents_shift/maps/lambda_study_shared.pdf` | ✅ ³ |
+| Fig. `fig:ablation-topology`: star / ring / full graph (App. Ablation) | `just train-ablation-topology` | `just figure-ablation-topology` | `results/mnist_4agents_shift/topology/topology_gap_shared.pdf` | ✅ ³ |
 | Tab. `tab:comm-epochs`: communication epochs ρ = 2–80 % (App. Ablation) | `just train-ablation-comm-epochs` | `just table-comm-epochs` | `results/mnist_4agents_shift/comm_epochs/rows.tex` | ✅ ² |
-| Fig. `fig:ablation-pilots`: pilot budget K (App. Ablation) | `just train-ablation-pilots` | `just figure-ablation-pilots` | `results/mnist_4agents_shift/{pilots,maps}/` | ⚠️ ³ |
-| Fig. `fig:ablation-lambda`: penalty weight λ (App. Ablation) | `just train-ablation-lambda` | `just figure-ablation-lambda` | `results/mnist_4agents_shift/{lambda,maps}/` | ⚠️ ³ |
-| Fig. `fig:ablation-topology`: star / ring / full graph (App. Ablation) | – | – | – | ❌ ⁴ |
 | Figs. `fig:spectrum`, `fig:tv_normalized`, `fig:low_energy` (App. Global sections) | – | – | – | ❌ ⁴ |
 | Sheaf-FMTL compression factor γ (App. Experimental details) | – | `just sheaf-fmtl-gamma <configs>` | printed | ✅ |
 | Tab. `tab:setups`: agents of the benchmarks (App. Experimental details) | – | – | the experiment configs | descriptive |
-| DomainNet, 6 agents × 6 domains (not in the paper yet) | `just domainnet-data`, then `just train-domainnet [domainnet_6agents\|domainnet_6agents_shift]` | `just report-domainnet` | `results/domainnet_6agents{,_shift}/domain_scope_report.md`, `results/domainnet_6agents_figures/` | ✅ |
+
+New experiments, not in the paper yet:
+
+| Experiment | Train | Table / figure | Output | Status |
+|---|---|---|---|---|
+| Anchor selection: k-means prototypes vs class-stratified anchors vs the original pilots, MNIST, K = 128–1536 | `just train-anchors` | `just figure-anchors` | `results/mnist_4agents_shift/anchors/anchors_study_shared.pdf` | ✅ ³ |
+| MNIST parity: 2 agents on the same images, 10 digits (d = 40) vs even/odd (d = 8); k-NN probes of digit identity in the even/odd agent ([doc](scripts/mnist_parity_knn.md)) | `just train-parity` | `just figure-parity` | `results/mnist_2agents_parity_d40x8/` | ⚠️ ⁵ |
+| DomainNet, 6 agents × 6 domains | `just domainnet-data`, then `just train-domainnet [domainnet_6agents\|domainnet_6agents_shift]` | `just report-domainnet` | `results/domainnet_6agents{,_shift}/domain_scope_report.md`, `results/domainnet_6agents_figures/` | ✅ |
 
 ¹ Rebuilt and checked against the paper for CIFAR-10, the benchmark whose
 checkpoints are on the development machine: every cell and rank group of
@@ -73,17 +80,29 @@ are rounded (.20/.20/.70/.20 against .16/.19/.66/.17 from the runs; with the
 exact values its shared-class cell falls in the second rank group).
 `tables-benchmarks` re-scores every run from its checkpoint
 (`logs/<project>/<run_id>/checkpoints/`), so it needs the checkpoints of all
-four benchmarks.
+four benchmarks. The Fashion-MNIST λ grid and a wandb-summary version of its
+block are written by `uv run python scripts/plot_fashionmnist_hetero.py`
+(`results/fashionmnist_4agents_shift/`).
 ² Rebuilt rows identical to the paper's. The ρ = 0 % and 100 % rows are the
 non-cooperative and DiSheafFRL runs of `tab:main`; when they are not re-scored
 on the machine, the script uses the values printed in `tab:main`/`tab:geom` and
 says so.
-³ The routines train and plot the non-cooperative baseline and DiSheafFRL with
-CenterNorm, ZCA whitening and unconstrained (OLS) maps. The paper's figures
-(`pilot_study_shared.pdf`, `lambda_study_shared.pdf`) also show DiSheafFRL with
-SWBN whitening, and split the accuracy into C_i∖C_j, C_i∩C_j and private; the
-SWBN runs and that three-panel figure have no routine in this repository.
+³ By default the figure routine redraws from the per-run class-scope scores
+kept in `results/mnist_4agents_shift/` (rebuilt here: identical tables, same
+figures); `just figure-<name> rescore` re-scores every checkpoint first (CUDA,
+the runs' wandb entity). The train routine writes every run to the wandb project
+and group its figure script reads (`mnist4_di_clean_bs256_{pilots,check}_*`,
+`{zca,ols,swbn}_p<K>_l<λ>`, `<method>_p4096`, `K<K>[_warm]`). The non-coop and
+CenterNorm runs at K = 4096 (`..._check_..._p4096`) serve the pilot, λ and
+topology figures, the anchors study and rows 0 % / 100 % of `tab:comm-epochs`;
+the topology script pins their run ids (`FULLY_CONNECTED`), so new runs replace
+them there. The "CenterNorm + OLS" curves score the OLS runs through the maps
+saved in training (wandb groups `pilot_saved_ols_eval`, `lambda_saved_ols_eval`),
+an evaluation made by a script that is not in this repository
+(`tmp/2026-11-12_mnist4_ols_learned.py`).
 ⁴ No config or routine in this repository.
+⁵ Routines smoke-tested (`just smoke-parity`); the study's runs and latent
+cache are not in this repository yet.
 
 ### Experiments
 
@@ -91,7 +110,10 @@ SWBN runs and that three-panel figure have no routine in this repository.
 |---|---|
 | `paper_base.yaml` | shared protocol: label shift 1.0, shared pilots, CenterNorm, fully connected graph, post-hoc evaluation |
 | `mnist_4agents_shift.yaml`, `fashionmnist_4agents_shift.yaml`, `femnist_4agents_shift.yaml`, `cifar10_4agents_full.yaml` | the four benchmarks of `tab:main` |
-| `mnist_4agents_shift_{zca,ols}.yaml` | map ablation (ZCA whitening, unconstrained maps) |
+| `mnist_4agents_shift_{zca,ols}.yaml`, `mnist_4agents_mapstudy_swbn.yaml` | map ablation (ZCA whitening, unconstrained maps, learnable SWBN whitening) |
+| `mnist_4agents_shift_{star,ring}.yaml` (+ `_topology_base.yaml`) | topology ablation |
+| `mnist_4agents_shift_anchors_{kmeans,strat}.yaml` (+ `_anchors_base.yaml`) | anchor selection |
+| `mnist_2agents_parity_d40x8.yaml` (+ `mnist_2agents_parity_base.yaml`) | MNIST parity: 10 digits vs even/odd |
 | `femnist_2agents_bottleneck.yaml` + `bottleneck_femnist/d{8,16,32,64}.yaml` | compression sweep |
 | `domainnet_6agents.yaml`, `domainnet_6agents_shift.yaml` + `dataset/domainnet.yaml` | DomainNet, one visual domain and one architecture per agent, without and with label shift |
 | `dataset/`, `model/`, `optimizer/`, `orchestrator/` | building blocks (`orchestrator/ce_di_sheaf_frl.yaml`: DiSheafFRL communicating on a share of the epochs) |

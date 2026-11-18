@@ -1,0 +1,12 @@
+# Tests whether DiSheafFRL on 4-agent MNIST (7 classes/agent) survives a star graph.
+# Every agent has the same total overlap (13 classes), so the hub choice is a tie;
+# hub = agent 0, whose strongest partner is agent 3 (5 shared classes). 3 edges.
+defaults:
+  - mnist_4agents_shift_topology_base
+  - _self_
+study_name: mnist_4agents_shift_star
+logger:
+  project: mnist_4agents_shift_star
+graph:
+  neighbors_mode: manual
+  neighbors: {0: [1, 2, 3], 1: [0], 2: [0], 3: [0]}

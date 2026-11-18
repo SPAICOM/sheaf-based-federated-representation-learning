@@ -46,35 +46,74 @@ figure-compression:
     uv run python scripts/rescore_hetero.py femnist_2agents_bottleneck --groups comfed
     uv run python scripts/plot_bottleneck.py femnist
 
-# Non-coop and DiSheafFRL (CenterNorm), then DiSheafFRL with ZCA whitening and with unconstrained
-# (OLS) maps; wandb groups as read by the figure scripts.
-# Fig. ablation-pilots, train: MNIST, pilot budget K = 384..4096, lambda 0.01, 3 seeds
+# Every run lands in the wandb project and group its figure script reads. Non-coop and CenterNorm
+# DiSheafFRL at K = 4096 are the `..._check_..._p4096` runs, shared with the lambda and topology
+# studies and with rows 0% / 100% of Tab. comm-epochs.
+# Fig. ablation-pilots, train: MNIST, K = 384..4096, lambda 0.01, 3 seeds: non-coop, CenterNorm, ZCA, OLS, SWBN
 train-ablation-pilots *args="":
-    uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift \
-        orchestrator=non_cooperative,di_sheaf_frl dataset.pilot_num_samples=384,768,1536,2048,4096 \
-        'study_name=mnist4_di_clean_bs256_pilots_${hydra:runtime.choices.orchestrator}_p${dataset.pilot_num_samples}' {{args}}
-    for m in zca ols; do uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift_$m \
-        dataset.pilot_num_samples=384,768,1536,2048,4096 \
-        "study_name=${m}_p\${dataset.pilot_num_samples}_l\${orchestrator.max_lmb}" {{args}}; done
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run() { uv run python scripts/multi_agent_experiment.py -m "$@" {{args}}; }
+    run --config-name mnist_4agents_shift orchestrator=non_cooperative,di_sheaf_frl \
+        dataset.pilot_num_samples=384,768,1536,2048 seed=42,43,44 \
+        'study_name=mnist4_di_clean_bs256_pilots_${hydra:runtime.choices.orchestrator}_p${dataset.pilot_num_samples}'
+    run --config-name mnist_4agents_shift orchestrator=non_cooperative,di_sheaf_frl \
+        dataset.pilot_num_samples=4096 seed=42,43,44 \
+        'study_name=mnist4_di_clean_bs256_check_${hydra:runtime.choices.orchestrator}_p4096'
+    for m in zca:mnist_4agents_shift_zca ols:mnist_4agents_shift_ols swbn:mnist_4agents_mapstudy_swbn; do
+        for k in 384 768 1536 2048 4096; do
+            run --config-name "${m#*:}" orchestrator=di_sheaf_frl dataset.pilot_num_samples=$k \
+                orchestrator.max_lmb=0.01 seed=42,43,44 "study_name=${m%%:*}_p${k}_l.01"
+        done
+    done
 
-# Fig. ablation-pilots → results/mnist_4agents_shift/{pilots,maps}/ (re-scores the checkpoints; CUDA)
-figure-ablation-pilots:
-    uv run python scripts/plot_mnist4_pilots.py
-    uv run python scripts/plot_mnist4_maps.py
+# Redraws from the retained class-scope scores (results/mnist_4agents_shift/swbn_scopes/);
+# `just figure-ablation-pilots rescore` re-scores every checkpoint first (CUDA).
+# Fig. ablation-pilots → results/mnist_4agents_shift/maps/pilot_study{,_shared}.{pdf,png}
+figure-ablation-pilots mode="":
+    uv run python scripts/plot_mnist4_swbn_scopes.py {{ if mode == "rescore" { "" } else { "--plot-only" } }}
 
-# Fig. ablation-lambda, train: MNIST, K = 4096, lambda = 0.003..1, 3 seeds: DiSheafFRL (CenterNorm), ZCA, OLS
+# The lambda = 0.01 points are the K = 4096 runs of train-ablation-pilots.
+# Fig. ablation-lambda, train: MNIST, K = 4096, lambda = 0.003..1, 3 seeds: CenterNorm, ZCA, OLS, SWBN
 train-ablation-lambda *args="":
-    uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift \
-        orchestrator=di_sheaf_frl orchestrator.max_lmb=0.003,0.01,0.03,0.1,0.3,1 \
-        'study_name=mnist4_di_clean_bs256_lambda4096_${orchestrator.max_lmb}' {{args}}
-    for m in zca ols; do uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift_$m \
-        dataset.pilot_num_samples=4096 orchestrator.max_lmb=0.003,0.03,0.1,0.3,1 \
-        "study_name=${m}_p\${dataset.pilot_num_samples}_l\${orchestrator.max_lmb}" {{args}}; done
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run() { uv run python scripts/multi_agent_experiment.py -m "$@" {{args}}; }
+    run --config-name mnist_4agents_shift orchestrator=di_sheaf_frl \
+        orchestrator.max_lmb=0.003,0.03,0.1,0.3,1 seed=42,43,44 \
+        'study_name=mnist4_di_clean_bs256_lambda4096_${orchestrator.max_lmb}'
+    for m in zca:mnist_4agents_shift_zca ols:mnist_4agents_shift_ols swbn:mnist_4agents_mapstudy_swbn; do
+        for l in 0.003:.003 0.03:.03 0.1:.1 0.3:.3 1:1; do
+            run --config-name "${m#*:}" orchestrator=di_sheaf_frl dataset.pilot_num_samples=4096 \
+                orchestrator.max_lmb=${l%%:*} seed=42,43,44 "study_name=${m%%:*}_p4096_l${l#*:}"
+        done
+    done
 
-# Fig. ablation-lambda → results/mnist_4agents_shift/{lambda,maps}/
-figure-ablation-lambda:
+# `just figure-ablation-lambda rescore` re-scores every checkpoint first (CUDA).
+# Fig. ablation-lambda → results/mnist_4agents_shift/maps/lambda_study{,_shared}.{pdf,png}
+figure-ablation-lambda mode="":
+    uv run python scripts/plot_mnist4_swbn_scopes.py --study lambda {{ if mode == "rescore" { "" } else { "--plot-only" } }}
+
+# Pilot / lambda / map summary tables and run provenance (results/mnist_4agents_shift/{pilots,lambda,maps}/),
+# the inputs of the rescore mode of the two figures above (re-scores checkpoints: CUDA).
+# Fig. ablation-pilots + ablation-lambda, summary tables
+tables-ablation-maps:
+    uv run python scripts/plot_mnist4_pilots.py
     uv run python scripts/plot_mnist4_lambda.py
     uv run python scripts/plot_mnist4_maps.py
+
+# Star (hub = agent 0) and ring (0-1-2-3-0), wandb projects mnist_4agents_shift_{star,ring}; the fully
+# connected arm is the K = 4096 check runs of train-ablation-pilots.
+# Fig. ablation-topology, train: MNIST, non-coop and DiSheafFRL on a star and a ring, 3 seeds
+train-ablation-topology *args="":
+    for t in star ring; do uv run python scripts/multi_agent_experiment.py -m --config-name mnist_4agents_shift_$t \
+        orchestrator=non_cooperative,di_sheaf_frl seed=42,43,44 \
+        'study_name=${hydra:runtime.choices.orchestrator}_p${dataset.pilot_num_samples}' {{args}}; done
+
+# Redraws from results/mnist_4agents_shift/topology/per_run.csv; `rescore` re-scores the checkpoints (CUDA).
+# Fig. ablation-topology → results/mnist_4agents_shift/topology/topology_gap{,_shared}.{pdf,png}
+figure-ablation-topology mode="":
+    uv run python scripts/plot_mnist4_topology.py {{ if mode == "rescore" { "" } else { "--plot-only" } }}
 
 # CEDiSheafFRL, lambda 0.01; rho = 0% / 100% are the non-coop / DiSheafFRL runs of Tab. main.
 # Tab. comm-epochs, train: MNIST, DiSheafFRL communicating on rho = 2..80% of the 100 epochs, 3 seeds
@@ -93,7 +132,49 @@ table-comm-epochs:
 sheaf-fmtl-gamma *configs:
     uv run python scripts/sheaf_fmtl_memory.py {{configs}}
 
-# ── DomainNet, 6 agents x 6 domains (not in the paper yet) ────────────────────
+# ── New experiments (not in the paper yet) ─────────────────────────────────────
+
+# DiSheafFRL with K per-edge anchors taken from a 4096-pilot pool by k-means prototypes (warm-started
+# refits for K >= 768) or by class-stratified sampling (70% from C_i Δ C_j), and the original K-pilot
+# runs at K = 128 (K = 384..1536 are the pilot-ablation runs); lambda 0.01, 3 seeds.
+# Anchor selection, train: MNIST, K = 128..1536
+train-anchors *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run() { uv run python scripts/multi_agent_experiment.py -m "$@" {{args}}; }
+    run --config-name mnist_4agents_shift_anchors_kmeans orchestrator=di_sheaf_frl \
+        orchestrator.num_anchors=128,384 seed=42,43,44 'study_name=K${orchestrator.num_anchors}'
+    run --config-name mnist_4agents_shift_anchors_kmeans orchestrator=di_sheaf_frl \
+        orchestrator.num_anchors=768,1536 orchestrator.kmeans_warm_start=true seed=42,43,44 \
+        'study_name=K${orchestrator.num_anchors}_warm'
+    run --config-name mnist_4agents_shift_anchors_strat orchestrator=di_sheaf_frl \
+        orchestrator.num_anchors=128,384,768,1536 seed=42,43,44 'study_name=K${orchestrator.num_anchors}'
+    run --config-name mnist_4agents_shift orchestrator=di_sheaf_frl dataset.pilot_num_samples=128 \
+        orchestrator.max_lmb=0.01 seed=42,43,44 study_name=cnorm_p128_l.01
+    run --config-name mnist_4agents_shift orchestrator=non_cooperative dataset.pilot_num_samples=128 \
+        seed=42,43,44 study_name=mnist4_di_clean_bs256_pilots_non_cooperative_p128
+
+# Plots the cached class-scope scores; `just figure-anchors rescore` first scores the new checkpoints
+# (resumable, CUDA; non-coop rows re-score the K = 4096 check runs under every arm).
+# Anchor selection → results/mnist_4agents_shift/anchors/anchors_study{,_shared}.{pdf,png} + summary.md
+figure-anchors mode="":
+    {{ if mode == "rescore" { "uv run python scripts/score_mnist4_anchors.py" } else { "true" } }}
+    uv run python scripts/plot_mnist4_anchors.py
+
+# Agent 0 learns the 10 digits (d = 40), agent 1 only even vs odd (d = 8), same images; non-coop and
+# DiSheafFRL at lambda = 1e-3, 4e-3, 1e-2, 3e-2, 3 seeds (scripts/mnist_parity_knn.md). Test latents are
+# cached in results/mnist_2agents_parity_d40x8/latents/; finished cells are skipped.
+# MNIST parity, train: two agents, 10 digits vs even/odd, with the 10-class k-NN probe of agent 1
+train-parity *args="":
+    uv run python scripts/mnist_parity_knn.py --seeds 42 43 44 --lmb 1e-3 4e-3 1e-2 3e-2 {{args}}
+
+# From the cached latents, no training: 10-class, within-parity and few-label k-NN probes.
+# MNIST parity → results/mnist_2agents_parity_d40x8/{knn_vs_k,probes}.{pdf,png}
+figure-parity:
+    uv run python scripts/mnist_parity_knn.py --plot-only
+    uv run python scripts/mnist_parity_probes.py
+
+# DomainNet, 6 agents x 6 domains
 
 # DomainNet data: the 20 best-covered classes of all six domains at 64 px → data/domainnet/dn64_k20_d6/
 domainnet-data:
@@ -126,6 +207,11 @@ smoke config *args="":
         --config-name {{config}} trainer.max_epochs=1 ++trainer.limit_train_batches=3 \
         ++trainer.limit_val_batches=2 ++trainer.limit_test_batches=2 \
         ++lmb_study.enabled=false {{args}}
+
+# MNIST parity smoke run: no wandb, 1 epoch, 2k rows, CPU, output in tmp/mnist_parity_smoke
+smoke-parity *args="":
+    WANDB_MODE=disabled uv run python scripts/mnist_parity_knn.py --epochs 1 --pilots 128 --train-samples 2000 \
+        --accelerator cpu --out tmp/mnist_parity_smoke {{args}}
 
 # Left pane: the run, teed to logs/console/<name>.log; right pane: live dashboard. Survives
 # closing the terminal; `just attach <name>` to follow it.
