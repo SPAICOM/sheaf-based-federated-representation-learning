@@ -10,7 +10,7 @@ neighboring agents accurately.
 
 import warnings
 from contextlib import contextmanager, nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -34,13 +34,19 @@ from src.communication.whitening import (
     whiten,
     whitening_from_moments,
 )
-from src.mutualinfo._common import kmeans_cluster
+from src.mutualinfo._common import kmeans_cluster, kmeans_cluster_warm
 from src.orchestrators.base_orchestrator import BaseOrchestrator
 from src.utils.anchors import (
     AnchorConfig,
     communication_anchor_payload,
     parseval_normalize,
+    stratified_edge_seed,
+    stratified_focus_classes,
+    stratified_row_indices,
 )
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class SheafFRL(BaseOrchestrator):
@@ -87,6 +93,14 @@ class SheafFRL(BaseOrchestrator):
       re-encoded fresh through the current parameters) for every step's
       penalty until the next refresh — ``num_anchors`` is the total volume
       communicated per edge per window;
+    * **stratified** — like ``random`` (``num_anchors`` raw rows, re-encoded
+      fresh every step) but the rows are drawn *once for the whole run* and
+      biased towards each edge's symmetric class difference
+      ``C_i Δ C_j``: a share ``stratified_bias`` of the rows comes from those
+      classes, equally per class (:func:`~src.utils.anchors.stratified_row_indices`).
+      The draw is a deterministic function of the pool, the run seed and the
+      edge, so every refresh re-selects the same samples and post-hoc
+      evaluation (``anchor_selection='stratified'`` there too) uses them;
     * **proto_class** — one (or ``protos_per_class``, via within-class
       k-means) prototype per class, à la FedProto — the map is fit on
       full-pool prototypes at the refresh, while the per-step penalty builds
@@ -137,6 +151,8 @@ class SheafFRL(BaseOrchestrator):
         num_anchors: int = 128,
         anchor_selection: str = 'all',
         protos_per_class: int = 1,
+        stratified_bias: float = 0.7,
+        kmeans_warm_start: bool = False,
         anchor_parseval_normalize: bool = False,
         lambda_schedule: str | None = None,
         sparse_communication: bool = False,
@@ -256,6 +272,7 @@ class SheafFRL(BaseOrchestrator):
         _valid_anchor_selections = (
             'all',
             'random',
+            'stratified',
             'proto_class',
             'proto_kmeans',
         )
@@ -266,6 +283,8 @@ class SheafFRL(BaseOrchestrator):
             )
         if protos_per_class < 1:
             raise ValueError('protos_per_class must be at least 1')
+        if not 0.0 <= float(stratified_bias) <= 1.0:
+            raise ValueError('stratified_bias must be in [0, 1]')
         zca_refit_mode = str(zca_refit_mode)
         zca_refit_source = str(zca_refit_source)
         _valid_zca_sources = ('train', 'pilots', 'train+pilots')
@@ -365,6 +384,8 @@ class SheafFRL(BaseOrchestrator):
         # assignment, refit at every map refresh (whenever the matched pool
         # has at least K rows) and reused for the steps of that window.
         self._edge_kmeans_assign: dict[tuple[int, int], dict[int, int]] = {}
+        # kmeans_warm_start: per-edge centres of the previous refresh's fit.
+        self._edge_kmeans_centers: dict[tuple[int, int], np.ndarray] = {}
         # Current step's whitened pilot-batch latents per node (grad intact):
         # (Z_whitened, y, sample_ids), consumed by the step-batch penalty path
         # (_edge_step_anchors) and cleared after every loss computation.
@@ -455,7 +476,7 @@ class SheafFRL(BaseOrchestrator):
     # ── Per-edge λ: dual-ascent machinery ──────────────────────────────────────
 
     def _dual_lmb_enabled(self) -> bool:
-        """True when per-edge dual-ascent multipliers replace the global λ."""
+        """Return True when per-edge dual-ascent multipliers replace the global λ."""
         return bool(getattr(self.hparams, 'learn_lmb', False))
 
     def _init_edge_duals(self, edge_keys) -> None:
@@ -474,7 +495,7 @@ class SheafFRL(BaseOrchestrator):
     def _edge_sides(
         self, Z_i: torch.Tensor, Z_j: torch.Tensor, V: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The two sides ``(X, A·Y)`` of the coboundary ``X − A·Y``.
+        """Return the two sides ``(X, A·Y)`` of the coboundary ``X − A·Y``.
 
         ``X = Z_i`` is the higher-dimensional side and ``A·Y = Z_j Vᵀ`` is the
         lower-dimensional side embedded into it, for Stiefel and general maps
@@ -627,7 +648,7 @@ class SheafFRL(BaseOrchestrator):
         self.dual_lambdas = lams.clamp_(0.0, cap)
 
     def _use_learnable_whitening(self) -> bool:
-        """True when SWBN learnable whitening is the active normalisation.
+        """Return True when SWBN learnable whitening is the active normalisation.
 
         ``self.whitening_layers`` is non-empty only when ``learn_whitening`` was
         requested *and* parseval/L2 normalisation are off (they are mutually
@@ -712,7 +733,7 @@ class SheafFRL(BaseOrchestrator):
         return float(penalty_lr) / float(self.hparams.optimizer['lr'])
 
     def _swbn_fits_on_train(self) -> bool:
-        """True when SWBN statistics are collected on the local training batches."""
+        """Return True when SWBN statistics are collected on the local training batches."""
         return self._use_learnable_whitening() and (
             str(getattr(self.hparams, 'swbn_fit_source', 'pilots')) == 'train'
         )
@@ -1123,7 +1144,8 @@ class SheafFRL(BaseOrchestrator):
         :func:`~src.utils.anchors.parseval_normalize`.
         """
         strategy = self.hparams.anchor_selection
-        if strategy == 'all' or Z_i.shape[0] == 0:
+        if strategy in ('all', 'stratified') or Z_i.shape[0] == 0:
+            # 'stratified' rows were already fixed at the refresh.
             sel = (Z_i, y_i, Z_j, y_j)
         elif strategy == 'random':
             sel = self._random_edge_anchors(Z_i, y_i, Z_j, y_j)
@@ -1510,6 +1532,25 @@ class SheafFRL(BaseOrchestrator):
                         y_j_m[idx],
                         sids_m[idx],
                     )
+            elif strategy == 'stratified':
+                budget = int(self.hparams.num_anchors)
+                if Z_i_m.shape[0] > budget:
+                    agent_tc = getattr(self, '_agent_target_classes', None)
+                    idx = stratified_row_indices(
+                        y_i_m,
+                        budget,
+                        stratified_focus_classes(agent_tc, node_i, node_j),
+                        float(self.hparams.stratified_bias),
+                        keys=sids_m,
+                        seed=stratified_edge_seed(node_i, node_j),
+                    ).to(Z_i_m.device)
+                    Z_i_m, y_i_m, Z_j_m, y_j_m, sids_m = (
+                        Z_i_m[idx],
+                        y_i_m[idx],
+                        Z_j_m[idx],
+                        y_j_m[idx],
+                        sids_m[idx],
+                    )
             elif strategy == 'proto_kmeans':
                 pair = (node_i, node_j)
                 K = int(self.hparams.num_anchors)
@@ -1518,9 +1559,19 @@ class SheafFRL(BaseOrchestrator):
                     # drifting whitened pilot geometry, alongside the map
                     # refit.  Re-broadcasting the sample-id -> cluster
                     # assignment costs a few KB per window.
-                    labels = kmeans_cluster(
-                        Z_i_m.detach().float().cpu().numpy(), n_clusters=K
-                    )
+                    x_np = Z_i_m.detach().float().cpu().numpy()
+                    if self.hparams.kmeans_warm_start:
+                        # Start from last refresh's centres: the whitened pool
+                        # drifts slowly, so this converges in a few iterations
+                        # instead of a cold n_init=3 k-means++ fit.
+                        labels, centers = kmeans_cluster_warm(
+                            x_np,
+                            K,
+                            init_centers=self._edge_kmeans_centers.get(pair),
+                        )
+                        self._edge_kmeans_centers[pair] = centers
+                    else:
+                        labels = kmeans_cluster(x_np, n_clusters=K)
                     self._edge_kmeans_assign[pair] = dict(
                         zip(sids_m.tolist(), labels.tolist())
                     )
@@ -1607,6 +1658,7 @@ class SheafFRL(BaseOrchestrator):
         return edge_metrics
 
     def on_train_start(self) -> None:
+        """Reset per-run buffers and anchor caches before training begins."""
         super().on_train_start()
         self._step_pilot_latents.clear()
         self._whitening_ops.clear()
@@ -1619,6 +1671,7 @@ class SheafFRL(BaseOrchestrator):
         # Fresh fit() call -> forget any proto_kmeans assignment and any fixed
         # anchor caches fit/selected previously.
         self._edge_kmeans_assign = {}
+        self._edge_kmeans_centers = {}
         self._edge_anchor_cache = {}
         self._frozen_edge_anchors = {}
         self._warn_if_pool_coverage_partial()
@@ -1630,7 +1683,7 @@ class SheafFRL(BaseOrchestrator):
         pilot split via the rotating loader batches; full per-epoch coverage
         needs ``steps_per_epoch × pilot_batch_size ≥ pool size``.
         """
-        if self.hparams.anchor_selection == 'random':
+        if self.hparams.anchor_selection in ('random', 'stratified'):
             return
         dm = getattr(self.trainer, 'datamodule', None)
         pds = getattr(dm, 'pilot_datasets', None) if dm is not None else None
@@ -1652,11 +1705,13 @@ class SheafFRL(BaseOrchestrator):
             )
 
     def on_train_epoch_start(self) -> None:
+        """Clear per-epoch pilot and task latent buffers."""
         self._step_pilot_latents.clear()
         self._task_latent_buffer = {}
 
     @torch.no_grad()
     def on_train_epoch_end(self) -> None:
+        """Log dual multipliers, refresh local whitening, and rebuild anchor caches/maps."""
         if self._dual_lmb_enabled() and self._dual_edge_index:
             self.log_dict(
                 {
@@ -1711,7 +1766,7 @@ class SheafFRL(BaseOrchestrator):
     # ── Closed-form (ZCA) whitening refit ─────────────────────────────────────
 
     def _attached_datamodule(self):
-        """The datamodule, or None when this module has no Trainer attached.
+        """Return the datamodule, or None when this module has no Trainer attached.
 
         ``LightningModule.trainer`` *raises* when detached rather than
         returning None, and these helpers are reachable from a bare
@@ -1915,6 +1970,7 @@ class SheafFRL(BaseOrchestrator):
         )
 
     def on_validation_epoch_end(self) -> None:
+        """Run the base validation-epoch hook."""
         super().on_validation_epoch_end()
 
     def _compute_alignment_losses(
@@ -1992,7 +2048,7 @@ class SheafFRL(BaseOrchestrator):
         one-shot assignment).  Falls back to the cache path when step latents
         are unavailable (e.g. a datamodule without pilot sample ids).
         """
-        if self.hparams.anchor_selection == 'random':
+        if self.hparams.anchor_selection in ('random', 'stratified'):
             return self._edge_live_anchors(
                 node_i, node_j, rows=self._rotating_rows(node_i, node_j)
             )
@@ -2453,7 +2509,7 @@ class SheafFRL(BaseOrchestrator):
     def _directed_alignment_map(
         self, sender_idx: int, receiver_idx: int
     ) -> torch.Tensor | None:
-        """The Stiefel/general map stored for exactly sender_idx -> receiver_idx.
+        """Return the Stiefel/general map stored for exactly sender_idx -> receiver_idx.
 
         Edges are stored once per pair under a single canonical key (see
         ``send_message``'s convention). Only the direction matching that
@@ -2542,10 +2598,16 @@ class SheafFRL(BaseOrchestrator):
         running mean, the origin used at evaluation).
         """
         mode = str(getattr(self.hparams, 'pilot_bn_mode', 'update'))
-        bns = [] if mode == 'update' else [
-            m for m in agent.modules()
-            if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training
-        ]
+        bns = (
+            []
+            if mode == 'update'
+            else [
+                m
+                for m in agent.modules()
+                if isinstance(m, nn.modules.batchnorm._BatchNorm)
+                and m.training
+            ]
+        )
         saved = [m.momentum for m in bns]
         for m in bns:
             if mode == 'running':
@@ -2553,15 +2615,23 @@ class SheafFRL(BaseOrchestrator):
             else:
                 m.momentum = 0.0
         centers = []
-        if str(getattr(self.hparams, 'pilot_center_mode', 'batch')) == 'running':
+        if (
+            str(getattr(self.hparams, 'pilot_center_mode', 'batch'))
+            == 'running'
+        ):
             centers = [
-                m for m in agent.modules()
+                m
+                for m in agent.modules()
                 if isinstance(m, CenterNorm) and m.training
             ]
         for m in centers:
             m.eval()
         try:
-            with nullcontext() if mode == 'update' else frozen_center_norm(agent):
+            with (
+                nullcontext()
+                if mode == 'update'
+                else frozen_center_norm(agent)
+            ):
                 yield
         finally:
             for m in centers:
@@ -2605,6 +2675,7 @@ class SheafFRL(BaseOrchestrator):
                 self.__dict__.pop(name, None)
 
     def on_test_epoch_end(self) -> None:
+        """Run the base test-epoch hook, then log communication accuracy on the attached datamodule."""
         super().on_test_epoch_end()
         dm = getattr(self.trainer, 'datamodule', None)
         if dm is None:

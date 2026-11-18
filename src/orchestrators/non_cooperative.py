@@ -32,7 +32,7 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
     *anchors*, reduced from the matched pilot pool exactly as SheafFRL does
     at train time, so one override set sweeps the anchor budget/strategy
     across a SheafFRL run and this baseline alike: ``anchor_selection``
-    ('all' | 'random' | 'proto_class' | 'proto_kmeans', one-shot here — see
+    ('all' | 'random' | 'stratified' | 'proto_class' | 'proto_kmeans', one-shot here — see
     :func:`~src.utils.anchors.select_paired_anchors`), ``num_anchors``,
     ``protos_per_class``.  ``anchor_parseval_normalize`` left at its default
     (``None``) auto-picks True for 'relative' (the analysis/synthesis
@@ -52,6 +52,7 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
         anchor_selection: str = 'all',
         num_anchors: int = 128,
         protos_per_class: int = 1,
+        stratified_bias: float = 0.7,
         anchor_parseval_normalize: bool | None = None,
         posthoc_whitening_shrinkage: float | str = 'auto',
         posthoc_whitening: bool = True,
@@ -76,6 +77,8 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
             )
         if int(num_anchors) < 1:
             raise ValueError('num_anchors must be at least 1')
+        if not 0.0 <= float(stratified_bias) <= 1.0:
+            raise ValueError('stratified_bias must be in [0, 1]')
         if int(protos_per_class) < 1:
             raise ValueError('protos_per_class must be at least 1')
         _check_posthoc_shrinkage(posthoc_whitening_shrinkage)
@@ -132,8 +135,12 @@ class NonCooperativeLearning(PostTrainingAlignmentMixin, BaseOrchestrator):
 
         if prefix == 'train':
             for idx, agent in self.agents.items():
-                agent_losses[int(idx)] += self._local_pilot_loss(agent, batch, int(idx))
-                agent_losses[int(idx)] += self._local_simclr_loss(agent, batch, int(idx))
+                agent_losses[int(idx)] += self._local_pilot_loss(
+                    agent, batch, int(idx)
+                )
+                agent_losses[int(idx)] += self._local_simclr_loss(
+                    agent, batch, int(idx)
+                )
 
         total_loss, _avg_performance = self._log_shared_metrics(
             prefix=prefix,

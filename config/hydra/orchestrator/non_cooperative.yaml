@@ -16,10 +16,13 @@ align_class_filter: none
 # has no refresh cadence):
 #   all          — every matched pilot row (num_anchors ignored)
 #   random       — num_anchors rows, subsampled once
+#   stratified   — num_anchors raw rows, a share stratified_bias from the edge's
+#                  symmetric class difference C_i Δ C_j (fixed given the run seed)
 #   proto_class  — protos_per_class prototypes per class (within-class k-means)
 #   proto_kmeans — unsupervised k-means (K=num_anchors) prototypes
 anchor_selection: all
 num_anchors: 128
+stratified_bias: 0.7  # only used by stratified
 # Where each agent's whitening operator is estimated:
 #   train  — the full local training split (classical post-hoc recipe)
 #   pilots — the pilot split, i.e. exactly the rows SheafFRL/CESheafFRL's SWBN

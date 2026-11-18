@@ -1,0 +1,17 @@
+# Shared setting of the anchor-selection ablation on 4-agent MNIST (fully connected,
+# 7 classes/agent): DiSheafFRL lambda .01, CenterNorm, 4096-pilot POOL, batch 256,
+# 100 epochs, pilot_bn_mode running (as the finished pilot-study runs). Only the way
+# the K per-edge anchors are taken from the pool changes; K = orchestrator.num_anchors
+# (128/384/768/1536). Reference ("original"): mnist_4agents_shift with
+# dataset.pilot_num_samples=K, anchor_selection all. Non-coop rows come from
+# rescoring the 4096-pilot non-coop checkpoints (tmp/2026-11-16_mnist4_anchors_noncoop_eval.py).
+defaults:
+  - mnist_4agents_shift
+  - override orchestrator: di_sheaf_frl
+  - _self_
+dataset:
+  pilot_num_samples: 4096
+orchestrator:
+  max_lmb: 0.01
+  pilot_bn_mode: running
+  num_anchors: 384
